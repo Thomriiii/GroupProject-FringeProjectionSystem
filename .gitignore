@@ -1,0 +1,3 @@
+# Ignore generated scan data and large binary outputs
+scans/
+**/scans/
