@@ -59,5 +59,3 @@ python3 main.py
 - If full-screen projector mode doesn't appear, check that `SDL_VIDEODRIVER` is set to `kmsdrm` or your system's display driver (the `Projector` class sets `SDL_VIDEODRIVER=kmsdrm` by default).
 
 ---
-
-If you want, I can also add a `requirements.txt` or `pyproject.toml` and some basic sanity-check scripts (e.g., a small script to verify camera+projector detection). Let me know which one you prefer. 💡
