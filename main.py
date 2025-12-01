@@ -2,30 +2,11 @@
 main.py
 
 ENTRY POINT for the structured-light fringe projection scanner.
-
-This script must be executed directly.
-
-Responsibilities:
-  - Initialise projector (main thread only)
-  - Generate PSP patterns + mid-grey
-  - Initialise camera controller
-  - Initialise scan controller
-  - Start Flask web server (background thread)
-  - Run projector loop forever (blocking)
-
-System startup sequence:
-    1. Projector initialises (fullscreen)
-    2. Patterns load (using projector resolution)
-    3. Camera initialises
-    4. ScanController assembled
-    5. Flask server starts on a worker thread
-    6. Projector loop runs (main thread)
 """
 
 from __future__ import annotations
 
 import threading
-import time
 
 # Local modules
 from projector import Projector
@@ -42,6 +23,7 @@ from server import WebServer
 FREQS = [4, 8, 16, 32]
 N_PHASE = 4
 SCAN_ROOT = "scans"
+CALIB_ROOT = "calib"
 
 
 # =====================================================================
@@ -58,13 +40,24 @@ def main():
     W, H = projector.width, projector.height
     print(f"[MAIN] Projector resolution: {W}x{H}")
 
-    print("[MAIN] Generating PSP patterns...")
-    patterns, raw_patterns = generate_psp_patterns(
+    print("[MAIN] Generating PSP patterns (vertical)...")
+    patterns_vert, raw_patterns_vert = generate_psp_patterns(
         width=W,
         height=H,
         freqs=FREQS,
         n_phase=N_PHASE,
-        gamma_proj=None,     # projector gamma compensation disabled for now
+        gamma_proj=None,
+        orientation="vertical",
+    )
+
+    print("[MAIN] Generating PSP patterns (horizontal)...")
+    patterns_horiz, raw_patterns_horiz = generate_psp_patterns(
+        width=W,
+        height=H,
+        freqs=FREQS,
+        n_phase=N_PHASE,
+        gamma_proj=None,
+        orientation="horizontal",
     )
 
     print("[MAIN] Generating mid-grey calibration surface...")
@@ -93,13 +86,15 @@ def main():
     # ============================================================
     scan_controller = ScanController(
         camera=camera,
-        patterns=patterns,
+        patterns_vert=patterns_vert,
         midgrey_surface=midgrey_surface,
         set_surface_callback=projector.set_surface,
         freqs=FREQS,
         n_phase=N_PHASE,
         scan_root=SCAN_ROOT,
+        calib_root=CALIB_ROOT,
         pattern_settle_time=0.15,
+        calib_patterns_horiz=patterns_horiz,
     )
 
     # ============================================================

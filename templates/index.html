@@ -1,0 +1,46 @@
+<!doctype html>
+<html>
+<head>
+    <title>Fringe Projection Scanner</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+
+<div class="container">
+
+    <h1>Fringe Projection Scanner</h1>
+
+    <section>
+        <h2>Live Camera</h2>
+        <img src="/video" class="live-video">
+    </section>
+
+    <section>
+        <h2>Status: <span class="status">{{ status }}</span></h2>
+        {% if last_dir %}
+            <p>Last directory: <code>{{ last_dir }}</code></p>
+        {% endif %}
+    </section>
+
+    <section>
+        <form method="post" action="/scan">
+            <button type="submit" class="scan-btn">Run Scan</button>
+        </form>
+    </section>
+
+    <section>
+        <h2>Calibration</h2>
+        <p>Place a flat white board in view, tilt it to a new pose, then capture a calibration pose.</p>
+        <form method="post" action="/calib_capture">
+            <button type="submit" class="scan-btn">Capture Calibration Pose</button>
+        </form>
+    </section>
+
+    <p class="note">Projector output updates in real time.</p>
+
+</div>
+
+<script src="{{ url_for('static', filename='js/main.js') }}"></script>
+
+</body>
+</html>

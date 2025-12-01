@@ -6,6 +6,7 @@ Pattern generation for structured-light fringe projection.
 This version adds:
   - BRIGHTNESS_SCALE to dim the projected image (prevents saturation).
   - CONTRAST_SCALE to slightly reduce sinusoid contrast if needed.
+  - Support for vertical and horizontal fringe orientations.
 """
 
 from __future__ import annotations
@@ -45,30 +46,63 @@ def generate_psp_patterns(
     freqs: List[int],
     n_phase: int,
     gamma_proj: float | None = None,
+    orientation: str = "vertical",
 ) -> Tuple[SurfaceDict, RawPatternDict]:
     """
     Generate sinusoidal PSP patterns for all frequencies and phases.
 
-    patterns[f][n]  -> pygame.Surface
-    raw_patterns[f][n] -> float32 HxW array [0..1] (before scaling & gamma)
+    Parameters
+    ----------
+    width, height : int
+        Projector resolution.
+    freqs : list[int]
+        Number of periods across the varying dimension.
+    n_phase : int
+        Number of phase steps (e.g. 4).
+    gamma_proj : float or None
+        Projector gamma for compensation (optional).
+    orientation : {"vertical", "horizontal"}
+        - "vertical"   : fringes vary along x (columns)
+        - "horizontal" : fringes vary along y (rows)
+
+    Returns
+    -------
+    patterns : dict[freq -> list[pygame.Surface]]
+        Displayable pygame surfaces.
+    raw_patterns : dict[freq -> list[np.ndarray]]
+        Linear float32 patterns in [0..1] before brightness scaling & gamma.
     """
+    orientation = orientation.lower()
+    if orientation not in ("vertical", "horizontal"):
+        raise ValueError(f"Invalid orientation '{orientation}', use 'vertical' or 'horizontal'.")
+
     patterns: SurfaceDict = {}
     raw_patterns: RawPatternDict = {}
 
     deltas = 2.0 * np.pi * np.arange(n_phase) / n_phase
-    xs = np.linspace(0.0, 1.0, width, endpoint=False)
+
+    # Coordinate axis depending on orientation
+    if orientation == "vertical":
+        axis_len = width
+    else:  # "horizontal"
+        axis_len = height
+
+    coords = np.linspace(0.0, 1.0, axis_len, endpoint=False)
 
     for f in freqs:
         freq_surfaces: List[pygame.Surface] = []
         freq_raw: List[np.ndarray] = []
 
         for delta in deltas:
-            # Base sinusoid: 0.5 +/- 0.5 * sin()
-            phase = 2.0 * np.pi * f * xs + delta
+            phase = 2.0 * np.pi * f * coords + delta
             stripe = 0.5 + 0.5 * CONTRAST_SCALE * np.sin(phase)  # 0..1
 
-            # Expand to full image
-            img = np.tile(stripe, (height, 1)).astype(np.float32)
+            if orientation == "vertical":
+                # stripe varies along x, replicate along y
+                img = np.tile(stripe, (height, 1)).astype(np.float32)
+            else:
+                # stripe varies along y, replicate along x
+                img = np.tile(stripe[:, None], (1, width)).astype(np.float32)
 
             # Store linear pattern before brightness scaling
             freq_raw.append(img.copy())

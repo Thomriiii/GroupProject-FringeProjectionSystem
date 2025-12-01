@@ -1,33 +1,21 @@
-"""
-server.py
+# server.py
 
+"""
 Flask web server for the structured-light scanner.
 
 Responsibilities:
-  - Serve a simple HTML UI
+  - Serve a clean HTML UI from templates/index.html
   - Provide a /video MJPEG live camera stream
   - Provide a /scan endpoint to trigger the scan
+  - Provide a /calib_capture endpoint to capture a calibration pose
   - Display scan status and last-scan directory
-
-This module does *not* directly interact with pygame.
-Instead, it calls ScanController.run_scan() inside a worker thread.
-
-CameraController:
-    server uses camera.capture_rgb() for live MJPEG stream.
-
-ScanController:
-    server calls scan_controller.run_scan() in a background worker thread.
-
-Threading:
-    A simple lock protects scan_status and last_scan_dir.
 """
 
 from __future__ import annotations
 
 import threading
-import time
 
-from flask import Flask, Response, render_template_string
+from flask import Flask, Response, render_template
 
 import cv2
 import numpy as np
@@ -36,77 +24,39 @@ import numpy as np
 class WebServer:
     """
     Flask server wrapper.
-
-    Attributes
-    ----------
-    app : Flask
-        The Flask application object.
-    camera : CameraController
-        Passed externally.
-    scan_controller : ScanController
-        Full scan pipeline manager.
-    scan_lock : threading.Lock
-        Ensures only one scan runs at a time.
-    scan_status : str
-        "Idle", "Running", or "Complete".
-    last_scan_dir : str or None
-        Path to the last completed scan directory.
     """
 
     def __init__(self, camera, scan_controller):
         self.camera = camera
         self.scan_controller = scan_controller
 
+        # Single lock to prevent concurrent scan/calibration
         self.scan_lock = threading.Lock()
         self.scan_status = "Idle"
         self.last_scan_dir = None
 
-        self.app = Flask(__name__)
+        self.app = Flask(
+            __name__,
+            static_folder="static",
+            template_folder="templates"
+        )
         self._setup_routes()
 
     # =====================================================================
     # ROUTES
     # =====================================================================
 
-    INDEX_HTML = """
-<!doctype html>
-<html>
-<head>
-    <title>Fringe Projection Scanner</title>
-</head>
-<body>
-    <h1>Fringe Projection Scanner</h1>
-
-    <h2>Live Camera</h2>
-    <img src="/video" style="max-width: 640px;"><br><br>
-
-    <h2>Status: <strong>{{ status }}</strong></h2>
-    {% if last_dir %}
-        <p>Last scan directory: {{ last_dir }}</p>
-    {% endif %}
-
-    <form method="post" action="/scan">
-        <button type="submit">Run Scan</button>
-    </form>
-
-    <p>Projector output is updating in real time.</p>
-</body>
-</html>
-"""
-
     def _setup_routes(self):
         app = self.app
 
-        # index
         @app.route("/")
         def index():
-            return render_template_string(
-                self.INDEX_HTML,
+            return render_template(
+                "index.html",
                 status=self.scan_status,
                 last_dir=self.last_scan_dir,
             )
 
-        # MJPEG stream
         @app.route("/video")
         def video():
             return Response(
@@ -114,12 +64,37 @@ class WebServer:
                 mimetype="multipart/x-mixed-replace; boundary=frame",
             )
 
-        # scan trigger
         @app.post("/scan")
         def scan():
             if not self._start_scan_thread():
-                return "Scan already running. <a href='/'>Back</a>"
-            return "Scan started. <a href='/'>Back</a>"
+                return render_template(
+                    "message.html",
+                    title="Busy",
+                    message="A scan or calibration is already in progress.",
+                    back_url="/"
+                )
+            return render_template(
+                "message.html",
+                title="Scan Started",
+                message="The scan has started successfully.",
+                back_url="/"
+            )
+
+        @app.post("/calib_capture")
+        def calib_capture():
+            if not self._start_calib_thread():
+                return render_template(
+                    "message.html",
+                    title="Busy",
+                    message="A scan or calibration is already in progress.",
+                    back_url="/"
+                )
+            return render_template(
+                "message.html",
+                    title="Calibration Pose Capture Started",
+                    message="Calibration pose capture has started. Move the flat board to a new pose for each capture.",
+                    back_url="/"
+            )
 
     # =====================================================================
     # MJPEG STREAMING
@@ -143,14 +118,14 @@ class WebServer:
             )
 
     # =====================================================================
-    # SCAN THREAD HANDLER
+    # SCAN & CALIBRATION THREAD HANDLERS
     # =====================================================================
 
     def _start_scan_thread(self) -> bool:
         if not self.scan_lock.acquire(blocking=False):
             return False
 
-        self.scan_status = "Running"
+        self.scan_status = "Scan Running"
 
         t = threading.Thread(target=self._run_scan_worker, daemon=True)
         t.start()
@@ -160,7 +135,25 @@ class WebServer:
         try:
             scan_dir = self.scan_controller.run_scan()
             self.last_scan_dir = scan_dir
-            self.scan_status = "Complete"
+            self.scan_status = "Scan Complete"
+        finally:
+            self.scan_lock.release()
+
+    def _start_calib_thread(self) -> bool:
+        if not self.scan_lock.acquire(blocking=False):
+            return False
+
+        self.scan_status = "Calibration Running"
+
+        t = threading.Thread(target=self._run_calib_worker, daemon=True)
+        t.start()
+        return True
+
+    def _run_calib_worker(self):
+        try:
+            pose_dir = self.scan_controller.run_calib_pose()
+            self.last_scan_dir = pose_dir
+            self.scan_status = "Calibration Pose Complete"
         finally:
             self.scan_lock.release()
 
