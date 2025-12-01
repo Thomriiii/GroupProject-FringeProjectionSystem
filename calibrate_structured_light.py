@@ -285,9 +285,9 @@ def build_calib_dataset(
     out_path = os.path.join(session_root, "calib_dataset.npz")
     np.savez(
         out_path,
-        cam_points_list=cam_points_list,
-        proj_points_list=proj_points_list,
-        image_size_cam=image_size_cam,
+        cam_points_list=np.array(cam_points_list, dtype=object),
+        proj_points_list=np.array(proj_points_list, dtype=object),
+        image_size_cam=(W_cam, H_cam),
         proj_size=np.array([proj_width, proj_height], dtype=np.int32),
         freqs=np.array(freqs, dtype=np.int32),
         f_max=int(f_max),

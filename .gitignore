@@ -1,3 +1,7 @@
 # Ignore generated scan data and large binary outputs
 scans/
 **/scans/
+calib/
+**/calib/
+__pycache__/
+**/__pycache__/
