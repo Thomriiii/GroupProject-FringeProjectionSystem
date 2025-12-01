@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Projector Calibration</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/calib.css') }}">
+</head>
+<body>
+  <header>
+    <h1>Projector Calibration</h1>
+    <p>Status: <strong>{{ status }}</strong></p>
+    <p>Session: {{ session or "None" }} | Views: {{ views }}</p>
+    <p>Projector: {{ proj_w }} x {{ proj_h }} | Checkerboard: {{ pattern_cols }} x {{ pattern_rows }} (inner corners), square {{ square_px }} px</p>
+    <p>Gray code bits: X={{ bits_x }}, Y={{ bits_y }}</p>
+  </header>
+
+  <main>
+    <section class="controls">
+      <h2>Capture Checkerboard View</h2>
+      <form method="post" action="{{ url_for('proj_calib_capture') }}">
+        <button type="submit">Project & Capture</button>
+      </form>
+
+      <h2>Solve Projector Intrinsics</h2>
+      <form method="post" action="{{ url_for('proj_calib_solve') }}">
+        <button type="submit" class="finish">Solve and Save</button>
+      </form>
+
+      <div class="tips">
+        <h3>Instructions</h3>
+        <ul>
+          <li>Capture several poses (move/tilt the target) to improve calibration.</li>
+          <li>Camera intrinsics must exist at camera_intrinsics.npz before solving.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="video">
+      <h2>Live Camera</h2>
+      <img src="{{ url_for('video') }}" alt="Live video feed">
+    </section>
+  </main>
+</body>
+</html>

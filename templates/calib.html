@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Camera Calibration</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/calib.css') }}">
+</head>
+<body>
+  <header>
+    <h1>Camera Calibration</h1>
+    <p>Checkerboard: <strong>{{ cb_cols }} × {{ cb_rows }} inner corners</strong> (9×7 squares). Default square size: <strong>{{ cb_square_size }} m</strong>.</p>
+    <p class="status">Status: {{ cb_status }}</p>
+    <p class="views">Captured views: {{ cb_views }}</p>
+  </header>
+
+  <main>
+    <section class="video">
+      <h2>Live Camera</h2>
+      <img src="{{ url_for('video') }}" alt="Live video feed">
+    </section>
+
+    <section class="controls">
+      <h2>Capture Controls</h2>
+      <form method="post" action="{{ url_for('calib_capture') }}">
+        <label for="square_size">Square size (meters):</label>
+        <input type="number" id="square_size" name="square_size" step="0.001" value="{{ cb_square_size }}" min="0.001">
+        <button type="submit">Capture Checkerboard View</button>
+      </form>
+
+      <form method="post" action="{{ url_for('calib_finish') }}">
+        <label for="square_size_finish">Square size (meters):</label>
+        <input type="number" id="square_size_finish" name="square_size" step="0.001" value="{{ cb_square_size }}" min="0.001">
+        <button type="submit" class="finish">Finish Calibration</button>
+      </form>
+
+      <div class="tips">
+        <h3>Tips</h3>
+        <ul>
+          <li>Use a printed checkerboard with 8×6 inner corners (9×7 squares).</li>
+          <li>Move and tilt the board: center, corners, near, far, slight rotations.</li>
+          <li>Capture at least 8–12 diverse views for a stable result.</li>
+          <li>Avoid motion blur and glare; keep the board in focus.</li>
+        </ul>
+      </div>
+    </section>
+  </main>
+</body>
+</html>
