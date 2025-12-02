@@ -81,9 +81,6 @@ class ScanController:
         # Calibration session state
         self.calib_session_root: str | None = None
         self.calib_pose_idx: int = 0
-        # Gray-code calibration session state
-        self.graycode_root = "calib_graycode"
-        os.makedirs(self.graycode_root, exist_ok=True)
 
     # =====================================================================
     # INTERNAL HELPERS
@@ -121,46 +118,6 @@ class ScanController:
         pose_dir = os.path.join(session_root, pose_name)
         os.makedirs(pose_dir, exist_ok=True)
         print(f"[CALIB] Creating calibration pose directory: {pose_dir}")
-        return pose_dir
-
-    # =====================================================================
-    # GRAY CODE CAPTURE (for projector calibration)
-    # =====================================================================
-    def run_graycode_pose(self, patterns_gray: list[tuple[str, object]], session_root: str) -> str:
-        """
-        Capture a single Gray code pose.
-
-        Parameters
-        ----------
-        patterns_gray : list[(label, pygame.Surface)]
-            Gray code patterns to project.
-        session_root : str
-            Root session directory under calib_graycode.
-
-        Returns
-        -------
-        pose_dir : str
-        """
-        pose_idx = 0
-        while True:
-            candidate = os.path.join(session_root, f"pose_{pose_idx:03d}")
-            if not os.path.exists(candidate):
-                pose_dir = candidate
-                break
-            pose_idx += 1
-        os.makedirs(pose_dir, exist_ok=True)
-        print(f"[GRAY] Capturing Gray code pose at {pose_dir}")
-
-        images = {}
-        for i, (label, surf) in enumerate(patterns_gray):
-            self.set_surface_callback(surf)
-            time.sleep(self.pattern_settle_time)
-            gray = self.camera.capture_gray().astype(np.float32)
-            images[label] = gray
-            fname = f"{label}.png"
-            cv2.imwrite(os.path.join(pose_dir, fname), gray)
-            print(f"[GRAY] Captured {fname} (mean={gray.mean():.2f})")
-
         return pose_dir
 
     def _run_auto_exposure(self):
@@ -474,11 +431,11 @@ class ScanController:
 
         # PSP analysis (low freqs only)
         f_low = [4, 8]
-        psp_v = psp_calib.run_psp_calibration(I_vert, f_low, self.n_phase)
-        psp_h = psp_calib.run_psp_calibration(I_horiz, f_low, self.n_phase)
+        psp_v = run_psp_calibration(I_vert, freqs=f_low, n_phase=self.n_phase)
+        psp_h = run_psp_calibration(I_horiz, freqs=f_low, n_phase=self.n_phase)
 
-        mask_v = masking_calib.merge_masks_calibration(psp_v.mask, f_low)
-        mask_h = masking_calib.merge_masks_calibration(psp_h.mask, f_low)
+        mask_v = merge_masks_calibration(psp_v.mask, freqs=f_low)
+        mask_h = merge_masks_calibration(psp_h.mask, freqs=f_low)
 
         unwrap_v = temporal_unwrap(psp_v.phi_wrapped, mask_v, f_low)
         unwrap_h = temporal_unwrap(psp_h.phi_wrapped, mask_h, f_low)

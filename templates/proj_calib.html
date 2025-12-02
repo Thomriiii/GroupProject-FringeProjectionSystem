@@ -9,28 +9,23 @@
   <header>
     <h1>Projector Calibration</h1>
     <p>Status: <strong>{{ status }}</strong></p>
-    <p>Session: {{ session or "None" }} | Views: {{ views }}</p>
-    <p>Projector: {{ proj_w }} x {{ proj_h }} | Checkerboard: {{ pattern_cols }} x {{ pattern_rows }} (inner corners), square {{ square_px }} px</p>
-    <p>Gray code bits: X={{ bits_x }}, Y={{ bits_y }}</p>
+    <p>Session: {{ session or "None" }} | Poses: {{ views }}</p>
+    <p>Projector: {{ proj_w }} x {{ proj_h }}</p>
   </header>
 
   <main>
     <section class="controls">
-      <h2>Capture Checkerboard View</h2>
-      <form method="post" action="{{ url_for('proj_calib_capture') }}">
-        <button type="submit">Project & Capture</button>
-      </form>
-
-      <h2>Solve Projector Intrinsics</h2>
-      <form method="post" action="{{ url_for('proj_calib_solve') }}">
-        <button type="submit" class="finish">Solve and Save</button>
+      <h2>PSP Calibration</h2>
+      <p>Collects vertical + horizontal PSP poses automatically and solves projector intrinsics.</p>
+      <form method="post" action="{{ url_for('calib_psp_start') }}">
+        <button type="submit" class="finish">Run PSP Calibration</button>
       </form>
 
       <div class="tips">
         <h3>Instructions</h3>
         <ul>
-          <li>Capture several poses (move/tilt the target) to improve calibration.</li>
-          <li>Camera intrinsics must exist at camera_intrinsics.npz before solving.</li>
+          <li>Ensure camera_intrinsics.npz exists before starting.</li>
+          <li>Move the planar target (A4 white sheet) across the view while the poses capture.</li>
         </ul>
       </div>
     </section>
