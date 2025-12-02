@@ -29,12 +29,21 @@
     </section>
 
     <section>
-        <h2>Calibration</h2>
-        <p>Place a flat white board in view, tilt it to a new pose, then capture a calibration pose.</p>
-        <form method="post" action="/calib_capture">
-            <button type="submit" class="scan-btn">Capture Calibration Pose</button>
-        </form>
+        <h2>Camera-Calibration</h2>
+        <p>Checkerboard Pattern</p> 
+            <a href="/calib.html"><button type="submit" class="scan-btn">Capture Calibration Pose</button></section></a>
     </section>
+
+    <div class="section">
+        <h2>Projector Calibration (PSP)</h2>
+        <p>Status: <strong>{{ psp_status }}</strong></p>
+        <p>Poses: {{ psp_views }}</p>
+
+    <form method="post" action="/calib_psp_start">
+          <button type="submit">Calibrate Projector (PSP)</button>
+    </form>
+</div>
+
 
     <p class="note">Projector output updates in real time.</p>
 

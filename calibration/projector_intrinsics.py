@@ -1,191 +1,194 @@
-#!/usr/bin/env python3
 """
-calibration/projector_intrinsics.py
+projector_intrinsics.py
 
-Calibrate projector intrinsics (and camera–projector extrinsics) using
-correspondences from structured-light captures.
+Solve projector intrinsics + camera-projector extrinsics
+using a PSP-generated dataset.
 
-Inputs:
-    camera_intrinsics.npz (K, dist, size)
-    calib_dataset.npz     (cam_points_list, proj_points_list, proj_size)
+Input:
+    dataset:
+        cam_points : list of Nx2 arrays  (camera pixels)
+        proj_points: list of Nx2 arrays  (projector pixels)
+        proj_w, proj_h
 
-Process:
-    - Undistort camera points
-    - Fit homographies between cam (undistorted) and projector points
-    - Solve projector intrinsics via Zhang's method
-    - Compute extrinsics (R, t) between camera and projector
-
-Outputs:
-    projector_intrinsics.npz  (K)
-    stereo_params.npz         (R, t) projector relative to camera
+Output:
+    Saves:
+      projector_intrinsics_psp.npz
+      stereo_params_psp.npz
 """
 
 from __future__ import annotations
-
-import argparse
+import os
 import numpy as np
 import cv2
-from typing import List, Tuple
 
 
-# -------------------------------------------------------------------------
-# Helper: Normalize homography
-# -------------------------------------------------------------------------
-def normalize_H(H: np.ndarray) -> np.ndarray:
-    H = H / np.linalg.norm(H[:, 0])
-    return H
+def zhang_solve_intrinsics(proj_pts_list, cam_pts_list):
+    """
+    Solve projector intrinsics Kp using homographies (Zhang method).
+    proj_pts_list : list of Nx2 projector coords per pose
+    cam_pts_list  : list of Nx2 camera coords per pose
+    """
 
+    print("[INTR] Solving projector intrinsics using Zhang method...")
 
-# -------------------------------------------------------------------------
-# Zhang intrinsics from homographies
-# -------------------------------------------------------------------------
-def solve_intrinsics_from_homographies(H_list: List[np.ndarray]) -> np.ndarray:
     V = []
 
-    def v_ij(H, i, j):
-        return np.array([
-            H[0, i] * H[0, j],
-            H[0, i] * H[1, j] + H[1, i] * H[0, j],
-            H[1, i] * H[1, j],
-            H[0, i] * H[2, j] + H[2, i] * H[0, j],
-            H[1, i] * H[2, j] + H[2, i] * H[1, j],
-            H[2, i] * H[2, j],
-        ])
-
-    for H in H_list:
+    for cam_pts, proj_pts in zip(cam_pts_list, proj_pts_list):
+        H, _ = cv2.findHomography(proj_pts, cam_pts, method=cv2.RANSAC)
         if H is None:
             continue
-        H = normalize_H(H)
-        V.append(v_ij(H, 0, 1))
-        V.append(v_ij(H, 0, 0) - v_ij(H, 1, 1))
 
-    if not V:
-        raise RuntimeError("No valid homographies to solve intrinsics; check dataset.")
+        h1 = H[:, 0]
+        h2 = H[:, 1]
 
-    V = np.array(V)
-    _, _, VT = np.linalg.svd(V)
-    b = VT[-1]
+        v12 = np.array([
+            h1[0]*h2[0],
+            h1[0]*h2[1] + h1[1]*h2[0],
+            h1[1]*h2[1],
+            h1[2]*h2[0] + h1[0]*h2[2],
+            h1[2]*h2[1] + h1[1]*h2[2],
+            h1[2]*h2[2]
+        ])
+
+        v11 = np.array([
+            h1[0]*h1[0],
+            h1[0]*h1[1] + h1[1]*h1[0],
+            h1[1]*h1[1],
+            h1[2]*h1[0] + h1[0]*h1[2],
+            h1[2]*h1[1] + h1[1]*h1[2],
+            h1[2]*h1[2]
+        ])
+
+        v22 = np.array([
+            h2[0]*h2[0],
+            h2[0]*h2[1] + h2[1]*h2[0],
+            h2[1]*h2[1],
+            h2[2]*h2[0] + h2[0]*h2[2],
+            h2[2]*h2[1] + h2[1]*h2[2],
+            h2[2]*h2[2]
+        ])
+
+        V.append(v12)
+        V.append(v11 - v22)
+
+    V = np.vstack(V)
+
+    # Solve Vb=0
+    _, _, vh = np.linalg.svd(V)
+    b = vh[-1]
 
     B = np.array([
         [b[0], b[1], b[3]],
         [b[1], b[2], b[4]],
-        [b[3], b[4], b[5]],
+        [b[3], b[4], b[5]]
     ])
 
-    if B[0, 0] < 0:
-        B = -B
-
-    denom = (B[0, 0] * B[1, 1] - B[0, 1]**2)
-    if abs(denom) < 1e-12 or abs(B[0, 0]) < 1e-12:
-        raise RuntimeError("Degenerate homography set: unable to solve intrinsics.")
-
-    cy = (B[0, 1] * B[0, 2] - B[0, 0] * B[1, 2]) / denom
-    lam = B[2, 2] - (B[0, 2]**2 + cy*(B[0, 1]*B[0, 2] - B[0, 0]*B[1, 2])) / B[0, 0]
-
-    lam = abs(lam)
-    denom_abs = abs(denom)
-
-    fx = np.sqrt(abs(lam / B[0, 0]))
-    fy = np.sqrt(abs(lam * B[0, 0] / denom_abs))
-    s = -B[0, 1] * fx**2 * fy / lam
-    cx = s * cy / fy - B[0, 2] * fx**2 / lam
+    # Recover intrinsics
+    cy = (B[0, 1]*B[0, 2] - B[0, 0]*B[1, 2]) / (B[0, 0]*B[1, 1] - B[0, 1]**2)
+    lam = B[0, 2] - (B[0, 1]*cy)
+    fx = np.sqrt(lam / B[0, 0])
+    fy = np.sqrt((lam*B[0, 0]) / (B[0, 0]*B[1, 1] - B[0, 1]**2))
+    cx = -B[0, 2] / B[0, 0]
+    cy = cy
 
     K = np.array([
-        [fx, s,  cx],
+        [fx, 0,  cx],
         [0,  fy, cy],
-        [0,  0,  1]
+        [0,   0,  1]
     ])
+
+    print("[INTR] Initial projector intrinsics:")
+    print(K)
+
     return K
 
 
-# -------------------------------------------------------------------------
-# Extrinsics from homography
-# -------------------------------------------------------------------------
-def extrinsics_from_H(K: np.ndarray, H: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    Kinv = np.linalg.inv(K)
-    h1 = H[:, 0]
-    h2 = H[:, 1]
-    h3 = H[:, 2]
+def refine_intrinsics(K_init, proj_pts_list, cam_pts_list):
+    print("[INTR] Refining intrinsics via calibrateCamera()...")
 
-    lam = 1.0 / np.linalg.norm(Kinv @ h1)
-    r1 = lam * (Kinv @ h1)
-    r2 = lam * (Kinv @ h2)
-    r3 = np.cross(r1, r2)
-    t = lam * (Kinv @ h3)
+    objpoints = []
+    imgpoints = []
 
-    R = np.column_stack([r1, r2, r3])
-    U, _, VT = np.linalg.svd(R)
-    R = U @ VT
+    for proj, cam in zip(proj_pts_list, cam_pts_list):
+        objpoints.append(proj.reshape(-1, 1, 2).astype(np.float32))
+        imgpoints.append(cam.reshape(-1, 1, 2).astype(np.float32))
+
+    # Get camera size
+    if os.path.exists("camera_intrinsics.npz"):
+        cam_data = np.load("camera_intrinsics.npz")
+        W, H = cam_data["size"]  # [1280, 720]
+    else:
+        H, W = 720, 1280
+
+    ret, K, dist, rvecs, tvecs = cv2.calibrateCamera(
+        objpoints,
+        imgpoints,
+        (int(W), int(H)),
+        K_init,
+        None,
+        flags=cv2.CALIB_USE_INTRINSIC_GUESS
+    )
+
+    print("[INTR] Refinement RMS:", ret)
+    print("[INTR] Final K:")
+    print(K)
+    print("[INTR] Distortion:")
+    print(dist)
+
+    return K, dist, rvecs, tvecs, ret
+
+
+def solve_stereo(Kp, proj_pts_list, cam_pts_list):
+    """
+    Solve camera–projector extrinsics using cv2.solvePnP().
+    """
+
+    print("[STEREO] Solving camera→projector pose...")
+
+    # Use the largest pose
+    i = np.argmax([pts.shape[0] for pts in proj_pts_list])
+
+    proj_pts = proj_pts_list[i]
+    cam_pts = cam_pts_list[i]
+
+    # We treat projector coords as 3D points on z=0 plane
+    obj = np.column_stack([proj_pts, np.zeros(len(proj_pts))]).astype(np.float32)
+    img = cam_pts.astype(np.float32)
+
+    # Solve Pose
+    ret, rvec, tvec = cv2.solvePnP(obj, img, Kp, None)
+
+    R, _ = cv2.Rodrigues(rvec)
+    t = tvec.reshape(3)
+
+    print("[STEREO] R:")
+    print(R)
+    print("[STEREO] t:")
+    print(t)
+
     return R, t
 
 
-# -------------------------------------------------------------------------
-# Calibration pipeline
-# -------------------------------------------------------------------------
-def calibrate(dataset_path: str, cam_intr_path: str):
-    print(f"[CALIB] Loading camera intrinsics: {cam_intr_path}")
-    cam_intr = np.load(cam_intr_path)
-    K_cam = cam_intr["K"]
-    dist_cam = cam_intr["dist"]
+def solve_from_dataset(dataset):
+    cam_points = dataset["cam_points"]
+    proj_points = dataset["proj_points"]
 
-    print(f"[CALIB] Loading dataset: {dataset_path}")
-    data = np.load(dataset_path, allow_pickle=True)
-    cam_pts_list = data["cam_points_list"]
-    proj_pts_list = data["proj_points_list"]
+    K_init = zhang_solve_intrinsics(proj_points, cam_points)
 
-    H_list = []
+    K_refined, dist, rvecs, tvecs, rms = refine_intrinsics(K_init, proj_points, cam_points)
 
-    cam_undist_list = []
-    for cam_pts in cam_pts_list:
-        cam_pts = np.asarray(cam_pts, dtype=np.float32)
-        cam_pts_ud = cv2.undistortPoints(
-            cam_pts.reshape(-1, 1, 2), K_cam, dist_cam, P=K_cam
-        ).reshape(-1, 2)
-        cam_undist_list.append(cam_pts_ud)
+    R, t = solve_stereo(K_refined, proj_points, cam_points)
 
-    for idx, (cam_ud, proj) in enumerate(zip(cam_undist_list, proj_pts_list)):
-        proj = np.asarray(proj, dtype=np.float32)
+    np.savez("projector_intrinsics_psp.npz", K=K_refined, dist=dist)
+    np.savez("stereo_params_psp.npz", R=R, t=t)
 
-        if cam_ud.shape[0] < 4 or proj.shape[0] < 4:
-            print(f"[CALIB][WARN] Pose {idx}: not enough correspondences (have {cam_ud.shape[0]}), skipping.")
-            continue
+    print("[INTR] Saved projector_intrinsics_psp.npz")
+    print("[STEREO] Saved stereo_params_psp.npz")
 
-        H, _ = cv2.findHomography(cam_ud, proj, method=cv2.RANSAC, ransacReprojThreshold=3.0)
-        if H is None:
-            print(f"[CALIB][WARN] Pose {idx}: homography estimation failed, skipping.")
-            continue
-
-        H_list.append(H)
-
-    if not H_list:
-        raise RuntimeError("No valid homographies; check dataset and captures.")
-
-    print("[CALIB] Solving projector intrinsics...")
-    K_proj = solve_intrinsics_from_homographies(H_list)
-    print("Projector K:\n", K_proj)
-
-    # Extrinsics (use first pose as reference)
-    H0 = H_list[0]
-    R_cam, t_cam = extrinsics_from_H(K_cam, H0)
-    H0_inv = np.linalg.inv(H0)
-    R_proj, t_proj = extrinsics_from_H(K_proj, H0_inv)
-
-    R_cam_proj = R_proj @ R_cam.T
-    t_cam_proj = t_proj - R_cam_proj @ t_cam
-
-    np.savez("projector_intrinsics.npz", K=K_proj)
-    np.savez("stereo_params.npz", R=R_cam_proj, t=t_cam_proj)
-
-    print("[CALIB] Saved projector_intrinsics.npz and stereo_params.npz")
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Projector calibration using structured-light dataset.")
-    parser.add_argument("--dataset", required=True, help="Path to calib_dataset.npz")
-    parser.add_argument("--camera", default="camera_intrinsics.npz", help="Path to camera intrinsics (npz).")
-    args = parser.parse_args()
-    calibrate(args.dataset, args.camera)
-
-
-if __name__ == "__main__":
-    main()
+    return {
+        "K": K_refined,
+        "dist": dist,
+        "R": R,
+        "t": t,
+        "rms": rms
+    }

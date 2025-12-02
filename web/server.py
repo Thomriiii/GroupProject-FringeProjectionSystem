@@ -73,6 +73,11 @@ class WebServer:
         self.graycode_status = "Idle"
         self.graycode_views = 0
         self.graycode_dataset: str | None = None
+        # PSP calibration state
+        self.psp_status = "Idle"
+        self.psp_views = 0
+        self.psp_lock = threading.Lock()
+
 
         self.app = Flask(
             __name__,
@@ -226,6 +231,16 @@ class WebServer:
         def calib_graycode_finish():
             self._finish_graycode_calibration()
             return redirect(url_for("index"))
+        
+        # -------------------------------
+        # PSP Calibration (placeholder)
+        # -------------------------------
+        @app.post("/calib_psp_start")
+        def calib_psp_start():
+            if not self._start_psp_thread():
+                return "Already running. <a href='/'>Back</a>"
+            return "PSP calibration started. <a href='/'>Back</a>"
+
 
     # ============================================================
     # MJPEG STREAMING
@@ -378,6 +393,34 @@ class WebServer:
             image_size_cam=self.proj_calib_image_size,
         )
         return ds_path
+    
+    def _start_psp_thread(self):
+        if not self.psp_lock.acquire(blocking=False):
+            return False
+
+        t = threading.Thread(target=self._run_psp_worker, daemon=True)
+        t.start()
+        return True
+    
+    def _run_psp_worker(self):
+        try:
+            self.psp_status = "Running"
+            session = self.scan_controller.start_psp_session()
+
+        # Capture 10 poses automatically
+            for i in range(10):
+                self.psp_status = f"Capturing pose {i+1}/10"
+                pose_dir = self.scan_controller.run_calib_pose_psp()
+                self.psp_views += 1
+
+            self.psp_status = "Solving intrinsics"
+            out = self.scan_controller.solve_psp_calibration(session)
+
+            self.psp_status = f"Complete: {out}"
+        finally:
+            self.psp_lock.release()
+
+
 
     # ============================================================
     # GRAY CODE CALIBRATION (new workflow)
