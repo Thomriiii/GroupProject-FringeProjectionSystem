@@ -9,11 +9,11 @@ from __future__ import annotations
 import threading
 
 # Local modules
-from projector import Projector
-from patterns import generate_psp_patterns, generate_midgrey_surface
-from camera import CameraController
-from scan import ScanController
-from server import WebServer
+from core.projector import Projector
+from core.patterns import generate_psp_patterns, generate_midgrey_surface
+from core.camera import CameraController
+from core.scan import ScanController
+from web.server import WebServer
 
 
 # =====================================================================
@@ -86,7 +86,8 @@ def main():
     # ============================================================
     scan_controller = ScanController(
         camera=camera,
-        patterns_vert=patterns_vert,
+        patterns=patterns_vert,
+        patterns_horiz=patterns_horiz,
         midgrey_surface=midgrey_surface,
         set_surface_callback=projector.set_surface,
         freqs=FREQS,
@@ -94,7 +95,6 @@ def main():
         scan_root=SCAN_ROOT,
         calib_root=CALIB_ROOT,
         pattern_settle_time=0.15,
-        calib_patterns_horiz=patterns_horiz,
     )
 
     # ============================================================

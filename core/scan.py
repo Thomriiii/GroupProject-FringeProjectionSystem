@@ -58,6 +58,7 @@ class ScanController:
         set_surface_callback,
         freqs: List[int],
         n_phase: int,
+        patterns_horiz: Dict[int, List[object]] | None = None,
         scan_root: str = "scans",
         calib_root: str = "calib",
         pattern_settle_time: float = 0.15,
@@ -68,6 +69,7 @@ class ScanController:
         self.set_surface_callback = set_surface_callback
         self.freqs = freqs
         self.n_phase = n_phase
+        self.patterns_horiz = patterns_horiz  # optional dict for horizontal fringes
         self.scan_root = scan_root
         self.calib_root = calib_root
         self.pattern_settle_time = pattern_settle_time
@@ -322,13 +324,15 @@ class ScanController:
 
         for f in self.freqs:
             for k in range(self.n_phase):
-                pattern = self.patterns[f][k]
-                pattern_h = pygame.transform.rotate(pattern, 90)
-                pattern_h = pygame.transform.smoothscale(
-                    pattern_h, (self.proj_w, self.proj_h)
-                )
+                if self.patterns_horiz is not None:
+                    pattern = self.patterns_horiz[f][k]
+                else:
+                    pattern = pygame.transform.rotate(self.patterns[f][k], 90)
+                    pattern = pygame.transform.smoothscale(
+                        pattern, (self.proj_w, self.proj_h)
+                    )
 
-                self.set_surface_callback(pattern_h)
+                self.set_surface_callback(pattern)
                 time.sleep(self.pattern_settle_time)
 
                 gray = self.camera.capture_gray().astype(np.float32)
@@ -422,7 +426,11 @@ class ScanController:
         I_horiz = {}
         for f in self.freqs:
             for k in range(self.n_phase):
-                surf = pygame.transform.rotate(self.patterns[f][k], 90)
+                if self.patterns_horiz is not None:
+                    surf = self.patterns_horiz[f][k]
+                else:
+                    surf = pygame.transform.rotate(self.patterns[f][k], 90)
+                    surf = pygame.transform.smoothscale(surf, (self.proj_w, self.proj_h))
                 self.set_surface_callback(surf)
                 time.sleep(self.pattern_settle_time)
                 gray = self.camera.capture_gray().astype(np.float32)
@@ -431,14 +439,18 @@ class ScanController:
 
         # PSP analysis (low freqs only)
         f_low = [4, 8]
-        psp_v = run_psp_calibration(I_vert, freqs=f_low, n_phase=self.n_phase)
-        psp_h = run_psp_calibration(I_horiz, freqs=f_low, n_phase=self.n_phase)
+        phi_v_wrapped, masks_v_raw = run_psp_calibration(
+            I_vert, freqs=f_low, n_phase=self.n_phase
+        )
+        phi_h_wrapped, masks_h_raw = run_psp_calibration(
+            I_horiz, freqs=f_low, n_phase=self.n_phase
+        )
 
-        mask_v = merge_masks_calibration(psp_v.mask, freqs=f_low)
-        mask_h = merge_masks_calibration(psp_h.mask, freqs=f_low)
+        mask_v = merge_masks_calibration(masks_v_raw, freqs=f_low)
+        mask_h = merge_masks_calibration(masks_h_raw, freqs=f_low)
 
-        unwrap_v = temporal_unwrap(psp_v.phi_wrapped, mask_v, f_low)
-        unwrap_h = temporal_unwrap(psp_h.phi_wrapped, mask_h, f_low)
+        unwrap_v = temporal_unwrap(phi_v_wrapped, mask_v, f_low)
+        unwrap_h = temporal_unwrap(phi_h_wrapped, mask_h, f_low)
 
         np.save(os.path.join(pose_dir, "phi_vert.npy"), unwrap_v.Phi_final)
         np.save(os.path.join(pose_dir, "mask_vert.npy"), unwrap_v.mask_final)
@@ -456,4 +468,3 @@ class ScanController:
         )
         out = projector_intrinsics.solve_from_dataset(dataset)
         return out
-

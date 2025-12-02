@@ -65,8 +65,45 @@ def run_calibration(
     imgpoints: List[np.ndarray],
     image_size: Tuple[int, int],
 ):
-    """Run cv2.calibrateCamera on accumulated views."""
-    return cv2.calibrateCamera(objpoints, imgpoints, image_size, None, None)
+    """
+    Run cv2.calibrateCamera with a centre principal point prior.
+
+    Strategy:
+      1) Fix principal point at image centre, fix K2/K3 to zero.
+      2) Relax K2 if needed.
+      3) Relax K2+K3 if still failing.
+    Returns (rms, K, dist, rvecs, tvecs, strategy).
+    """
+    cx = image_size[0] * 0.5
+    cy = image_size[1] * 0.5
+    f_init = max(image_size)
+    K0 = np.array([[f_init, 0, cx], [0, f_init, cy], [0, 0, 1]], dtype=np.float64)
+    dist0 = np.zeros((5, 1), dtype=np.float64)
+
+    flags_common = cv2.CALIB_USE_INTRINSIC_GUESS | cv2.CALIB_FIX_PRINCIPAL_POINT
+    attempts = [
+        ("fixed K2/K3", flags_common | cv2.CALIB_FIX_K2 | cv2.CALIB_FIX_K3),
+        ("relaxed K2", flags_common | cv2.CALIB_FIX_K3),
+        ("relaxed K2/K3", flags_common),
+    ]
+
+    last_err = None
+    for desc, flags in attempts:
+        try:
+            rms, K, dist, rvecs, tvecs = cv2.calibrateCamera(
+                objpoints,
+                imgpoints,
+                image_size,
+                K0.copy(),
+                dist0.copy(),
+                flags=flags,
+            )
+            return rms, K, dist, rvecs, tvecs, desc
+        except cv2.error as e:
+            last_err = str(e)
+            continue
+
+    raise RuntimeError(f"Calibration failed after relaxations: {last_err}")
 
 
 class WebServer:
@@ -332,7 +369,7 @@ class WebServer:
                 return False, msg
 
             print(f"[CAM-CAL] Running calibration on {self.cb_views} views...")
-            rms, K, dist, _, _ = run_calibration(
+            rms, K, dist, _, _, strategy = run_calibration(
                 self.cb_objpoints,
                 self.cb_imgpoints,
                 self.cb_image_size,
@@ -341,6 +378,7 @@ class WebServer:
             print("RMS:", rms)
             print("K:\n", K)
             print("dist:", dist)
+            print("Strategy:", strategy)
 
             np.savez(
                 "camera_intrinsics.npz",
@@ -349,7 +387,10 @@ class WebServer:
                 size=self.cb_image_size,
             )
 
-            msg = f"Calibration complete. RMS={rms:.3f}. Saved camera_intrinsics.npz"
+            msg = (
+                f"Calibration complete ({strategy}). "
+                f"RMS={rms:.3f}. Saved camera_intrinsics.npz"
+            )
             self.cb_last_rms = float(rms)
             self.cb_status = msg
             return True, msg

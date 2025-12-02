@@ -22,21 +22,45 @@ import numpy as np
 import cv2
 
 
-def zhang_solve_intrinsics(proj_pts_list, cam_pts_list):
+def _fallback_intrinsics(proj_pts_list):
+    all_proj = np.vstack(proj_pts_list)
+    cx = np.median(all_proj[:, 0])
+    cy = np.median(all_proj[:, 1])
+    span_x = all_proj[:, 0].max() - all_proj[:, 0].min()
+    span_y = all_proj[:, 1].max() - all_proj[:, 1].min()
+    f = max(span_x, span_y)
+    K = np.array([[f, 0, cx], [0, f, cy], [0, 0, 1]], dtype=np.float64)
+    print("[INTR] Warning: Zhang solve degenerate; using fallback guess from projector extents.")
+    return K
+
+
+def zhang_solve_intrinsics(proj_pts_list, cam_pts_list, max_pts: int = 8000):
     """
     Solve projector intrinsics Kp using homographies (Zhang method).
     proj_pts_list : list of Nx2 projector coords per pose
     cam_pts_list  : list of Nx2 camera coords per pose
+    max_pts : cap correspondences per pose to keep RANSAC tractable
     """
 
     print("[INTR] Solving projector intrinsics using Zhang method...")
 
     V = []
+    rng = np.random.default_rng(0)
+    poses_used = 0
 
     for cam_pts, proj_pts in zip(cam_pts_list, proj_pts_list):
-        H, _ = cv2.findHomography(proj_pts, cam_pts, method=cv2.RANSAC)
+        if len(cam_pts) > max_pts:
+            idx = rng.choice(len(cam_pts), size=max_pts, replace=False)
+            cam_use = cam_pts[idx]
+            proj_use = proj_pts[idx]
+        else:
+            cam_use = cam_pts
+            proj_use = proj_pts
+
+        H, _ = cv2.findHomography(proj_use, cam_use, method=cv2.RANSAC)
         if H is None:
             continue
+        poses_used += 1
 
         h1 = H[:, 0]
         h2 = H[:, 1]
@@ -71,6 +95,10 @@ def zhang_solve_intrinsics(proj_pts_list, cam_pts_list):
         V.append(v12)
         V.append(v11 - v22)
 
+    if len(V) < 2:
+        print("[INTR] Warning: insufficient valid poses for Zhang; need at least 1.")
+        return _fallback_intrinsics(proj_pts_list)
+
     V = np.vstack(V)
 
     # Solve Vb=0
@@ -84,12 +112,14 @@ def zhang_solve_intrinsics(proj_pts_list, cam_pts_list):
     ])
 
     # Recover intrinsics
-    cy = (B[0, 1]*B[0, 2] - B[0, 0]*B[1, 2]) / (B[0, 0]*B[1, 1] - B[0, 1]**2)
+    denom = (B[0, 0]*B[1, 1] - B[0, 1]**2)
+    cy = (B[0, 1]*B[0, 2] - B[0, 0]*B[1, 2]) / denom
     lam = B[0, 2] - (B[0, 1]*cy)
+    if B[0, 0] <= 0 or denom <= 0 or lam <= 0:
+        return _fallback_intrinsics(proj_pts_list)
     fx = np.sqrt(lam / B[0, 0])
-    fy = np.sqrt((lam*B[0, 0]) / (B[0, 0]*B[1, 1] - B[0, 1]**2))
+    fy = np.sqrt((lam*B[0, 0]) / denom)
     cx = -B[0, 2] / B[0, 0]
-    cy = cy
 
     K = np.array([
         [fx, 0,  cx],
@@ -110,8 +140,13 @@ def refine_intrinsics(K_init, proj_pts_list, cam_pts_list):
     imgpoints = []
 
     for proj, cam in zip(proj_pts_list, cam_pts_list):
-        objpoints.append(proj.reshape(-1, 1, 2).astype(np.float32))
+        # Treat projector coordinates as lying on z=0 plane for PnP.
+        obj = np.column_stack([proj, np.zeros(len(proj))]).astype(np.float32)
+        objpoints.append(obj.reshape(-1, 1, 3))
         imgpoints.append(cam.reshape(-1, 1, 2).astype(np.float32))
+
+    if not objpoints:
+        raise RuntimeError("No projector/camera correspondences available for refinement.")
 
     # Get camera size
     if os.path.exists("camera_intrinsics.npz"):
@@ -119,6 +154,13 @@ def refine_intrinsics(K_init, proj_pts_list, cam_pts_list):
         W, H = cam_data["size"]  # [1280, 720]
     else:
         H, W = 720, 1280
+
+    # Ensure K_init is finite; fall back to a simple guess if Zhang failed.
+    if not np.isfinite(K_init).all():
+        cx, cy = W * 0.5, H * 0.5
+        f = max(W, H)
+        print("[INTR] Warning: invalid Zhang init; falling back to centre guess.")
+        K_init = np.array([[f, 0, cx], [0, f, cy], [0, 0, 1]], dtype=np.float64)
 
     ret, K, dist, rvecs, tvecs = cv2.calibrateCamera(
         objpoints,
