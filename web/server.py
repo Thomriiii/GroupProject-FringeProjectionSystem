@@ -3,107 +3,23 @@ from __future__ import annotations
 import os
 import threading
 import time
-from typing import List, Tuple
+from pathlib import Path
 
 from flask import Flask, Response, render_template, request, redirect, url_for
 
 import cv2
 import numpy as np
 
-
-# ---------------------------------------------------------------------------
-# Camera calibration helpers (checkerboard)
-# ---------------------------------------------------------------------------
-
-def capture_frame(camera) -> np.ndarray:
-    """Grab an RGB frame from the camera and return grayscale."""
-    frame_rgb = camera.capture_rgb()
-    return cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
-
-
-def detect_checkerboard(gray_frame: np.ndarray, pattern_size: Tuple[int, int]):
-    """Detect and refine inner-corner chessboard points."""
-    flags = (
-        cv2.CALIB_CB_ADAPTIVE_THRESH
-        | cv2.CALIB_CB_NORMALIZE_IMAGE
-        | cv2.CALIB_CB_FAST_CHECK
-    )
-    found, corners = cv2.findChessboardCorners(gray_frame, pattern_size, flags=flags)
-    if not found:
-        return False, None
-
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-    corners_sub = cv2.cornerSubPix(
-        gray_frame,
-        corners,
-        winSize=(11, 11),
-        zeroZone=(-1, -1),
-        criteria=criteria,
-    )
-    return True, corners_sub
-
-
-def add_view(
-    objpoints: List[np.ndarray],
-    imgpoints: List[np.ndarray],
-    corners: np.ndarray,
-    pattern_size: Tuple[int, int],
-    square_size: float,
-):
-    """Append a detected checkerboard view to calibration buffers."""
-    cols, rows = pattern_size
-    objp = np.zeros((cols * rows, 3), np.float32)
-    objp[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2)
-    objp *= float(square_size)
-
-    objpoints.append(objp)
-    imgpoints.append(corners)
-
-
-def run_calibration(
-    objpoints: List[np.ndarray],
-    imgpoints: List[np.ndarray],
-    image_size: Tuple[int, int],
-):
-    """
-    Run cv2.calibrateCamera with a centre principal point prior.
-
-    Strategy:
-      1) Fix principal point at image centre, fix K2/K3 to zero.
-      2) Relax K2 if needed.
-      3) Relax K2+K3 if still failing.
-    Returns (rms, K, dist, rvecs, tvecs, strategy).
-    """
-    cx = image_size[0] * 0.5
-    cy = image_size[1] * 0.5
-    f_init = max(image_size)
-    K0 = np.array([[f_init, 0, cx], [0, f_init, cy], [0, 0, 1]], dtype=np.float64)
-    dist0 = np.zeros((5, 1), dtype=np.float64)
-
-    flags_common = cv2.CALIB_USE_INTRINSIC_GUESS | cv2.CALIB_FIX_PRINCIPAL_POINT
-    attempts = [
-        ("fixed K2/K3", flags_common | cv2.CALIB_FIX_K2 | cv2.CALIB_FIX_K3),
-        ("relaxed K2", flags_common | cv2.CALIB_FIX_K3),
-        ("relaxed K2/K3", flags_common),
-    ]
-
-    last_err = None
-    for desc, flags in attempts:
-        try:
-            rms, K, dist, rvecs, tvecs = cv2.calibrateCamera(
-                objpoints,
-                imgpoints,
-                image_size,
-                K0.copy(),
-                dist0.copy(),
-                flags=flags,
-            )
-            return rms, K, dist, rvecs, tvecs, desc
-        except cv2.error as e:
-            last_err = str(e)
-            continue
-
-    raise RuntimeError(f"Calibration failed after relaxations: {last_err}")
+from calibration import run_calibration_from_folder
+from calibration.camera_calibration import (
+    MIN_BOARD_AREA_FRAC,
+    MIN_BOARD_ASPECT,
+    MIN_MEAN,
+    MAX_MEAN,
+    MIN_STD,
+    compute_image_stats,
+    detect_checkerboard,
+)
 
 
 class WebServer:
@@ -128,15 +44,14 @@ class WebServer:
         self.last_scan_dir = None
 
         # Checkerboard camera calibration state
-        self.cb_checkerboard = (8, 6)        # inner corners (cols, rows)
-        self.cb_square_size = 0.020          # 20 mm squares
-        self.cb_objpoints: list[np.ndarray] = []
-        self.cb_imgpoints: list[np.ndarray] = []
-        self.cb_image_size = None
+        self.cb_checkerboard = (8, 6)        # inner corners (cols, rows) for 9x7 board (10 mm squares)
+        self.cb_square_size = 0.010          # 10 mm squares
         self.cb_views = 0
         self.cb_status = "Not calibrated"
         self.cb_last_rms: float | None = None
         self.cb_lock = threading.Lock()
+        self.cam_calib_root = Path(self.scan_controller.calib_root) / "camera"
+        self.cam_calib_session = self._start_new_calib_session()
 
         self.app = Flask(
             __name__,
@@ -163,6 +78,7 @@ class WebServer:
                 cb_square_size=self.cb_square_size,
                 cb_views=self.cb_views,
                 cb_status=self.cb_status,
+                cb_session=str(self.cam_calib_session),
             )
 
         @app.get("/calib")
@@ -175,6 +91,7 @@ class WebServer:
                 cb_views=self.cb_views,
                 cb_status=self.cb_status,
                 cb_last_rms=self.cb_last_rms,
+                cb_session=str(self.cam_calib_session),
             )
 
         @app.route("/video")
@@ -249,6 +166,14 @@ class WebServer:
     # CHECKERBOARD CALIBRATION
     # ============================================================
 
+    def _start_new_calib_session(self) -> Path:
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        session = self.cam_calib_root / f"session_{timestamp}"
+        session.mkdir(parents=True, exist_ok=True)
+        (session / "debug_corners").mkdir(exist_ok=True)
+        print(f"[CAM-CAL] New calibration session at {session}")
+        return session
+
     def _capture_checkerboard_view(self):
         with self.cb_lock:
             try:
@@ -258,26 +183,47 @@ class WebServer:
             except Exception:
                 pass
 
-            gray = capture_frame(self.camera)
+            frame_rgb = self.camera.capture_rgb()
+            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
 
-            found, corners = detect_checkerboard(gray, self.cb_checkerboard)
-            if not found or corners is None:
-                self.cb_status = "Checkerboard NOT found. Adjust pose/lighting."
+            mean, std, min_val, max_val = compute_image_stats(gray)
+            if mean < MIN_MEAN:
+                self.cb_status = f"Rejected frame: too dark (mean={mean:.1f})"
+                return False, self.cb_status
+            if mean > MAX_MEAN:
+                self.cb_status = f"Rejected frame: too bright (mean={mean:.1f})"
+                return False, self.cb_status
+            if std < MIN_STD:
+                self.cb_status = f"Rejected frame: low contrast (std={std:.1f})"
                 return False, self.cb_status
 
-            add_view(
-                self.cb_objpoints,
-                self.cb_imgpoints,
-                corners,
-                self.cb_checkerboard,
-                self.cb_square_size,
-            )
+            dbg_path = self.cam_calib_session / "debug_corners" / f"view_{self.cb_views:03d}.png"
+            detection = detect_checkerboard(gray, self.cb_checkerboard, debug_path=dbg_path)
+            if detection.corners is None:
+                reason = detection.reason or "checkerboard not found"
+                self.cb_status = f"Checkerboard NOT found: {reason}"
+                return False, self.cb_status
 
-            self.cb_image_size = (gray.shape[1], gray.shape[0])
+            if detection.area_frac < MIN_BOARD_AREA_FRAC:
+                self.cb_status = f"Rejected: board too small in frame (area={detection.area_frac:.3f})"
+                return False, self.cb_status
+
+            if detection.aspect_ratio < MIN_BOARD_ASPECT:
+                self.cb_status = f"Rejected: board extremely tilted (aspect={detection.aspect_ratio:.3f})"
+                return False, self.cb_status
+
+            # Save frame to session directory
+            self.cam_calib_session.mkdir(parents=True, exist_ok=True)
+            fname = f"view_{self.cb_views:03d}.png"
+            out_path = self.cam_calib_session / fname
+            cv2.imwrite(str(out_path), frame_bgr)
+
             self.cb_views += 1
-            self.cb_status = f"Captured {self.cb_views} views."
+            self.cb_status = f"Captured {self.cb_views} views (saved {fname})."
 
-            print(f"[CAM-CAL] Captured view {self.cb_views}")
+            print(f"[CAM-CAL] Captured view {self.cb_views} at {out_path} "
+                  f"(mean={mean:.1f}, std={std:.1f}, area={detection.area_frac:.3f})")
             return True, self.cb_status
 
     def _finish_camera_calibration(self):
@@ -289,41 +235,33 @@ class WebServer:
             except Exception:
                 pass
 
-            min_views = 8
+            min_views = 12
             if self.cb_views < min_views:
                 msg = f"Need at least {min_views} views. Have {self.cb_views}."
                 self.cb_status = msg
                 return False, msg
 
-            if self.cb_image_size is None:
-                msg = "No image size recorded; capture a view first."
+            try:
+                print(f"[CAM-CAL] Running calibration on {self.cb_views} views from {self.cam_calib_session} ...")
+                calib = run_calibration_from_folder(
+                    image_dir=self.cam_calib_session,
+                    pattern_size=self.cb_checkerboard,
+                    square_size=self.cb_square_size,
+                    debug_dir=self.cam_calib_session / "debug_corners",
+                    min_images=min_views,
+                    max_per_view_error=1.5,
+                )
+            except Exception as e:
+                msg = f"Calibration failed: {e}"
                 self.cb_status = msg
                 return False, msg
 
-            print(f"[CAM-CAL] Running calibration on {self.cb_views} views...")
-            rms, K, dist, _, _, strategy = run_calibration(
-                self.cb_objpoints,
-                self.cb_imgpoints,
-                self.cb_image_size,
-            )
-
-            print("RMS:", rms)
-            print("K:\n", K)
-            print("dist:", dist)
-            print("Strategy:", strategy)
-
-            np.savez(
-                "camera_intrinsics.npz",
-                K=K,
-                dist=dist,
-                size=self.cb_image_size,
-            )
-
+            self.cb_last_rms = calib.rms
             msg = (
-                f"Calibration complete ({strategy}). "
-                f"RMS={rms:.3f}. Saved camera_intrinsics.npz"
+                f"Calibration complete. RMS={calib.rms:.3f} px "
+                f"(fx={calib.K[0,0]:.1f}, fy={calib.K[1,1]:.1f}). "
+                "Saved camera_intrinsics.npz and calibration_report.txt."
             )
-            self.cb_last_rms = float(rms)
             self.cb_status = msg
             return True, msg
 

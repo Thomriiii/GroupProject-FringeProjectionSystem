@@ -242,6 +242,7 @@ def calibrate_camera(
     image_points: List[np.ndarray],
     image_size: ImageSize,
     flags: int = 0,
+    used_images: Optional[List[Path]] = None,
 ) -> CalibrationResult:
     if len(object_points) == 0 or len(image_points) == 0:
         raise ValueError("No valid object/image point pairs for calibration.")
@@ -264,7 +265,7 @@ def calibrate_camera(
         rvecs=rvecs,
         tvecs=tvecs,
         per_image_errors=per_image_errors,
-        used_images=[],
+        used_images=list(used_images) if used_images else [],
         image_size=image_size,
     )
 
@@ -339,6 +340,44 @@ def estimate_board_scale(corners: np.ndarray, pattern_size: PatternSize) -> floa
     if not vals:
         return 0.0
     return float(np.mean(vals))
+
+
+def maybe_filter_outliers(
+    calib: CalibrationResult,
+    object_points: List[np.ndarray],
+    image_points: List[np.ndarray],
+    used_images: List[Path],
+    image_size: ImageSize,
+    flags: int,
+    min_images: int,
+    max_per_view_error: Optional[float],
+) -> Tuple[CalibrationResult, List[np.ndarray], List[np.ndarray], List[Path]]:
+    """
+    Optionally drop high-error views and recalibrate.
+    """
+    if max_per_view_error is None:
+        return calib, object_points, image_points, used_images
+
+    keep_mask = [err <= max_per_view_error for err in calib.per_image_errors]
+    if all(keep_mask):
+        return calib, object_points, image_points, used_images
+
+    filtered_obj = [op for op, k in zip(object_points, keep_mask) if k]
+    filtered_img = [ip for ip, k in zip(image_points, keep_mask) if k]
+    filtered_names = [p for p, k in zip(used_images, keep_mask) if k]
+    dropped = [p for p, k in zip(used_images, keep_mask) if not k]
+
+    print(f"[CALIB] Dropping {len(dropped)} views with RMS > {max_per_view_error}:")
+    for p, err, keep in zip(used_images, calib.per_image_errors, keep_mask):
+        if not keep:
+            print(f"  - {p.name}: {err:.4f} px")
+
+    if len(filtered_obj) < min_images:
+        print(f"[CALIB] Not enough views after dropping ({len(filtered_obj)}/{min_images}); keeping all.")
+        return calib, object_points, image_points, used_images
+
+    recalib = calibrate_camera(filtered_obj, filtered_img, image_size=image_size, flags=flags, used_images=filtered_names)
+    return recalib, filtered_obj, filtered_img, filtered_names
 
 
 def save_calibration(path: Path, K: np.ndarray, dist: np.ndarray, image_size: ImageSize, rms: float) -> None:
@@ -433,6 +472,7 @@ def run_calibration_from_folder(
     min_images: int = DEFAULT_MIN_IMAGES,
     flags: int = 0,
     max_images: Optional[int] = None,
+    max_per_view_error: Optional[float] = None,
 ) -> CalibrationResult:
     """
     High-level convenience: load images, detect corners, calibrate, and report.
@@ -448,8 +488,17 @@ def run_calibration_from_folder(
     if len(object_points) < min_images:
         raise ValueError(f"Not enough valid calibration frames ({len(object_points)}/{min_images}).")
 
-    calib = calibrate_camera(object_points, image_points, image_size=image_size, flags=flags)
-    calib.used_images = used_images
+    calib = calibrate_camera(object_points, image_points, image_size=image_size, flags=flags, used_images=used_images)
+    calib, object_points, image_points, used_images = maybe_filter_outliers(
+        calib,
+        object_points,
+        image_points,
+        used_images,
+        image_size,
+        flags,
+        min_images,
+        max_per_view_error,
+    )
 
     # Coverage printout
     report_dataset_coverage(image_points, image_size, pattern_size)
