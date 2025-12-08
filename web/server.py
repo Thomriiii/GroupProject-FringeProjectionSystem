@@ -108,7 +108,7 @@ def run_calibration(
 
 class WebServer:
     """
-    Flask server wrapper focused on PSP-based structured light.
+    Flask server wrapper for structured-light scanning.
     Handles:
       - /                  → main UI
       - /video             → live MJPEG feed
@@ -116,7 +116,6 @@ class WebServer:
       - /calib             → checkerboard camera calibration
       - /calib/capture     → capture one checkerboard view
       - /calib/finish      → solve camera intrinsics
-      - /calib_psp_start   → PSP projector calibration (dataset + solve)
     """
 
     def __init__(self, camera, scan_controller):
@@ -138,13 +137,6 @@ class WebServer:
         self.cb_status = "Not calibrated"
         self.cb_last_rms: float | None = None
         self.cb_lock = threading.Lock()
-
-        # PSP projector calibration state
-        self.psp_status = "Idle"
-        self.psp_views = 0
-        self.psp_lock = threading.Lock()
-        self.psp_session: str | None = None
-        self.psp_result: dict | None = None
 
         self.app = Flask(
             __name__,
@@ -171,9 +163,6 @@ class WebServer:
                 cb_square_size=self.cb_square_size,
                 cb_views=self.cb_views,
                 cb_status=self.cb_status,
-                psp_status=self.psp_status,
-                psp_views=self.psp_views,
-                psp_session=self.psp_session,
             )
 
         @app.get("/calib")
@@ -186,17 +175,6 @@ class WebServer:
                 cb_views=self.cb_views,
                 cb_status=self.cb_status,
                 cb_last_rms=self.cb_last_rms,
-            )
-
-        @app.get("/proj_calib")
-        def proj_calib():
-            return render_template(
-                "proj_calib.html",
-                status=self.psp_status,
-                session=self.psp_session,
-                views=self.psp_views,
-                proj_w=self.scan_controller.proj_w,
-                proj_h=self.scan_controller.proj_h,
             )
 
         @app.route("/video")
@@ -225,12 +203,6 @@ class WebServer:
             if not ok:
                 print(f"[CAM-CAL] Calibration failed: {msg}")
             return redirect(url_for("calib"))
-
-        @app.post("/calib_psp_start")
-        def calib_psp_start():
-            if not self._start_psp_thread():
-                return "Already running. <a href='/'>Back</a>"
-            return "PSP calibration started. <a href='/'>Back</a>"
 
     # ============================================================
     # MJPEG STREAMING
@@ -272,46 +244,6 @@ class WebServer:
             self.scan_status = "Complete"
         finally:
             self.scan_lock.release()
-
-    # ============================================================
-    # PSP PROJECTOR CALIBRATION
-    # ============================================================
-
-    def _start_psp_thread(self):
-        if not self.psp_lock.acquire(blocking=False):
-            return False
-
-        t = threading.Thread(target=self._run_psp_worker, daemon=True)
-        t.start()
-        return True
-
-    def _run_psp_worker(self):
-        try:
-            self.psp_status = "Running"
-            session = self.scan_controller.start_psp_session()
-            self.psp_session = session
-            self.psp_views = 0
-
-            # Capture a fixed number of calibration poses automatically
-            for i in range(10):
-                self.psp_status = f"Capturing pose {i + 1}/10"
-                self.scan_controller.run_calib_pose_psp()
-                self.psp_views += 1
-
-            self.psp_status = "Solving intrinsics"
-            out = self.scan_controller.solve_psp_calibration(session)
-
-            rms = out.get("rms", None)
-            if rms is not None:
-                self.psp_status = f"Complete (RMS={rms:.3f})"
-            else:
-                self.psp_status = "Complete"
-            self.psp_result = out
-        except Exception as exc:
-            self.psp_status = f"PSP calibration failed: {exc}"
-            print(f"[PSP] Calibration failed: {exc}")
-        finally:
-            self.psp_lock.release()
 
     # ============================================================
     # CHECKERBOARD CALIBRATION

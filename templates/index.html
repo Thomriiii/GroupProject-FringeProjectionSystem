@@ -34,18 +34,6 @@
         <a href="{{ url_for('calib') }}" class="scan-btn">Open Calibration Page</a>
     </section>
 
-    <div class="section">
-        <h2>Projector Calibration (PSP)</h2>
-        <p>Status: <strong>{{ psp_status }}</strong></p>
-        <p>Session: {{ psp_session or "None" }} | Poses: {{ psp_views }}</p>
-
-        <form method="post" action="{{ url_for('calib_psp_start') }}">
-          <button type="submit">Calibrate Projector (PSP)</button>
-        </form>
-        <p><a href="{{ url_for('proj_calib') }}">Projector calibration details</a></p>
-    </div>
-
-
     <p class="note">Projector output updates in real time.</p>
 
 </div>

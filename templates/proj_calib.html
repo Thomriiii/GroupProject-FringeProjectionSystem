@@ -15,17 +15,19 @@
 
   <main>
     <section class="controls">
-      <h2>PSP Calibration</h2>
-      <p>Collects vertical + horizontal PSP poses automatically and solves projector intrinsics.</p>
+      <h2>Dot Grid Calibration</h2>
+      <p>Projects a bright dot grid, detects it in the camera, and solves projector intrinsics.</p>
       <form method="post" action="{{ url_for('calib_psp_start') }}">
-        <button type="submit" class="finish">Run PSP Calibration</button>
+        <button type="submit" class="finish">Run Dot Calibration</button>
       </form>
 
       <div class="tips">
         <h3>Instructions</h3>
         <ul>
           <li>Ensure camera_intrinsics.npz exists before starting.</li>
-          <li>Move the planar target (A4 white sheet) across the view while the poses capture.</li>
+          <li>Place a diffuse, flat target; move/tilt it slightly between poses.</li>
+          <li>Ambient light can stay on—the bright dots are robust to modest glare.</li>
+          <li>Each pose captures once; no bright/dark/graycode sequences are used.</li>
         </ul>
       </div>
     </section>

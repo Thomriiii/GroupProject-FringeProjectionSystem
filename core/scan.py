@@ -1,7 +1,7 @@
 """
 scan.py
 
-Central scanning pipeline for structured-light fringe projection.
+Central scanning pipeline for structured-light fringe projection (PSP).
 
 Features:
   - Normal scan mode:
@@ -10,19 +10,6 @@ Features:
       * Uses masking.merge_frequency_masks
       * Temporal unwrapping across all freqs
       * Outputs phase_final.npy, mask_final.npy, phase_debug.png
-
-  - Calibration mode (run_calib_pose):
-      * Uses only low frequencies [4, 8] for calibration
-      * Uses psp_calib.run_psp_calibration (relaxed thresholds)
-      * Uses masking_calib.merge_masks_calibration (OR-merging)
-      * Temporal unwrapping across [4, 8]
-      * Captures both vertical and horizontal fringes
-      * Saves:
-          phase_vert_final.npy,  mask_vert_final.npy
-          phase_horiz_final.npy, mask_horiz_final.npy
-      * Raw fringe images saved as:
-          vert_fXXX_nYY.png, horiz_fXXX_nYY.png
-        under calib/session_YYYYMMDD_HHMMSS/pose_XXX/
 """
 
 from __future__ import annotations
@@ -41,13 +28,6 @@ from core.camera import CameraController
 from core.psp import run_psp_per_frequency
 from core.masking import merge_frequency_masks
 from core.unwrap import temporal_unwrap
-
-from calibration.psp_calib import run_psp_calibration
-from calibration.masking_calib import merge_masks_calibration
-from calibration.build_projector_dataset_psp import build_projector_dataset_psp
-from calibration import projector_intrinsics
-
-
 
 class ScanController:
     def __init__(
@@ -189,17 +169,6 @@ class ScanController:
 
 
     # =====================================================================
-    # psp SCAN PIPELINE
-    # =====================================================================
-    def start_psp_session(self):
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.current_psp_session = os.path.join(self.calib_root, f"psp_session_{timestamp}")
-        os.makedirs(self.current_psp_session, exist_ok=True)
-        self.psp_pose_index = 0
-        return self.current_psp_session
-
-
-    # =====================================================================
     # NORMAL SCAN PIPELINE
     # =====================================================================
 
@@ -263,208 +232,3 @@ class ScanController:
 
         print(f"[SCAN] COMPLETE: results saved in {scan_dir}")
         return scan_dir
-
-    # =====================================================================
-    # CALIBRATION POSE CAPTURE
-    # =====================================================================
-
-    def run_calib_pose(self) -> str:
-        """
-        Capture a single calibration pose.
-
-        Steps:
-          - Ensure / create a calibration session under self.calib_root.
-          - Auto exposure on midgrey.
-          - Capture VERTICAL fringes for all frequencies in self.freqs, saving:
-                vert_f{f:03d}_n{n:02d}.png
-          - Capture HORIZONTAL fringes by rotating patterns 90 deg, saving:
-                horiz_f{f:03d}_n{n:02d}.png
-          - Run calibration PSP on low freqs [4, 8]:
-                psp_calib.run_psp_calibration + masking_calib.merge_masks_calibration
-                + unwrap.temporal_unwrap
-          - Save:
-                phase_vert_final.npy,  mask_vert_final.npy
-                phase_horiz_final.npy, mask_horiz_final.npy
-
-        Returns
-        -------
-        pose_dir : str
-            Path to this pose's directory.
-        """
-        print("[CALIB] Starting calibration pose capture...")
-
-        pose_dir = self._make_calib_pose_dir()
-
-        # Auto exposure
-        self._run_auto_exposure()
-
-        # -----------------------------
-        # Capture VERTICAL images
-        # -----------------------------
-        print("[CALIB] Capturing VERTICAL PSP sequence...")
-        I_vert: Dict[Tuple[int, int], np.ndarray] = {}
-
-        for f in self.freqs:
-            for k in range(self.n_phase):
-                surface = self.patterns[f][k]
-                self.set_surface_callback(surface)
-                time.sleep(self.pattern_settle_time)
-
-                gray = self.camera.capture_gray().astype(np.float32)
-                I_vert[(f, k)] = gray
-                fname = f"vert_f{f:03d}_n{k:02d}.png"
-                cv2.imwrite(os.path.join(pose_dir, fname), gray)
-                print(f"[CALIB] Captured {fname} (mean={gray.mean():.2f})")
-
-        # -----------------------------
-        # Capture HORIZONTAL images
-        # -----------------------------
-        print("[CALIB] Capturing HORIZONTAL PSP sequence...")
-        I_horiz: Dict[Tuple[int, int], np.ndarray] = {}
-
-        for f in self.freqs:
-            for k in range(self.n_phase):
-                if self.patterns_horiz is not None:
-                    pattern = self.patterns_horiz[f][k]
-                else:
-                    pattern = pygame.transform.rotate(self.patterns[f][k], 90)
-                    pattern = pygame.transform.smoothscale(
-                        pattern, (self.proj_w, self.proj_h)
-                    )
-
-                self.set_surface_callback(pattern)
-                time.sleep(self.pattern_settle_time)
-
-                gray = self.camera.capture_gray().astype(np.float32)
-                I_horiz[(f, k)] = gray
-                fname = f"horiz_f{f:03d}_n{k:02d}.png"
-                cv2.imwrite(os.path.join(pose_dir, fname), gray)
-                print(f"[CALIB] Captured {fname} (mean={gray.mean():.2f})")
-
-        # -----------------------------
-        # PSP for calibration (low freqs only)
-        # -----------------------------
-        calib_freqs = [4, 8]  # low frequencies for calibration
-
-        # Restrict intensity dictionaries to calibration freqs
-        I_vert_calib = {
-            (f, k): img
-            for (f, k), img in I_vert.items()
-            if f in calib_freqs
-        }
-        I_horiz_calib = {
-            (f, k): img
-            for (f, k), img in I_horiz.items()
-            if f in calib_freqs
-        }
-
-        # VERTICAL calibration PSP
-        print("[CALIB] Running PSP for vertical fringes (calibration)...")
-        phi_v_wrapped, masks_v_raw = run_psp_calibration(
-            I_vert_calib,
-            freqs=calib_freqs,
-            n_phase=self.n_phase,
-        )
-        masks_v_merged = merge_masks_calibration(masks_v_raw, freqs=calib_freqs)
-        unwrap_v = temporal_unwrap(
-            phi_wrapped=phi_v_wrapped,
-            mask_merged=masks_v_merged,
-            freqs=calib_freqs,
-        )
-        Phi_vert = unwrap_v.Phi_final
-        mask_vert = unwrap_v.mask_final
-
-        np.save(os.path.join(pose_dir, "phase_vert_final.npy"), Phi_vert)
-        np.save(os.path.join(pose_dir, "mask_vert_final.npy"), mask_vert)
-        self._save_phase_debug(Phi_vert, mask_vert, pose_dir, filename="phase_vert_debug.png")
-
-        # HORIZONTAL calibration PSP
-        print("[CALIB] Running PSP for horizontal fringes (calibration)...")
-        phi_h_wrapped, masks_h_raw = run_psp_calibration(
-            I_horiz_calib,
-            freqs=calib_freqs,
-            n_phase=self.n_phase,
-        )
-        masks_h_merged = merge_masks_calibration(masks_h_raw, freqs=calib_freqs)
-        unwrap_h = temporal_unwrap(
-            phi_wrapped=phi_h_wrapped,
-            mask_merged=masks_h_merged,
-            freqs=calib_freqs,
-        )
-        Phi_horiz = unwrap_h.Phi_final
-        mask_horiz = unwrap_h.mask_final
-
-        np.save(os.path.join(pose_dir, "phase_horiz_final.npy"), Phi_horiz)
-        np.save(os.path.join(pose_dir, "mask_horiz_final.npy"), mask_horiz)
-        self._save_phase_debug(Phi_horiz, mask_horiz, pose_dir, filename="phase_horiz_debug.png")
-
-        print(f"[CALIB] Calibration pose COMPLETE: data saved in {pose_dir}")
-        return pose_dir
-    
-    def run_calib_pose_psp(self):
-        session = self.current_psp_session
-        pose_dir = os.path.join(session, f"pose_{self.psp_pose_index:03d}")
-        os.makedirs(pose_dir, exist_ok=True)
-        self.psp_pose_index += 1
-
-        # AE
-        def set_midgrey():
-            self.set_surface_callback(self.midgrey_surface)
-        self.camera.auto_expose_with_midgrey(set_midgrey_surface_callback=set_midgrey)
-
-        # VERTICAL capture
-        I_vert = {}
-        for f in self.freqs:
-            for k in range(self.n_phase):
-                self.set_surface_callback(self.patterns[f][k])
-                time.sleep(self.pattern_settle_time)
-                gray = self.camera.capture_gray().astype(np.float32)
-                I_vert[(f, k)] = gray
-                cv2.imwrite(os.path.join(pose_dir, f"vert_f{f:03d}_n{k:02d}.png"), gray)
-
-        # HORIZONTAL capture
-        I_horiz = {}
-        for f in self.freqs:
-            for k in range(self.n_phase):
-                if self.patterns_horiz is not None:
-                    surf = self.patterns_horiz[f][k]
-                else:
-                    surf = pygame.transform.rotate(self.patterns[f][k], 90)
-                    surf = pygame.transform.smoothscale(surf, (self.proj_w, self.proj_h))
-                self.set_surface_callback(surf)
-                time.sleep(self.pattern_settle_time)
-                gray = self.camera.capture_gray().astype(np.float32)
-                I_horiz[(f, k)] = gray
-                cv2.imwrite(os.path.join(pose_dir, f"horiz_f{f:03d}_n{k:02d}.png"), gray)
-
-        # PSP analysis (low freqs only)
-        f_low = [4, 8]
-        phi_v_wrapped, masks_v_raw = run_psp_calibration(
-            I_vert, freqs=f_low, n_phase=self.n_phase
-        )
-        phi_h_wrapped, masks_h_raw = run_psp_calibration(
-            I_horiz, freqs=f_low, n_phase=self.n_phase
-        )
-
-        mask_v = merge_masks_calibration(masks_v_raw, freqs=f_low)
-        mask_h = merge_masks_calibration(masks_h_raw, freqs=f_low)
-
-        unwrap_v = temporal_unwrap(phi_v_wrapped, mask_v, f_low)
-        unwrap_h = temporal_unwrap(phi_h_wrapped, mask_h, f_low)
-
-        np.save(os.path.join(pose_dir, "phi_vert.npy"), unwrap_v.Phi_final)
-        np.save(os.path.join(pose_dir, "mask_vert.npy"), unwrap_v.mask_final)
-        np.save(os.path.join(pose_dir, "phi_horiz.npy"), unwrap_h.Phi_final)
-        np.save(os.path.join(pose_dir, "mask_horiz.npy"), unwrap_h.mask_final)
-
-        return pose_dir
-
-    def solve_psp_calibration(self, session):
-        dataset = build_projector_dataset_psp(
-            session_dir=session,
-            proj_width=self.proj_w,
-            proj_height=self.proj_h,
-            freqs=self.freqs,          # ← important
-        )
-        out = projector_intrinsics.solve_from_dataset(dataset)
-        return out

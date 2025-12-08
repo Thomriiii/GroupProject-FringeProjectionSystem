@@ -59,3 +59,12 @@ python3 main.py
 - If full-screen projector mode doesn't appear, check that `SDL_VIDEODRIVER` is set to `kmsdrm` or your system's display driver (the `Projector` class sets `SDL_VIDEODRIVER=kmsdrm` by default).
 
 ---
+
+## Projector calibration (dot grid)
+1. Calibrate the camera first so `camera_intrinsics.npz` exists.
+2. Start the app and open `/proj_calib` (or use the “Calibrate Projector” button on the home page).
+3. The projector will show a bright dot grid once per pose; move/tilt the planar target between poses.
+4. The system detects the dots, matches them to projector pixel coordinates, and solves using `cv2.calibrateCamera`.
+5. Outputs (per session under `calib/session_.../`):
+   - `projector_intrinsics.npz` with `K`, `dist`, `rvecs`, `tvecs`, RMS.
+   - `pose_XXX/capture.png`, `camera_points.npy`, `projector_points.npy`, and `reprojection.png` overlays for validation.
