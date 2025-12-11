@@ -13,7 +13,10 @@ from pathlib import Path
 from typing import Tuple
 
 import numpy as np
-import cv2
+try:
+    import cv2
+except Exception:
+    cv2 = None
 
 
 # =====================================================================
@@ -258,7 +261,7 @@ def reconstruct_3d_from_scan(scan_dir: str, proj_size: Tuple[int, int], color_pa
         using_fake = True
 
     # Compute rays (undistort if calibration is available)
-    if stereo is not None or rms_proj is not None:
+    if cv2 is not None and (stereo is not None or rms_proj is not None):
         cam_norm = cv2.undistortPoints(cam_uv.reshape(-1, 1, 2), Kc, dist)
         proj_norm = cv2.undistortPoints(proj_uv.reshape(-1, 1, 2), Kp, dp)
 
