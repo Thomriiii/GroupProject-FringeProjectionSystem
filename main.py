@@ -13,6 +13,7 @@ from core.projector import Projector
 from core.patterns import generate_psp_patterns, generate_midgrey_surface
 from core.camera import CameraController
 from core.scan import ScanController
+from core.graycode import generate_graycode_patterns
 from web.server import WebServer
 
 
@@ -68,6 +69,14 @@ def main():
         gamma_proj=None,
     )
 
+    print("[MAIN] Generating GrayCode patterns for projector calibration...")
+    graycode_set = generate_graycode_patterns(
+        width=W,
+        height=H,
+        gamma_proj=None,
+        brightness_scale=1.0,
+    )
+
     # Start by displaying mid-grey (safe & neutral)
     projector.set_surface(midgrey_surface)
 
@@ -101,7 +110,13 @@ def main():
     # Flask server (background thread)
     # ============================================================
     print("[MAIN] Starting Flask web server thread...")
-    web = WebServer(camera=camera, scan_controller=scan_controller)
+    web = WebServer(
+        camera=camera,
+        scan_controller=scan_controller,
+        set_surface_callback=projector.set_surface,
+        graycode_set=graycode_set,
+        midgrey_surface=midgrey_surface,
+    )
 
     web_thread = threading.Thread(
         target=web.run,

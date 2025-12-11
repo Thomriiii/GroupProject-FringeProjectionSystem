@@ -26,12 +26,23 @@
         <form method="post" action="/scan">
             <button type="submit" class="scan-btn">Run Scan</button>
         </form>
+        {% if last_dir %}
+        <form method="post" action="/scan/reconstruct" style="margin-top:10px;">
+            <button type="submit" class="scan-btn">Reconstruct Last Scan</button>
+        </form>
+        {% endif %}
     </section>
 
     <section>
         <h2>Camera Calibration</h2>
         <p>Checkerboard: {{ cb_cols }} x {{ cb_rows }} inner corners (9x7 outer), square {{ cb_square_size }} m.</p>
         <a href="{{ url_for('calib') }}" class="scan-btn">Open Calibration Page</a>
+    </section>
+
+    <section>
+        <h2>Projector Calibration</h2>
+        <p>Status: {{ proj_status }} | Poses: {{ proj_views }} | Session: {{ proj_session }}</p>
+        <a href="{{ url_for('proj_calib') }}" class="scan-btn">Open Projector Calibration</a>
     </section>
 
     <p class="note">Projector output updates in real time.</p>

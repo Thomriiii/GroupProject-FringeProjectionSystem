@@ -61,10 +61,9 @@ python3 main.py
 ---
 
 ## Projector calibration (dot grid)
-1. Calibrate the camera first so `camera_intrinsics.npz` exists.
-2. Start the app and open `/proj_calib` (or use the “Calibrate Projector” button on the home page).
-3. The projector will show a bright dot grid once per pose; move/tilt the planar target between poses.
-4. The system detects the dots, matches them to projector pixel coordinates, and solves using `cv2.calibrateCamera`.
-5. Outputs (per session under `calib/session_.../`):
-   - `projector_intrinsics.npz` with `K`, `dist`, `rvecs`, `tvecs`, RMS.
-   - `pose_XXX/capture.png`, `camera_points.npy`, `projector_points.npy`, and `reprojection.png` overlays for validation.
+1. Calibrate the camera first at `/calib` (checkerboard). This writes `camera_intrinsics.npz`.
+2. Open `/proj_calib` and capture multiple poses. Each pose:
+   - Projects a full GrayCode set, locks exposure, captures the stack, and takes a bright checkerboard frame.
+   - Decodes projector `(u,v)` per camera pixel, samples projector pixels at detected checkerboard corners, and saves to `calib/projector/session_*/pose_*/`.
+3. After 6–10 diverse poses, click **Finish Projector Calibration**. This runs projector intrinsics + stereo calibration and writes `projector_intrinsics.npz` and `stereo_params.npz` (also copied to repo root).
+4. Run `/scan` and “Reconstruct” — reconstruction will now use calibrated camera↔projector geometry.

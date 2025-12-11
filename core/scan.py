@@ -25,6 +25,7 @@ from scipy.ndimage import median_filter
 import pygame
 
 from core.camera import CameraController
+from core.geometry import compute_projector_uv_from_phase
 from core.psp import run_psp_per_frequency
 from core.masking import merge_frequency_masks
 from core.unwrap import temporal_unwrap
@@ -192,43 +193,117 @@ class ScanController:
         # Auto exposure
         self._run_auto_exposure()
 
-        # Capture vertical PSP sequence (for object scanning)
-        I_dict = self._capture_psp_sequence(scan_dir, self.patterns, prefix="scan")
+        # -----------------------------------------------------------------
+        # Capture and decode VERTICAL patterns (u direction)
+        # -----------------------------------------------------------------
+        print("[SCAN] Capturing vertical PSP sequence...")
+        I_vert = self._capture_psp_sequence(scan_dir, self.patterns, prefix="scan")
 
-        print("[SCAN] Running PSP analysis...")
-        psp_res = run_psp_per_frequency(
-            I_dict,
+        print("[SCAN] Running PSP analysis (vertical)...")
+        psp_vert = run_psp_per_frequency(
+            I_vert,
             freqs=self.freqs,
             n_phase=self.n_phase,
             apply_input_blur=False,
             median_phase_filter=True,
         )
 
-        print("[SCAN] Cleaning masks...")
-        masks_final = merge_frequency_masks(psp_res.mask, self.freqs)
+        print("[SCAN] Cleaning masks (vertical)...")
+        masks_vert = merge_frequency_masks(psp_vert.mask, self.freqs)
 
-        print("[SCAN] Unwrapping temporally...")
-        unwrap_res = temporal_unwrap(
-            phi_wrapped=psp_res.phi_wrapped,
-            mask_merged=masks_final,
+        print("[SCAN] Unwrapping temporally (vertical)...")
+        unwrap_vert = temporal_unwrap(
+            phi_wrapped=psp_vert.phi_wrapped,
+            mask_merged=masks_vert,
             freqs=self.freqs,
+            spatial_axis=1,   # vertical fringes vary along x → unwrap rows
         )
 
-        Phi_final = unwrap_res.Phi_final
-        mask_final = unwrap_res.mask_final
+        Phi_vert = unwrap_vert.Phi_final
+        mask_vert = unwrap_vert.mask_final
 
-        # Median filter final phase (inside mask)
-        print("[SCAN] Applying median filter to final phase...")
-        Phi_med = median_filter(Phi_final, size=3)
-        Phi_final_smoothed = Phi_final.copy()
-        Phi_final_smoothed[mask_final] = Phi_med[mask_final]
-        Phi_final = Phi_final_smoothed
+        # Median filter vertical phase (inside mask)
+        print("[SCAN] Applying median filter to vertical phase...")
+        Phi_vert_med = median_filter(Phi_vert, size=3)
+        Phi_vert_smoothed = Phi_vert.copy()
+        Phi_vert_smoothed[mask_vert] = Phi_vert_med[mask_vert]
+        Phi_vert = Phi_vert_smoothed
 
-        np.save(os.path.join(scan_dir, "phase_final.npy"), Phi_final)
+        # -----------------------------------------------------------------
+        # Capture and decode HORIZONTAL patterns (v direction)
+        # -----------------------------------------------------------------
+        if self.patterns_horiz is None:
+            raise RuntimeError("Horizontal pattern set is not available but horizontal PSP is required.")
+
+        print("[SCAN] Capturing horizontal PSP sequence...")
+        I_horiz = self._capture_psp_sequence(scan_dir, self.patterns_horiz, prefix="scanh")
+
+        print("[SCAN] Running PSP analysis (horizontal)...")
+        psp_horiz = run_psp_per_frequency(
+            I_horiz,
+            freqs=self.freqs,
+            n_phase=self.n_phase,
+            apply_input_blur=False,
+            median_phase_filter=True,
+        )
+
+        print("[SCAN] Cleaning masks (horizontal)...")
+        masks_horiz = merge_frequency_masks(psp_horiz.mask, self.freqs)
+
+        print("[SCAN] Unwrapping temporally (horizontal)...")
+        unwrap_horiz = temporal_unwrap(
+            phi_wrapped=psp_horiz.phi_wrapped,
+            mask_merged=masks_horiz,
+            freqs=self.freqs,
+            spatial_axis=0,   # horizontal fringes vary along y → unwrap columns
+        )
+
+        Phi_horiz = unwrap_horiz.Phi_final
+        mask_horiz = unwrap_horiz.mask_final
+
+        # Median filter horizontal phase (inside mask)
+        print("[SCAN] Applying median filter to horizontal phase...")
+        Phi_h_med = median_filter(Phi_horiz, size=3)
+        Phi_horiz_smoothed = Phi_horiz.copy()
+        Phi_horiz_smoothed[mask_horiz] = Phi_h_med[mask_horiz]
+        Phi_horiz = Phi_horiz_smoothed
+
+        # in scan.py after Phi_horiz smoothing:
+        self._save_phase_debug(Phi_horiz, mask_horiz, scan_dir, filename="phase_horiz_debug.png")
+
+
+        # -----------------------------------------------------------------
+        # Combine masks and compute projector UV mapping
+        # -----------------------------------------------------------------
+        #mask_final = mask_vert & mask_horiz
+        # temporarily try:
+        mask_final = mask_vert | mask_horiz
+
+
+        print("[SCAN] Computing projector UV maps from phase...")
+        u_map, v_map, mask_final = compute_projector_uv_from_phase(
+            phase_vert=Phi_vert,
+            phase_horiz=Phi_horiz,
+            freqs=self.freqs,
+            proj_size=(self.proj_w, self.proj_h),
+            mask_vert=mask_vert,
+            mask_horiz=mask_horiz,
+            apply_affine_normalisation=True,
+        )
+        if np.isfinite(u_map).any() and np.isfinite(v_map).any():
+            print(f"[SCAN][UV] u range: {np.nanmin(u_map):.2f} .. {np.nanmax(u_map):.2f} (proj_w={self.proj_w})")
+            print(f"[SCAN][UV] v range: {np.nanmin(v_map):.2f} .. {np.nanmax(v_map):.2f} (proj_h={self.proj_h})")
+
+        # -----------------------------------------------------------------
+        # Save outputs
+        # -----------------------------------------------------------------
+        np.save(os.path.join(scan_dir, "phase_final.npy"), Phi_vert)  # keep legacy vertical phase
         np.save(os.path.join(scan_dir, "mask_final.npy"), mask_final)
-        print("[SCAN] Saved phase_final.npy and mask_final.npy")
+        np.save(os.path.join(scan_dir, "proj_u.npy"), u_map.astype(np.float32))
+        np.save(os.path.join(scan_dir, "proj_v.npy"), v_map.astype(np.float32))
+        print("[SCAN] Saved phase_final.npy, mask_final.npy, proj_u.npy, proj_v.npy")
 
-        self._save_phase_debug(Phi_final, mask_final, scan_dir, filename="phase_debug.png")
+        self._save_phase_debug(Phi_vert, mask_final, scan_dir, filename="phase_debug.png")
 
         print(f"[SCAN] COMPLETE: results saved in {scan_dir}")
         return scan_dir

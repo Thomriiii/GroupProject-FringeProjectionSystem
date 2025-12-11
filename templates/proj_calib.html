@@ -9,32 +9,47 @@
   <header>
     <h1>Projector Calibration</h1>
     <p>Status: <strong>{{ status }}</strong></p>
-    <p>Session: {{ session or "None" }} | Poses: {{ views }}</p>
-    <p>Projector: {{ proj_w }} x {{ proj_h }}</p>
+    <p>Session: <code>{{ session or "None" }}</code> | Poses captured: {{ views }}</p>
+    <p>Projector resolution: {{ proj_w }} x {{ proj_h }}</p>
   </header>
 
   <main>
-    <section class="controls">
-      <h2>Dot Grid Calibration</h2>
-      <p>Projects a bright dot grid, detects it in the camera, and solves projector intrinsics.</p>
-      <form method="post" action="{{ url_for('calib_psp_start') }}">
-        <button type="submit" class="finish">Run Dot Calibration</button>
-      </form>
-
-      <div class="tips">
-        <h3>Instructions</h3>
-        <ul>
-          <li>Ensure camera_intrinsics.npz exists before starting.</li>
-          <li>Place a diffuse, flat target; move/tilt it slightly between poses.</li>
-          <li>Ambient light can stay on—the bright dots are robust to modest glare.</li>
-          <li>Each pose captures once; no bright/dark/graycode sequences are used.</li>
-        </ul>
-      </div>
-    </section>
-
     <section class="video">
       <h2>Live Camera</h2>
       <img src="{{ url_for('video') }}" alt="Live video feed">
+    </section>
+
+    <section class="controls">
+      <h2>Capture</h2>
+      <form method="post" action="{{ url_for('proj_calib_capture') }}">
+        <button type="submit">Capture GrayCode Pose</button>
+      </form>
+
+      <form method="post" action="{{ url_for('proj_calib_finish') }}">
+        <button type="submit" class="finish">Finish Projector Calibration</button>
+      </form>
+
+      <div class="tips">
+        <h3>Workflow</h3>
+        <ul>
+          <li>Calibrate the camera first (/calib) so camera_intrinsics.npz exists.</li>
+          <li>Use the printed checkerboard (8×6 inner corners, 10 mm squares).</li>
+          <li>For each pose: place the board in view, click “Capture GrayCode Pose”. Exposure locks automatically.</li>
+          <li>Move and tilt the board across the frame; capture at least 6–10 diverse poses.</li>
+          <li>Click “Finish Projector Calibration” to solve intrinsics + stereo (saves projector_intrinsics.npz, stereo_params.npz).</li>
+        </ul>
+      </div>
+
+      <div class="tips">
+        <h3>Sessions</h3>
+        <ul>
+          {% for s in sessions %}
+            <li>{{ s.name }}</li>
+          {% else %}
+            <li>No previous sessions</li>
+          {% endfor %}
+        </ul>
+      </div>
     </section>
   </main>
 </body>
