@@ -32,6 +32,7 @@ class PSPResult:
         self.B: Dict[int, FloatImage] = {}      # raw modulation
         self.gamma: Dict[int, FloatImage] = {}  # from blurred B
         self.mask: Dict[int, np.ndarray] = {}   # raw per-frequency mask
+        self.saturated: Dict[int, np.ndarray] = {}
 
 
 # Global thresholds for normal scanning
@@ -104,5 +105,6 @@ def run_psp_per_frequency(
         result.B[f] = B_f          # keep raw B for debugging
         result.gamma[f] = gamma_f  # blurred B-based gamma
         result.mask[f] = mask_f
+        result.saturated[f] = saturated
 
     return result

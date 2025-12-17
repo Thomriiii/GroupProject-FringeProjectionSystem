@@ -24,6 +24,10 @@
 
     <section>
         <form method="post" action="/scan">
+            <label style="display:block; margin-bottom:6px;">
+                <input type="checkbox" name="polished" value="true" checked>
+                Polished output (Phase 1)
+            </label>
             <button type="submit" class="scan-btn">Run Scan</button>
         </form>
         {% if last_dir %}

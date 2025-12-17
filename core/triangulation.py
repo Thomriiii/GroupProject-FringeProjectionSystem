@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, List
+import json
 
 import numpy as np
 try:
@@ -222,6 +223,39 @@ def save_point_cloud_ply(filename: str | Path, points: np.ndarray, colors: np.nd
                 f.write(f"{p[0]} {p[1]} {p[2]}\n")
 
 
+def save_mesh_ply(filename: str | Path, vertices: np.ndarray, faces: List[Tuple[int, int, int]]):
+    """
+    Save a triangle mesh (faces reference filtered vertices).
+    """
+    filename = Path(filename)
+    filename.parent.mkdir(parents=True, exist_ok=True)
+    with open(filename, "w", encoding="ascii") as f:
+        f.write("ply\nformat ascii 1.0\n")
+        f.write(f"element vertex {len(vertices)}\n")
+        f.write("property float x\nproperty float y\nproperty float z\n")
+        f.write(f"element face {len(faces)}\n")
+        f.write("property list uchar int vertex_indices\n")
+        f.write("end_header\n")
+        for v in vertices:
+            f.write(f"{v[0]} {v[1]} {v[2]}\n")
+        for tri in faces:
+            f.write(f"3 {tri[0]} {tri[1]} {tri[2]}\n")
+
+
+def save_mesh_obj(filename: str | Path, vertices: np.ndarray, faces: List[Tuple[int, int, int]]):
+    """
+    Save OBJ mesh with only vertex/face records.
+    """
+    filename = Path(filename)
+    filename.parent.mkdir(parents=True, exist_ok=True)
+    with open(filename, "w", encoding="ascii") as f:
+        for v in vertices:
+            f.write(f"v {v[0]} {v[1]} {v[2]}\n")
+        for tri in faces:
+            # OBJ indices are 1-based
+            f.write(f"f {tri[0] + 1} {tri[1] + 1} {tri[2] + 1}\n")
+
+
 # =====================================================================
 # Reconstruction pipeline
 # =====================================================================
@@ -235,15 +269,27 @@ def reconstruct_3d_from_scan(scan_dir: str, proj_size: Tuple[int, int], color_pa
     u_map = np.load(scan_dir / "proj_u.npy")
     v_map = np.load(scan_dir / "proj_v.npy")
     mask = np.load(scan_dir / "mask_final.npy")
+    mask_quality_path = scan_dir / "mask_quality.npy"
+    mask_quality = np.load(mask_quality_path) if mask_quality_path.exists() else None
+    mask_used = mask_quality if mask_quality is not None else mask
+    diag_scan = {}
+    diag_path = scan_dir / "scan_diag_scan.json"
+    if diag_path.exists():
+        try:
+            diag_scan = json.loads(diag_path.read_text())
+        except Exception:
+            diag_scan = {}
 
     H, W = u_map.shape
     ys, xs = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
 
-    valid = mask & np.isfinite(u_map) & np.isfinite(v_map)
+    valid = mask_used & np.isfinite(u_map) & np.isfinite(v_map)
     if valid.sum() == 0:
         raise ValueError("No valid projector UV samples after masking/finite check.")
     cam_uv = np.stack([xs[valid], ys[valid]], axis=1).astype(np.float32)
     proj_uv = np.stack([u_map[valid], v_map[valid]], axis=1).astype(np.float32)
+    xs_valid = xs[valid]
+    ys_valid = ys[valid]
 
     if cam_uv.size == 0:
         raise ValueError("No valid pixels for reconstruction.")
@@ -325,8 +371,8 @@ def reconstruct_3d_from_scan(scan_dir: str, proj_size: Tuple[int, int], color_pa
         dots = np.clip(dots, -1.0, 1.0)
         angles = np.rad2deg(np.arccos(dots))
         print(f"[RECON] Ray angle stats (deg): min={np.nanmin(angles):.2f}, max={np.nanmax(angles):.2f}, mean={np.nanmean(angles):.2f}")
-        jump_u = neighbor_jump_stats(u_map, mask)
-        jump_v = neighbor_jump_stats(v_map, mask)
+        jump_u = neighbor_jump_stats(u_map, mask_used)
+        jump_v = neighbor_jump_stats(v_map, mask_used)
         print(f"[RECON] UV neighbor jumps >20px: u={jump_u:.2f}% v={jump_v:.2f}%")
         if stereo_rms is not None:
             print(f"[RECON] Stereo RMS loaded: {stereo_rms:.4f} px")
@@ -339,7 +385,7 @@ def reconstruct_3d_from_scan(scan_dir: str, proj_size: Tuple[int, int], color_pa
     if color_path is not None and os.path.exists(color_path) and cv2 is not None:
         color_img = cv2.imread(str(color_path), cv2.IMREAD_COLOR)
         if color_img is not None:
-            colors = color_img.reshape(-1, 3)[valid.ravel()][np.isfinite(points[:, 0])]
+            colors = color_img.reshape(-1, 3)[valid.ravel()]
 
     suffix = "calibrated" if not using_fake else "fake"
     np.savez_compressed(
@@ -358,4 +404,96 @@ def reconstruct_3d_from_scan(scan_dir: str, proj_size: Tuple[int, int], color_pa
     )
 
     save_point_cloud_ply(scan_dir / f"points_{suffix}.ply", points, colors=colors)
+
+    # Filter points by triangulation error
+    errors_finite = errors[np.isfinite(errors)]
+    med_err = float(np.nanmedian(errors_finite)) if errors_finite.size > 0 else float("nan")
+    err_cap = None  # cap disabled for sanity test
+    ok = np.isfinite(errors)
+    keep = ok & finite_pts
+
+    points_filtered = points[keep]
+    errors_filtered = errors[keep]
+    cam_uv_filtered = cam_uv[keep]
+    proj_uv_filtered = proj_uv[keep]
+    colors_filtered = colors[keep] if colors is not None else None
+
+    med_err_after = float(np.nanmedian(errors_filtered)) if errors_filtered.size > 0 else float("nan")
+    if not np.isnan(med_err):
+        print(f"[RECON] Error cap disabled for sanity test (median before={med_err:.4f}, after={med_err_after:.4f})")
+
+    np.savez_compressed(
+        scan_dir / "points_filtered.npz",
+        points=points_filtered,
+        errors=errors_filtered,
+        cam_uv=cam_uv_filtered,
+        proj_uv=proj_uv_filtered,
+        Kc=Kc,
+        dist=dist,
+        Kp=Kp,
+        dp=dp,
+        R=R,
+        T=T,
+        stereo_rms=np.array([stereo_rms if stereo_rms is not None else np.nan], dtype=np.float32),
+        mask_used=mask_used,
+        valid_mask=valid,
+        median_error=np.array([med_err], dtype=np.float32),
+    )
+    save_point_cloud_ply(scan_dir / "points_filtered.ply", points_filtered, colors=colors_filtered)
+
+    # Build single-view mesh (2.5D) from filtered points
+    mesh_stride = 1  # increase if Pi performance is constrained
+    idx_map = -np.ones((H, W), dtype=np.int32)
+    if points_filtered.size > 0:
+        idx_map[ys_valid[keep].astype(int), xs_valid[keep].astype(int)] = np.arange(points_filtered.shape[0], dtype=np.int32)
+
+    faces: List[Tuple[int, int, int]] = []
+    for y in range(0, H - mesh_stride, mesh_stride):
+        for x in range(0, W - mesh_stride, mesh_stride):
+            i00 = idx_map[y, x]
+            i10 = idx_map[y, x + mesh_stride]
+            i01 = idx_map[y + mesh_stride, x]
+            i11 = idx_map[y + mesh_stride, x + mesh_stride]
+            if (i00 < 0) or (i10 < 0) or (i01 < 0) or (i11 < 0):
+                continue
+            faces.append((int(i00), int(i10), int(i01)))
+            faces.append((int(i10), int(i11), int(i01)))
+
+    save_mesh_ply(scan_dir / "mesh_single_view.ply", points_filtered, faces)
+    save_mesh_obj(scan_dir / "mesh_single_view.obj", points_filtered, faces)
+
+    # Diagnostics summary
+    mask_quality_pct = float(100.0 * np.count_nonzero(mask_used) / mask_used.size)
+    u_vals = u_map[valid]
+    v_vals = v_map[valid]
+    z_filtered = points_filtered[:, 2] if points_filtered.size > 0 else np.array([], dtype=np.float32)
+    err_stats = {
+        "median": float(np.nanmedian(errors_filtered)) if errors_filtered.size > 0 else None,
+        "mean": float(np.nanmean(errors_filtered)) if errors_filtered.size > 0 else None,
+        "p95": float(np.nanpercentile(errors_filtered, 95.0)) if errors_filtered.size > 0 else None,
+    }
+    jump_u = neighbor_jump_stats(u_map, mask_used)
+    jump_v = neighbor_jump_stats(v_map, mask_used)
+    summary = {
+        "mask_quality_pct": mask_quality_pct,
+        "proj_u_min": float(np.nanmin(u_vals)) if u_vals.size > 0 else None,
+        "proj_u_max": float(np.nanmax(u_vals)) if u_vals.size > 0 else None,
+        "proj_v_min": float(np.nanmin(v_vals)) if v_vals.size > 0 else None,
+        "proj_v_max": float(np.nanmax(v_vals)) if v_vals.size > 0 else None,
+        "z_min": float(np.nanmin(z_filtered)) if z_filtered.size > 0 else None,
+        "z_max": float(np.nanmax(z_filtered)) if z_filtered.size > 0 else None,
+        "z_mean": float(np.nanmean(z_filtered)) if z_filtered.size > 0 else None,
+        "ray_error": err_stats,
+        "ray_error_median_before_cap": med_err if not np.isnan(med_err) else None,
+        "ray_error_median_after_cap": med_err_after if not np.isnan(med_err_after) else None,
+        "ray_error_cap": err_cap,
+        "neighbor_jumps_px": {
+            "proj_u": jump_u,
+            "proj_v": jump_v,
+        },
+    }
+    summary.update(diag_scan)
+    with open(scan_dir / "scan_summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
     return points, errors

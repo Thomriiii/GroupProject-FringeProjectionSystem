@@ -27,8 +27,13 @@ import pygame
 from core.camera import CameraController
 from core.geometry import compute_projector_uv_from_phase
 from core.psp import run_psp_per_frequency
-from core.masking import merge_frequency_masks
+from core.masking import merge_frequency_masks, clean_mask
 from core.unwrap import temporal_unwrap
+
+THRESH_GAMMA_PHASE1 = 0.25
+THRESH_B_PHASE1 = 20.0
+U_JUMP_MAX = 8.0
+V_JUMP_MAX = 8.0
 
 class ScanController:
     def __init__(
@@ -168,12 +173,30 @@ class ScanController:
         cv2.imwrite(out_path, img_color)
         print(f"[SCAN] Saved {filename}")
 
+    def _save_psp_quality_maps(self, scan_dir: str, orientation: str, psp_result):
+        """
+        Persist per-frequency PSP quality metrics for debugging/diagnostics.
+        """
+        f_hi = max(self.freqs)
+        prefix = "vert" if orientation == "vert" else "horiz"
+        for f in self.freqs:
+            np.save(os.path.join(scan_dir, f"A_{prefix}_f{f}.npy"), psp_result.A[f])
+            np.save(os.path.join(scan_dir, f"B_{prefix}_f{f}.npy"), psp_result.B[f])
+            np.save(os.path.join(scan_dir, f"gamma_{prefix}_f{f}.npy"), psp_result.gamma[f])
+            if hasattr(psp_result, "saturated"):
+                np.save(os.path.join(scan_dir, f"sat_{prefix}_f{f}.npy"), psp_result.saturated[f])
+        np.save(os.path.join(scan_dir, f"A_{prefix}.npy"), psp_result.A[f_hi])
+        np.save(os.path.join(scan_dir, f"B_{prefix}.npy"), psp_result.B[f_hi])
+        np.save(os.path.join(scan_dir, f"gamma_{prefix}.npy"), psp_result.gamma[f_hi])
+        if hasattr(psp_result, "saturated"):
+            np.save(os.path.join(scan_dir, f"sat_{prefix}.npy"), psp_result.saturated[f_hi])
+
 
     # =====================================================================
     # NORMAL SCAN PIPELINE
     # =====================================================================
 
-    def run_scan(self) -> str:
+    def run_scan(self, polished: bool = False) -> str:
         """
         Full normal scan:
           - AE on midgrey
@@ -187,7 +210,7 @@ class ScanController:
         scan_dir : str
             Directory where scan results were saved.
         """
-        print("[SCAN] Starting scan...")
+        print(f"[SCAN] Starting scan (polished={polished})...")
         scan_dir = self._make_scan_dir()
 
         # Auto exposure
@@ -207,6 +230,7 @@ class ScanController:
             apply_input_blur=False,
             median_phase_filter=True,
         )
+        self._save_psp_quality_maps(scan_dir, "vert", psp_vert)
 
         print("[SCAN] Cleaning masks (vertical)...")
         masks_vert = merge_frequency_masks(psp_vert.mask, self.freqs)
@@ -246,6 +270,7 @@ class ScanController:
             apply_input_blur=False,
             median_phase_filter=True,
         )
+        self._save_psp_quality_maps(scan_dir, "horiz", psp_horiz)
 
         print("[SCAN] Cleaning masks (horizontal)...")
         masks_horiz = merge_frequency_masks(psp_horiz.mask, self.freqs)
@@ -271,15 +296,48 @@ class ScanController:
         # in scan.py after Phi_horiz smoothing:
         self._save_phase_debug(Phi_horiz, mask_horiz, scan_dir, filename="phase_horiz_debug.png")
 
+        # -----------------------------------------------------------------
+        # Phase-1 quality gating and smoothing
+        # -----------------------------------------------------------------
+        f_hi = max(self.freqs)
+        qual_vert = (
+            (psp_vert.gamma[f_hi] > THRESH_GAMMA_PHASE1) &
+            (psp_vert.B[f_hi] > THRESH_B_PHASE1) &
+            (~psp_vert.saturated[f_hi])
+        )
+        qual_horiz = (
+            (psp_horiz.gamma[f_hi] > THRESH_GAMMA_PHASE1) &
+            (psp_horiz.B[f_hi] > THRESH_B_PHASE1) &
+            (~psp_horiz.saturated[f_hi])
+        )
+
+        mask_quality = (
+            (mask_vert & qual_vert) |
+            (mask_horiz & qual_horiz)
+        )
+        mask_quality = clean_mask(mask_quality.astype(np.uint8) > 0, kernel_size=3)
+        mask_quality_pre_uv = mask_quality.copy()
+        np.save(os.path.join(scan_dir, "mask_quality.npy"), mask_quality)
+
+        print("[SCAN] Applying quality-gated median filter to phases...")
+        Phi_vert_filtered = Phi_vert.copy()
+        Phi_horiz_filtered = Phi_horiz.copy()
+        Phi_vert_med_q = median_filter(Phi_vert, size=3)
+        Phi_horiz_med_q = median_filter(Phi_horiz, size=3)
+        Phi_vert_filtered[mask_quality] = Phi_vert_med_q[mask_quality]
+        Phi_horiz_filtered[mask_quality] = Phi_horiz_med_q[mask_quality]
+        Phi_vert_filtered[~mask_quality] = np.nan
+        Phi_horiz_filtered[~mask_quality] = np.nan
+
+        np.save(os.path.join(scan_dir, "phase_vert_filtered.npy"), Phi_vert_filtered)
+        np.save(os.path.join(scan_dir, "phase_horiz_filtered.npy"), Phi_horiz_filtered)
+        Phi_vert = Phi_vert_filtered
+        Phi_horiz = Phi_horiz_filtered
+
 
         # -----------------------------------------------------------------
         # Combine masks and compute projector UV mapping
         # -----------------------------------------------------------------
-        #mask_final = mask_vert & mask_horiz
-        # temporarily try:
-        mask_final = mask_vert | mask_horiz
-
-
         print("[SCAN] Computing projector UV maps from phase...")
         u_map, v_map, mask_final = compute_projector_uv_from_phase(
             phase_vert=Phi_vert,
@@ -293,6 +351,38 @@ class ScanController:
         if np.isfinite(u_map).any() and np.isfinite(v_map).any():
             print(f"[SCAN][UV] u range: {np.nanmin(u_map):.2f} .. {np.nanmax(u_map):.2f} (proj_w={self.proj_w})")
             print(f"[SCAN][UV] v range: {np.nanmin(v_map):.2f} .. {np.nanmax(v_map):.2f} (proj_h={self.proj_h})")
+
+        # UV-gradient rejection inside quality mask
+        # UV-gradient rejection temporarily disabled for sanity test
+        rej_uv_pct = 0.0
+        remaining_pct = 100.0 * np.count_nonzero(mask_quality) / float(mask_quality.size)
+
+        # Diagnostics for summary
+        diag = {
+            "uv_reject_pct": rej_uv_pct,
+            "mask_quality_pct": remaining_pct,
+        }
+        if mask_quality.any():
+            b_vals = []
+            g_vals = []
+            if psp_vert.B:
+                b_vals.append(psp_vert.B[f_hi][mask_quality])
+                g_vals.append(psp_vert.gamma[f_hi][mask_quality])
+            if psp_horiz.B:
+                b_vals.append(psp_horiz.B[f_hi][mask_quality])
+                g_vals.append(psp_horiz.gamma[f_hi][mask_quality])
+            if b_vals:
+                med_b = float(np.nanmedian(np.concatenate([bv.ravel() for bv in b_vals])))
+                diag["median_B_mask_quality"] = med_b
+                print(f"[SCAN][DIAG] Median B inside mask_quality: {med_b:.2f}")
+            if g_vals:
+                med_g = float(np.nanmedian(np.concatenate([gv.ravel() for gv in g_vals])))
+                diag["median_gamma_mask_quality"] = med_g
+                print(f"[SCAN][DIAG] Median gamma inside mask_quality: {med_g:.4f}")
+        diag_path = os.path.join(scan_dir, "scan_diag_scan.json")
+        with open(diag_path, "w", encoding="utf-8") as f:
+            import json as _json
+            _json.dump(diag, f, indent=2)
 
         # -----------------------------------------------------------------
         # Save outputs

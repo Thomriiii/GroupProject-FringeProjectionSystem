@@ -56,6 +56,7 @@ class WebServer:
         self.scan_status = "Idle"
         self.last_scan_dir = None
         self.recon_status = "Idle"
+        self.next_scan_polished: bool = False
 
         # Projector calibration state
         self.proj_lock = threading.Lock()
@@ -151,7 +152,8 @@ class WebServer:
 
         @app.post("/scan")
         def scan():
-            if not self._start_scan_thread():
+            polished_flag = str(request.form.get("polished", "false")).lower() in ("1", "true", "on", "yes")
+            if not self._start_scan_thread(polished=polished_flag):
                 return "Scan already running. <a href='/'>Back</a>"
             return "Scan started. <a href='/'>Back</a>"
 
@@ -233,10 +235,11 @@ class WebServer:
     # SCAN THREAD HANDLER
     # ============================================================
 
-    def _start_scan_thread(self) -> bool:
+    def _start_scan_thread(self, polished: bool = False) -> bool:
         if not self.scan_lock.acquire(blocking=False):
             return False
 
+        self.next_scan_polished = polished
         self.scan_status = "Running"
         t = threading.Thread(target=self._run_scan_worker, daemon=True)
         t.start()
@@ -244,7 +247,7 @@ class WebServer:
 
     def _run_scan_worker(self):
         try:
-            scan_dir = self.scan_controller.run_scan()
+            scan_dir = self.scan_controller.run_scan(polished=self.next_scan_polished)
             self.last_scan_dir = scan_dir
             self.scan_status = "Complete"
         finally:
