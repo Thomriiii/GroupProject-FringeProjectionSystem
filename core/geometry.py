@@ -71,7 +71,7 @@ def compute_projector_uv_from_phase(
     offset_u: float = 0.0,
     offset_v: float = 0.0,
     auto_cycle_alignment: bool = True,
-    apply_affine_normalisation: bool = True,
+    apply_affine_normalisation: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Convert unwrapped vertical/horizontal phase maps into projector pixel maps.
@@ -128,10 +128,10 @@ def compute_projector_uv_from_phase(
             v_map += v_shift
 
     if apply_affine_normalisation:
-        su, ou = _affine_normalise_minmax(u_map, mask_final, proj_w)
-        sv, ov = _affine_normalise_minmax(v_map, mask_final, proj_h)
-        u_map = u_map * su + ou
-        v_map = v_map * sv + ov
+        raise RuntimeError(
+            "Affine normalisation of projector UVs breaks calibrated geometry "
+            "and must remain disabled."
+        )
 
     u_map = u_map.astype(np.float32)
     v_map = v_map.astype(np.float32)

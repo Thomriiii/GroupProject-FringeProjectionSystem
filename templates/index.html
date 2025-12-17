@@ -31,6 +31,11 @@
             <button type="submit" class="scan-btn">Reconstruct Last Scan</button>
         </form>
         {% endif %}
+        <form method="post" action="/scan/reconstruct_previous" style="margin-top:10px;">
+            <label for="scan_path">Reconstruct previous scan folder:</label>
+            <input type="text" id="scan_path" name="scan_path" placeholder="scans/2025...">
+            <button type="submit" class="scan-btn">Reconstruct Specified Scan</button>
+        </form>
     </section>
 
     <section>

@@ -96,18 +96,21 @@ def load_session_poses(session_dir: Path) -> Tuple[List[PoseData], ImageSize | N
 def calibrate_projector_intrinsics(
     poses: List[PoseData],
     image_size_proj: ImageSize,
-) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], List[np.ndarray], float, List[float], List[PoseData]]:
+) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], List[np.ndarray], float, List[float], List[PoseData], List[str]]:
     obj_points = []
     proj_points = []
     used_poses: List[PoseData] = []
+    rejected: List[str] = []
     for p in poses:
         mask = np.isfinite(p.proj_points).all(axis=1)
         obj_filtered = p.object_points[mask].astype(np.float32)
         proj_filtered = p.proj_points[mask].astype(np.float32)
         if len(obj_filtered) < 4:
+            rejected.append(f"{p.name}: <4 valid corners")
             continue
         # Reject poses with extremely low spread (degenerate for calibration)
         if proj_filtered.std(axis=0).min() < 5.0:
+            rejected.append(f"{p.name}: projector spread too small")
             continue
         obj_points.append(obj_filtered)
         proj_points.append(proj_filtered)
@@ -122,7 +125,7 @@ def calibrate_projector_intrinsics(
     )
 
     per_view_err = compute_reprojection_errors(obj_points, proj_points, rvecs_p, tvecs_p, Kp, dist_p)
-    return Kp, dist_p, rvecs_p, tvecs_p, float(ret), per_view_err, used_poses
+    return Kp, dist_p, rvecs_p, tvecs_p, float(ret), per_view_err, used_poses, rejected
 
 
 def stereo_calibrate(
@@ -217,7 +220,11 @@ def run_from_session(
     print(f"[PROJ-CALIB] Loaded {len(poses)} poses for calibration.")
     print(f"[PROJ-CALIB] Projector size: {image_size_proj}, Camera size: {image_size_cam}")
 
-    Kp, dist_p, rvecs_p, tvecs_p, rms_proj, per_view_err, poses_used = calibrate_projector_intrinsics(poses, image_size_proj)
+    Kp, dist_p, rvecs_p, tvecs_p, rms_proj, per_view_err, poses_used, rejected = calibrate_projector_intrinsics(poses, image_size_proj)
+    if rejected:
+        print("[PROJ-CALIB] Rejected poses:")
+        for r in rejected:
+            print(f"  - {r}")
 
     # Optional rejection of high-error views
     if max_proj_error is not None:
@@ -225,8 +232,13 @@ def run_from_session(
         if not all(keep_mask) and any(keep_mask):
             kept = [p for p, k in zip(poses_used, keep_mask) if k]
             print(f"[PROJ-CALIB] Dropping {len(poses_used) - len(kept)} views above {max_proj_error} px.")
+            for name, err, k in zip([p.name for p in poses_used], per_view_err, keep_mask):
+                if not k:
+                    print(f"   {name}: {err:.3f} px")
             poses_used = kept
-            Kp, dist_p, rvecs_p, tvecs_p, rms_proj, per_view_err, poses_used = calibrate_projector_intrinsics(poses_used, image_size_proj)
+            Kp, dist_p, rvecs_p, tvecs_p, rms_proj, per_view_err, poses_used, rejected_again = calibrate_projector_intrinsics(poses_used, image_size_proj)
+            for r in rejected_again:
+                print(f"   rejected after re-fit: {r}")
 
     if not poses_used:
         raise ValueError("No valid poses after filtering NaNs/coverage.")
@@ -245,6 +257,15 @@ def run_from_session(
     T_proj_to_cam = -R_proj_to_cam @ T_cam_to_proj
     baseline = float(np.linalg.norm(T_proj_to_cam))
 
+    # Compute coverage bbox for reference
+    all_proj = np.vstack([p.proj_points for p in poses_used if len(p.proj_points)])
+    uv_bbox = np.array([
+        float(np.min(all_proj[:, 0])),
+        float(np.max(all_proj[:, 0])),
+        float(np.min(all_proj[:, 1])),
+        float(np.max(all_proj[:, 1])),
+    ], dtype=np.float32)
+
     # Save intrinsics
     intr_path = session_dir / "projector_intrinsics.npz"
     np.savez_compressed(
@@ -253,6 +274,7 @@ def run_from_session(
         dist_p=dist_p,
         image_size_proj=np.array(image_size_proj, dtype=np.int32),
         rms=np.array([rms_proj], dtype=np.float32),
+        uv_bbox=uv_bbox,
     )
     print(f"[PROJ-CALIB] Saved projector intrinsics to {intr_path}")
 
@@ -266,6 +288,7 @@ def run_from_session(
         Kp=Kp,
         dist_p=dist_p,
         rms=np.array([rms_stereo], dtype=np.float32),
+        uv_bbox=uv_bbox,
     )
     print(f"[STEREO] Saved stereo parameters to {stereo_path}")
 

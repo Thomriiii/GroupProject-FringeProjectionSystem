@@ -288,7 +288,7 @@ class ScanController:
             proj_size=(self.proj_w, self.proj_h),
             mask_vert=mask_vert,
             mask_horiz=mask_horiz,
-            apply_affine_normalisation=True,
+            apply_affine_normalisation=False,
         )
         if np.isfinite(u_map).any() and np.isfinite(v_map).any():
             print(f"[SCAN][UV] u range: {np.nanmin(u_map):.2f} .. {np.nanmax(u_map):.2f} (proj_w={self.proj_w})")

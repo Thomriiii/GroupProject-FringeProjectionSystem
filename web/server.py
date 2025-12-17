@@ -66,6 +66,7 @@ class WebServer:
         self.proj_calib_root = Path(self.scan_controller.calib_root) / "projector"
         self.proj_calib_root.mkdir(parents=True, exist_ok=True)
         self.proj_session = self._start_new_proj_session()
+        self.proj_max_error = 2.0  # drop poses with per-view RMS above this
         self.pattern_settle_time = 0.12
         self.proj_w = graycode_set.width
         self.proj_h = graycode_set.height
@@ -138,6 +139,7 @@ class WebServer:
                 proj_w=self.proj_w,
                 proj_h=self.proj_h,
                 sessions=sessions,
+                max_error=self.proj_max_error,
             )
 
         @app.route("/video")
@@ -156,6 +158,14 @@ class WebServer:
         @app.post("/scan/reconstruct")
         def scan_reconstruct():
             msg = self._run_reconstruct_latest()
+            return msg
+
+        @app.post("/scan/reconstruct_previous")
+        def scan_reconstruct_previous():
+            scan_path = request.form.get("scan_path", "").strip()
+            if not scan_path:
+                return "No scan path provided. <a href='/'>Back</a>"
+            msg = self._run_reconstruct_scan(scan_path)
             return msg
 
         @app.post("/calib/capture")
@@ -181,9 +191,22 @@ class WebServer:
 
         @app.post("/proj_calib/finish")
         def proj_calib_finish():
+            try:
+                val = request.form.get("max_error", type=float)
+                if val is not None:
+                    self.proj_max_error = val
+            except Exception:
+                pass
             ok, msg = self._finish_projector_calibration()
             if not ok:
                 print(f"[PROJ-CALIB] Finish failed: {msg}")
+            return redirect(url_for("proj_calib"))
+
+        @app.post("/proj_calib/select")
+        def proj_calib_select():
+            session_path = request.form.get("session_path", "")
+            if session_path:
+                self._set_proj_session(Path(session_path))
             return redirect(url_for("proj_calib"))
 
     # ============================================================
@@ -244,6 +267,27 @@ class WebServer:
             msg = (
                 f"Reconstruction complete ({suffix}). "
                 f"Saved {len(points)} points to {self.last_scan_dir}/points_{suffix}.ply"
+            )
+            self.recon_status = msg
+            return msg + " <a href='/'>Back</a>"
+        except Exception as e:
+            msg = f"Reconstruction failed: {e}"
+            self.recon_status = msg
+            return msg + " <a href='/'>Back</a>"
+
+    def _run_reconstruct_scan(self, scan_path: str) -> str:
+        scan_dir = Path(scan_path)
+        if not scan_dir.exists():
+            return f"Scan directory not found: {scan_dir} <a href='/'>Back</a>"
+        try:
+            suffix = "calibrated" if Path("stereo_params.npz").exists() else "fake"
+            points, _ = reconstruct_3d_from_scan(
+                scan_dir=scan_dir,
+                proj_size=(self.scan_controller.proj_w, self.scan_controller.proj_h),
+            )
+            msg = (
+                f"Reconstruction complete ({suffix}). "
+                f"Saved {len(points)} points to {scan_dir}/points_{suffix}.ply"
             )
             self.recon_status = msg
             return msg + " <a href='/'>Back</a>"
@@ -376,6 +420,33 @@ class WebServer:
         if self.proj_session is None:
             self.proj_session = self._start_new_proj_session()
         return self.proj_session
+
+    def _set_proj_session(self, session_path: Path):
+        """
+        Load an existing projector calibration session so the user can continue capturing
+        or re-run finish.
+        """
+        session_path = session_path.resolve()
+        if not session_path.exists():
+            self.proj_status = f"Session not found: {session_path}"
+            return
+        if session_path.parent != self.proj_calib_root.resolve():
+            self.proj_status = f"Session must be under {self.proj_calib_root}"
+            return
+        self.proj_session = session_path
+        # set next pose index based on existing pose_* folders
+        pose_dirs = sorted(session_path.glob("pose_*"))
+        next_idx = 0
+        if pose_dirs:
+            # parse max existing index
+            def _idx(p):
+                try:
+                    return int(p.name.split("_")[1])
+                except Exception:
+                    return -1
+            next_idx = max(_idx(p) for p in pose_dirs) + 1
+        self.proj_views = next_idx
+        self.proj_status = f"Loaded session {session_path.name} (next pose {next_idx:03d})"
 
     def _make_proj_pose_dir(self) -> Path:
         session = self._ensure_proj_session()
@@ -605,7 +676,7 @@ class WebServer:
                     session_dir=session,
                     camera_calib_path=Path("camera_intrinsics.npz"),
                     min_views=min_views,
-                    max_proj_error=2.0,
+                    max_proj_error=self.proj_max_error,
                 )
             except Exception as e:
                 msg = f"Projector calibration failed: {e}"

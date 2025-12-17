@@ -83,7 +83,8 @@ def load_projector_intrinsics(path: str | Path = "projector_intrinsics.npz"):
     dist_p = data["dist_p"]
     image_size = tuple(int(x) for x in data["image_size_proj"])
     rms = float(data["rms"][0]) if "rms" in data else float("nan")
-    return Kp, dist_p, image_size, rms
+    uv_bbox = data["uv_bbox"] if "uv_bbox" in data else None
+    return Kp, dist_p, image_size, rms, uv_bbox
 
 
 def load_stereo_params(path: str | Path = "stereo_params.npz"):
@@ -98,7 +99,8 @@ def load_stereo_params(path: str | Path = "stereo_params.npz"):
     Kp = data["Kp"]
     dist_p = data["dist_p"]
     rms = float(data["rms"][0]) if "rms" in data else float("nan")
-    return R, T, Kc, dist_c, Kp, dist_p, rms
+    uv_bbox = data["uv_bbox"] if "uv_bbox" in data else None
+    return R, T, Kc, dist_c, Kp, dist_p, rms, uv_bbox
 
 
 # =====================================================================
@@ -144,10 +146,14 @@ def triangulate_rays(rays_cam: np.ndarray, rays_proj_cam: np.ndarray, T: np.ndar
     T: projector origin in camera frame.
 
     Returns points_3d (Nx3) and per-point errors (distance between closest points on the two rays).
+    Points where the ray parameters are invalid (s<=0 or t<=0) or rays are near-parallel
+    are marked as NaN.
     """
     N = rays_cam.shape[0]
     points = np.full((N, 3), np.nan, dtype=np.float32)
     errors = np.full((N,), np.nan, dtype=np.float32)
+    s_params = np.full((N,), np.nan, dtype=np.float32)
+    t_params = np.full((N,), np.nan, dtype=np.float32)
 
     for i in range(N):
         a = rays_cam[i]
@@ -167,7 +173,12 @@ def triangulate_rays(rays_cam: np.ndarray, rays_proj_cam: np.ndarray, T: np.ndar
         b_dot_r = np.dot(b, r)
 
         s = (a_dot_b * b_dot_r - b_dot_b * a_dot_r) / denom
-        t = (a_dot_b * a_dot_r - a_dot_a * b_dot_r) / denom
+        t = (a_dot_a * b_dot_r - a_dot_b * a_dot_r) / denom
+        s_params[i] = float(s)
+        t_params[i] = float(t)
+
+        if s <= 0.0 or t <= 0.0:
+            continue
 
         p_cam = p0 + s * a
         p_proj = p1 + t * b
@@ -177,7 +188,7 @@ def triangulate_rays(rays_cam: np.ndarray, rays_proj_cam: np.ndarray, T: np.ndar
         points[i] = midpoint.astype(np.float32)
         errors[i] = float(err)
 
-    return points, errors
+    return points, errors, s_params, t_params
 
 
 # =====================================================================
@@ -243,64 +254,89 @@ def reconstruct_3d_from_scan(scan_dir: str, proj_size: Tuple[int, int], color_pa
     stereo = load_stereo_params()
     stereo_rms = None
     using_fake = False
-    rms_proj = None
 
     if stereo is not None:
-        R, T, Kc_s, dist_s, Kp, dp, stereo_rms = stereo
+        R_st, T_st, Kc_s, dist_s, Kp_st, dp_st, stereo_rms, _ = stereo
         Kc, dist = Kc_s, dist_s
+        Kp, dp = Kp_st, dp_st
         print(f"[RECON] Using calibrated projector + stereo. Stereo RMS={stereo_rms:.4f}px")
     else:
         intr = load_projector_intrinsics()
         if intr is not None:
-            Kp, dp, _, rms_proj = intr
+            Kp, dp, _, rms_proj, _ = intr
             print(f"[RECON] Using calibrated projector intrinsics only (fake extrinsics). RMS={rms_proj:.4f}px")
         else:
             Kp, dp = get_fake_projector_parameters(proj_size)
             print("[RECON] WARNING: Projector calibration not found. Using fake intrinsics.")
-        R, T = get_fake_extrinsics()
+        R_st, T_st = get_fake_extrinsics()
         using_fake = True
 
-    # Compute rays (undistort if calibration is available)
-    if cv2 is not None and (stereo is not None or rms_proj is not None):
-        cam_norm = cv2.undistortPoints(cam_uv.reshape(-1, 1, 2), Kc, dist)
-        proj_norm = cv2.undistortPoints(proj_uv.reshape(-1, 1, 2), Kp, dp)
+    # stereo_params.npz already stores projector->camera extrinsics.
+    # Do NOT invert or flip here.
+    R = R_st
+    T = T_st
 
-        def _dirs_from_norm(norm_xy: np.ndarray) -> np.ndarray:
-            dirs = np.hstack([norm_xy, np.ones((norm_xy.shape[0], 1), dtype=np.float64)])
-            norms = np.linalg.norm(dirs, axis=1, keepdims=True) + 1e-12
-            return (dirs / norms).astype(np.float32)
-
-        rays_cam = _dirs_from_norm(cam_norm[:, 0, :])
-        dirs_proj = _dirs_from_norm(proj_norm[:, 0, :])
-        dirs_proj_cam = (R.astype(np.float64) @ dirs_proj.T).T
-        norms_cam = np.linalg.norm(dirs_proj_cam, axis=1, keepdims=True) + 1e-12
-        rays_proj_cam = (dirs_proj_cam / norms_cam).astype(np.float32)
+    if cv2 is not None:
+        cam_norm = cv2.undistortPoints(cam_uv.reshape(-1, 1, 2), Kc, dist)[:, 0, :]
+        proj_norm = cv2.undistortPoints(proj_uv.reshape(-1, 1, 2), Kp, dp)[:, 0, :]
     else:
-        rays_cam = compute_camera_rays(cam_uv, Kc)
-        rays_proj_cam = compute_projector_rays(proj_uv, Kp, R, T)
+        cam_norm = cam_uv
+        proj_norm = proj_uv
 
-    points, errors = triangulate_rays(rays_cam, rays_proj_cam, T)
+    def _dirs_from_norm(norm_xy: np.ndarray) -> np.ndarray:
+        dirs = np.hstack([norm_xy, np.ones((norm_xy.shape[0], 1), dtype=np.float64)])
+        norms = np.linalg.norm(dirs, axis=1, keepdims=True) + 1e-12
+        return (dirs / norms).astype(np.float32)
+
+    rays_cam = _dirs_from_norm(cam_norm)
+    dirs_proj = _dirs_from_norm(proj_norm)
+    dirs_proj_cam = (R.astype(np.float64) @ dirs_proj.T).T
+    dirs_proj_cam /= np.linalg.norm(dirs_proj_cam, axis=1, keepdims=True) + 1e-12
+    rays_proj_cam = dirs_proj_cam.astype(np.float32)
+
+    points, errors, s_params, t_params = triangulate_rays(rays_cam, rays_proj_cam, T)
 
     # Basic validity diagnostics
     z_vals = points[:, 2]
     finite_pts = np.isfinite(points).all(axis=1)
+    def neighbor_jump_stats(arr: np.ndarray, mask_in: np.ndarray, thresh: float = 20.0):
+        # right and down neighbors
+        mask = mask_in & np.isfinite(arr)
+        # right
+        mr = mask[:, :-1] & mask[:, 1:]
+        vr = np.abs(arr[:, :-1] - arr[:, 1:])[mr]
+        md = mask[:-1, :] & mask[1:, :]
+        vd = np.abs(arr[:-1, :] - arr[1:, :])[md]
+        total = vr.size + vd.size
+        if total == 0:
+            return 0.0
+        jumps = np.count_nonzero(vr > thresh) + np.count_nonzero(vd > thresh)
+        return 100.0 * jumps / float(total)
+
     if finite_pts.any():
         z_valid = z_vals[finite_pts]
         err_valid = errors[finite_pts]
+        pos_frac = np.mean(z_valid > 0)
         print(f"[RECON] UV range u:{np.nanmin(u_map):.2f}-{np.nanmax(u_map):.2f} v:{np.nanmin(v_map):.2f}-{np.nanmax(v_map):.2f}")
-        print(f"[RECON] Depth stats (m): min={np.nanmin(z_valid):.3f}, max={np.nanmax(z_valid):.3f}, mean={np.nanmean(z_valid):.3f}")
-        print(f"[RECON] Ray intersection error (m): mean={np.nanmean(err_valid):.4f}, median={np.nanmedian(err_valid):.4f}")
+        print(f"[RECON] Depth stats (m): min={np.nanmin(z_valid):.3f}, max={np.nanmax(z_valid):.3f}, mean={np.nanmean(z_valid):.3f}, %Z>0={pos_frac*100:.1f}%")
+        print(f"[RECON] Ray intersection error (m): mean={np.nanmean(err_valid):.4f}, median={np.nanmedian(err_valid):.4f}, max={np.nanmax(err_valid):.4f}")
         # Angle between camera and projector rays (should vary, nonzero)
         dots = np.einsum("ij,ij->i", rays_cam[finite_pts], rays_proj_cam[finite_pts])
         dots = np.clip(dots, -1.0, 1.0)
         angles = np.rad2deg(np.arccos(dots))
         print(f"[RECON] Ray angle stats (deg): min={np.nanmin(angles):.2f}, max={np.nanmax(angles):.2f}, mean={np.nanmean(angles):.2f}")
+        jump_u = neighbor_jump_stats(u_map, mask)
+        jump_v = neighbor_jump_stats(v_map, mask)
+        print(f"[RECON] UV neighbor jumps >20px: u={jump_u:.2f}% v={jump_v:.2f}%")
         if stereo_rms is not None:
             print(f"[RECON] Stereo RMS loaded: {stereo_rms:.4f} px")
+        print(
+            f"[RECON] Z mean={np.nanmean(z_valid):.3f} m, "
+            f"median ray err={np.nanmedian(err_valid):.4f} m"
+        )
 
     colors = None
-    if color_path is not None and os.path.exists(color_path):
-        import cv2
+    if color_path is not None and os.path.exists(color_path) and cv2 is not None:
         color_img = cv2.imread(str(color_path), cv2.IMREAD_COLOR)
         if color_img is not None:
             colors = color_img.reshape(-1, 3)[valid.ravel()][np.isfinite(points[:, 0])]

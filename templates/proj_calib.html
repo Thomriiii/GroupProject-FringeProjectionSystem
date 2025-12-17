@@ -26,6 +26,8 @@
       </form>
 
       <form method="post" action="{{ url_for('proj_calib_finish') }}">
+        <label for="max_error">Drop poses with RMS above (px):</label>
+        <input type="number" step="0.1" id="max_error" name="max_error" value="{{ max_error }}">
         <button type="submit" class="finish">Finish Projector Calibration</button>
       </form>
 
@@ -44,7 +46,13 @@
         <h3>Sessions</h3>
         <ul>
           {% for s in sessions %}
-            <li>{{ s.name }}</li>
+            <li>
+              <form method="post" action="{{ url_for('proj_calib_select') }}" style="display:inline;">
+                <input type="hidden" name="session_path" value="{{ s }}">
+                <button type="submit">Load</button>
+              </form>
+              {{ s.name }}
+            </li>
           {% else %}
             <li>No previous sessions</li>
           {% endfor %}
