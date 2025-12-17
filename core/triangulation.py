@@ -32,16 +32,29 @@ def load_camera_intrinsics(path: str | Path = "camera_intrinsics.npz"):
     return K, dist, image_size
 
 
+FAKE_CONFIG_PATH = Path("config/fake_projector_config.json")
+
+
+def _load_fake_config():
+    if FAKE_CONFIG_PATH.exists():
+        try:
+            return json.loads(FAKE_CONFIG_PATH.read_text())
+        except Exception:
+            print(f"[RECON][WARN] Failed to parse {FAKE_CONFIG_PATH}, using defaults.")
+    return {}
+
+
 def get_fake_projector_parameters(proj_size: Tuple[int, int]):
     """
     Approximate projector intrinsics estimated from throw geometry.
     """
+    cfg = _load_fake_config()
     proj_w, proj_h = proj_size
 
-    fx = 2515.2
-    fy = 2319.3
-    cx = proj_w / 2.0  # 960 for 1920x1080
-    cy = proj_h / 2.0  # 540 for 1920x1080
+    fx = float(cfg.get("fx", 2515.2))
+    fy = float(cfg.get("fy", 2319.3))
+    cx = float(cfg.get("cx", proj_w / 2.0))
+    cy = float(cfg.get("cy", proj_h / 2.0))
 
     Kp = np.array([
         [fx, 0.0, cx],
@@ -50,6 +63,13 @@ def get_fake_projector_parameters(proj_size: Tuple[int, int]):
     ], dtype=np.float32)
 
     dp = np.zeros(5, dtype=np.float32)
+    if "distortion" in cfg and isinstance(cfg["distortion"], (list, tuple)):
+        vals = list(cfg["distortion"])
+        while len(vals) < 5:
+            vals.append(0.0)
+        dp = np.array(vals[:5], dtype=np.float32)
+    elif FAKE_CONFIG_PATH.exists():
+        print("[RECON][WARN] Fake projector distortion not provided; assuming zero.")
     return Kp, dp
 
 
@@ -57,14 +77,16 @@ def get_fake_extrinsics():
     """
     Approximate projector pose in camera frame based on tape-measured offsets.
     """
-    # Projector 18.5 cm LEFT, 1 cm above, 1.5 cm behind the camera
-    T = np.array([-0.185, 0.010, -0.015], dtype=np.float32)  # camera frame
+    cfg = _load_fake_config()
+    # Projector offset (camera frame): LEFT/RIGHT, UP, FORWARD (negative means behind)
+    T = np.array(cfg.get("T", [-0.185, 0.010, -0.015]), dtype=np.float32)
 
     # Toe-in yaw toward the scene centre (positive because projector sits left).
     # Point the projector z-axis roughly toward (0, 0, z_target) in camera frame.
-    z_target = 0.60  # metres in front of camera; used only to derive yaw guess
+    z_target = float(cfg.get("z_target", 0.60))  # metres in front of camera; used only to derive yaw guess
+    yaw_override = cfg.get("yaw_rad", None)
     vec_to_target = np.array([abs(T[0]), 0.0, z_target - T[2]], dtype=np.float64)
-    yaw = float(np.arctan2(vec_to_target[0], vec_to_target[2]))  # radians, ~17 deg
+    yaw = float(np.arctan2(vec_to_target[0], vec_to_target[2])) if yaw_override is None else float(yaw_override)
     c, s = np.cos(yaw), np.sin(yaw)
     R = np.array([
         [ c, 0.0,  s],
@@ -307,13 +329,23 @@ def reconstruct_3d_from_scan(scan_dir: str, proj_size: Tuple[int, int], color_pa
         Kp, dp = Kp_st, dp_st
         print(f"[RECON] Using calibrated projector + stereo. Stereo RMS={stereo_rms:.4f}px")
     else:
+        if os.getenv("REQUIRE_PROJECTOR_CALIB", "0") == "1":
+            raise RuntimeError(
+                "stereo_params.npz not found. Please run projector calibration "
+                "or unset REQUIRE_PROJECTOR_CALIB=1 to fall back to fake parameters."
+            )
         intr = load_projector_intrinsics()
         if intr is not None:
             Kp, dp, _, rms_proj, _ = intr
             print(f"[RECON] Using calibrated projector intrinsics only (fake extrinsics). RMS={rms_proj:.4f}px")
         else:
             Kp, dp = get_fake_projector_parameters(proj_size)
-            print("[RECON] WARNING: Projector calibration not found. Using fake intrinsics.")
+            print("[RECON][WARN] Projector calibration not found. Using FAKE intrinsics/extrinsics; geometry will be approximate.")
+            if np.allclose(dp, 0):
+                print("[RECON][WARN] Fake projector distortion is zero; distortion is NOT corrected. "
+                      f"Provide {FAKE_CONFIG_PATH} with 'distortion' coefficients if known.")
+            if FAKE_CONFIG_PATH.exists():
+                print(f"[RECON] Loaded fake projector parameters from {FAKE_CONFIG_PATH}.")
         R_st, T_st = get_fake_extrinsics()
         using_fake = True
 
@@ -408,8 +440,11 @@ def reconstruct_3d_from_scan(scan_dir: str, proj_size: Tuple[int, int], color_pa
     # Filter points by triangulation error
     errors_finite = errors[np.isfinite(errors)]
     med_err = float(np.nanmedian(errors_finite)) if errors_finite.size > 0 else float("nan")
-    err_cap = None  # cap disabled for sanity test
+    err_cap = None
     ok = np.isfinite(errors)
+    if not np.isnan(med_err):
+        err_cap = min(0.02, 2.0 * med_err)
+        ok &= errors <= err_cap
     keep = ok & finite_pts
 
     points_filtered = points[keep]
@@ -420,7 +455,8 @@ def reconstruct_3d_from_scan(scan_dir: str, proj_size: Tuple[int, int], color_pa
 
     med_err_after = float(np.nanmedian(errors_filtered)) if errors_filtered.size > 0 else float("nan")
     if not np.isnan(med_err):
-        print(f"[RECON] Error cap disabled for sanity test (median before={med_err:.4f}, after={med_err_after:.4f})")
+        cap_val = err_cap if err_cap is not None else float("nan")
+        print(f"[RECON] Error cap applied at {cap_val:.4f} m (median before={med_err:.4f}, after={med_err_after:.4f})")
 
     np.savez_compressed(
         scan_dir / "points_filtered.npz",

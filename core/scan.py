@@ -48,6 +48,7 @@ class ScanController:
         scan_root: str = "scans",
         calib_root: str = "calib",
         pattern_settle_time: float = 0.15,
+        graycode: object | None = None,
     ):
         self.camera = camera
         self.patterns = patterns              # dict[freq] -> list[pygame.Surface]
@@ -61,6 +62,7 @@ class ScanController:
         self.pattern_settle_time = pattern_settle_time
         self.proj_w = patterns[freqs[0]][0].get_width()
         self.proj_h = patterns[freqs[0]][0].get_height()
+        self.graycode = graycode
 
 
         os.makedirs(self.scan_root, exist_ok=True)
@@ -338,6 +340,9 @@ class ScanController:
         # -----------------------------------------------------------------
         # Combine masks and compute projector UV mapping
         # -----------------------------------------------------------------
+        # Use strict intersection for combined validity prior to UV mapping
+        mask_both = mask_vert & mask_horiz
+
         print("[SCAN] Computing projector UV maps from phase...")
         u_map, v_map, mask_final = compute_projector_uv_from_phase(
             phase_vert=Phi_vert,
@@ -348,14 +353,47 @@ class ScanController:
             mask_horiz=mask_horiz,
             apply_affine_normalisation=False,
         )
+        mask_final = mask_final & mask_both
         if np.isfinite(u_map).any() and np.isfinite(v_map).any():
             print(f"[SCAN][UV] u range: {np.nanmin(u_map):.2f} .. {np.nanmax(u_map):.2f} (proj_w={self.proj_w})")
             print(f"[SCAN][UV] v range: {np.nanmin(v_map):.2f} .. {np.nanmax(v_map):.2f} (proj_h={self.proj_h})")
 
         # UV-gradient rejection inside quality mask
-        # UV-gradient rejection temporarily disabled for sanity test
-        rej_uv_pct = 0.0
-        remaining_pct = 100.0 * np.count_nonzero(mask_quality) / float(mask_quality.size)
+        if mask_quality.any():
+            mask_uv_smooth = np.ones_like(mask_quality, dtype=bool)
+            mq = mask_quality
+            # right neighbor
+            du_r = np.abs(u_map[:, :-1] - u_map[:, 1:])
+            dv_r = np.abs(v_map[:, :-1] - v_map[:, 1:])
+            bad_u_r = (du_r > U_JUMP_MAX) & mq[:, :-1] & mq[:, 1:]
+            bad_v_r = (dv_r > V_JUMP_MAX) & mq[:, :-1] & mq[:, 1:]
+            # down neighbor
+            du_d = np.abs(u_map[:-1, :] - u_map[1:, :])
+            dv_d = np.abs(v_map[:-1, :] - v_map[1:, :])
+            bad_u_d = (du_d > U_JUMP_MAX) & mq[:-1, :] & mq[1:, :]
+            bad_v_d = (dv_d > V_JUMP_MAX) & mq[:-1, :] & mq[1:, :]
+
+            mask_uv_smooth[:, :-1] &= ~bad_u_r
+            mask_uv_smooth[:, 1:] &= ~bad_u_r
+            mask_uv_smooth[:, :-1] &= ~bad_v_r
+            mask_uv_smooth[:, 1:] &= ~bad_v_r
+
+            mask_uv_smooth[:-1, :] &= ~bad_u_d
+            mask_uv_smooth[1:, :] &= ~bad_u_d
+            mask_uv_smooth[:-1, :] &= ~bad_v_d
+            mask_uv_smooth[1:, :] &= ~bad_v_d
+
+            mask_quality = mask_quality & mask_uv_smooth
+            np.save(os.path.join(scan_dir, "mask_quality.npy"), mask_quality)
+            total_pix = mask_uv_smooth.size
+            pre_cnt = np.count_nonzero(mask_quality_pre_uv)
+            post_cnt = np.count_nonzero(mask_quality)
+            rej_uv_pct = 100.0 * max(pre_cnt - post_cnt, 0) / float(pre_cnt if pre_cnt > 0 else 1)
+            remaining_pct = 100.0 * post_cnt / float(total_pix)
+            print(f"[SCAN][UV] Rejected by UV-gradient: {rej_uv_pct:.2f}% | Remaining mask_quality: {remaining_pct:.2f}%")
+        else:
+            rej_uv_pct = 0.0
+            remaining_pct = 0.0
 
         # Diagnostics for summary
         diag = {

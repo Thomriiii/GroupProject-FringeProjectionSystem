@@ -1,0 +1,25 @@
+{
+  "mask_quality_pct": 9.116319444444445,
+  "proj_u_min": 153.7838134765625,
+  "proj_u_max": 988.930908203125,
+  "proj_v_min": 5.333311557769775,
+  "proj_v_max": 573.75,
+  "z_min": 0.7735536098480225,
+  "z_max": 3.628364086151123,
+  "z_mean": 1.3871389627456665,
+  "ray_error": {
+    "median": 0.014384496957063675,
+    "mean": 0.011381675489246845,
+    "p95": 0.019403798505663872
+  },
+  "ray_error_median_before_cap": 0.09039325267076492,
+  "ray_error_median_after_cap": 0.014384496957063675,
+  "ray_error_cap": 0.02,
+  "neighbor_jumps_px": {
+    "proj_u": 0.0,
+    "proj_v": 0.0
+  },
+  "uv_reject_pct": 31.20153293099354,
+  "median_B_mask_quality": 62.267567802187344,
+  "median_gamma_mask_quality": 0.6616029739379883
+}

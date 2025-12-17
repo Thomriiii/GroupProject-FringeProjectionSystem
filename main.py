@@ -104,6 +104,7 @@ def main():
         scan_root=SCAN_ROOT,
         calib_root=CALIB_ROOT,
         pattern_settle_time=0.15,
+        graycode=graycode_set,
     )
 
     # ============================================================
