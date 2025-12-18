@@ -1,0 +1,46 @@
+Camera Intrinsic Calibration Report
+
+Images used: 14
+
+Image size: 1280 x 720
+
+RMS reprojection error: 0.4771 px
+
+
+Intrinsics (K):
+
+[[3.91196679e+03 0.00000000e+00 6.36449410e+02]
+ [0.00000000e+00 3.93589636e+03 2.81901973e+02]
+ [0.00000000e+00 0.00000000e+00 1.00000000e+00]]
+
+
+Distortion coefficients (k1, k2, p1, p2, k3[, ...]):
+
+[ 1.77120273e-01 -8.57891424e+00 -3.28543962e-02 -2.26987295e-03
+ -3.49568723e+00]
+
+
+Per-image RMS errors:
+
+  view_000.png: 0.5148
+  view_001.png: 0.4980
+  view_002.png: 0.6676
+  view_003.png: 0.4239
+  view_004.png: 0.4733
+  view_005.png: 0.2548
+  view_006.png: 0.4326
+  view_007.png: 0.6026
+  view_008.png: 0.5380
+  view_009.png: 0.4831
+  view_010.png: 0.6197
+  view_011.png: 0.3596
+  view_012.png: 0.2981
+  view_013.png: 0.2899
+
+Rejected images (quality):
+
+  None
+
+Rejected images (detection/geometry):
+
+  None
