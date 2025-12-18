@@ -29,10 +29,144 @@ def load_camera_intrinsics(path: str | Path = "camera_intrinsics.npz"):
     K = data["K"]
     dist = data["dist"]
     image_size = data["image_size"]
-    return K, dist, image_size
+    # Stored as (W, H) int32
+    image_size_wh = (int(image_size[0]), int(image_size[1]))
+    return K, dist, image_size_wh
+
+
+def _format_K(K: np.ndarray) -> str:
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+    cx, cy = float(K[0, 2]), float(K[1, 2])
+    return f"fx={fx:.2f}, fy={fy:.2f}, cx={cx:.2f}, cy={cy:.2f}"
+
+
+def _warn_if_principal_point_far(K: np.ndarray, image_size_wh: Tuple[int, int], frac: float = 0.10) -> None:
+    w, h = image_size_wh
+    cx, cy = float(K[0, 2]), float(K[1, 2])
+    # Hard validity checks (catch swapped axes / wrong units early).
+    if not np.isfinite([cx, cy, K[0, 0], K[1, 1]]).all():
+        raise RuntimeError("[RECON][FATAL] Non-finite intrinsics detected.")
+    if float(K[0, 0]) <= 0 or float(K[1, 1]) <= 0:
+        raise RuntimeError("[RECON][FATAL] Non-positive focal length in intrinsics.")
+    if (cx < -0.5 * w) or (cx > 1.5 * w) or (cy < -0.5 * h) or (cy > 1.5 * h):
+        raise RuntimeError(
+            "[RECON][FATAL] Principal point is far outside the image bounds. "
+            "This strongly suggests a calibration/scan resolution mismatch or an unintended crop/rotation."
+        )
+    dx = abs(cx - (w / 2.0)) / float(w)
+    dy = abs(cy - (h / 2.0)) / float(h)
+    if (dx > frac) or (dy > frac):
+        print(
+            "[RECON][WARN] Principal point far from image center "
+            f"(dx={dx*100:.1f}%, dy={dy*100:.1f}%). This can indicate cropping/rotation, "
+            "sensor mode changes, or a weak calibration dataset."
+        )
+
+
+def _rescale_intrinsics(K: np.ndarray, calib_size_wh: Tuple[int, int], new_size_wh: Tuple[int, int]) -> np.ndarray:
+    """
+    Rescale camera intrinsics from calib_size_wh -> new_size_wh assuming the image was
+    resized (no cropping/ROI). This preserves the normalized coordinates:
+        x = (u - cx) / fx, y = (v - cy) / fy
+    """
+    calib_w, calib_h = calib_size_wh
+    new_w, new_h = new_size_wh
+    sx = float(new_w) / float(calib_w)
+    sy = float(new_h) / float(calib_h)
+
+    K2 = K.astype(np.float64).copy()
+    K2[0, 0] *= sx
+    K2[1, 1] *= sy
+    K2[0, 2] *= sx
+    K2[1, 2] *= sy
+    return K2.astype(K.dtype)
+
+
+def load_camera_intrinsics_for_image(
+    image_size_wh: Tuple[int, int],
+    path: str | Path = "camera_intrinsics.npz",
+    *,
+    allow_rescale: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
+    """
+    Load intrinsics and verify they match the given image size (W, H).
+
+    If sizes differ only by a uniform resize, set allow_rescale=True to rescale
+    fx/fy/cx/cy. This is logged explicitly; it is never silent.
+    """
+    K, dist, calib_size = load_camera_intrinsics(path)
+    scan_w, scan_h = (int(image_size_wh[0]), int(image_size_wh[1]))
+    if calib_size != (scan_w, scan_h):
+        msg = f"calibration image_size={calib_size[0]}x{calib_size[1]} != scan image_size={scan_w}x{scan_h}"
+        if not allow_rescale:
+            raise RuntimeError(
+                "[RECON][FATAL] Camera calibration resolution mismatch: " + msg + ". "
+                "Either re-capture calibration at the scan resolution, or set ALLOW_INTRINSIC_RESCALE=1 "
+                "to rescale intrinsics for pure image resizing (no cropping)."
+            )
+
+        # Only allow rescale if aspect ratio matches (resize without crop).
+        calib_w, calib_h = calib_size
+        if abs((scan_w / scan_h) - (calib_w / calib_h)) > 1e-6:
+            raise RuntimeError(
+                "[RECON][FATAL] Cannot rescale intrinsics: aspect ratio differs, indicating cropping/ROI/rotation. "
+                + msg
+            )
+
+        K2 = _rescale_intrinsics(K, calib_size, (scan_w, scan_h))
+        print(f"[RECON][WARN] Rescaling camera intrinsics due to size mismatch: {msg}")
+        print(f"[RECON]  K (calib): {_format_K(K)}")
+        print(f"[RECON]  K (scan) : {_format_K(K2)}")
+        K = K2
+
+    _warn_if_principal_point_far(K, (scan_w, scan_h))
+    return K, dist, (scan_w, scan_h)
+
+
+def prepare_intrinsics_for_image(
+    K: np.ndarray,
+    dist: np.ndarray,
+    calib_size_wh: Tuple[int, int],
+    image_size_wh: Tuple[int, int],
+    *,
+    allow_rescale: bool = False,
+    label: str = "camera",
+) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
+    """
+    Like load_camera_intrinsics_for_image, but operates on an already-loaded (K, dist)
+    and an explicit calib_size_wh (W, H).
+
+    This is used for stereo_params.npz where intrinsics are embedded but image size is not.
+    """
+    scan_w, scan_h = (int(image_size_wh[0]), int(image_size_wh[1]))
+    if calib_size_wh != (scan_w, scan_h):
+        msg = f"calibration image_size={calib_size_wh[0]}x{calib_size_wh[1]} != scan image_size={scan_w}x{scan_h}"
+        if not allow_rescale:
+            raise RuntimeError(
+                f"[RECON][FATAL] {label} calibration resolution mismatch: " + msg + ". "
+                "Either re-calibrate at the scan resolution, or set ALLOW_INTRINSIC_RESCALE=1 "
+                "to rescale intrinsics for pure image resizing (no cropping)."
+            )
+
+        calib_w, calib_h = calib_size_wh
+        if abs((scan_w / scan_h) - (calib_w / calib_h)) > 1e-6:
+            raise RuntimeError(
+                f"[RECON][FATAL] Cannot rescale {label} intrinsics: aspect ratio differs, indicating cropping/ROI/rotation. "
+                + msg
+            )
+
+        K2 = _rescale_intrinsics(K, calib_size_wh, (scan_w, scan_h))
+        print(f"[RECON][WARN] Rescaling {label} intrinsics due to size mismatch: {msg}")
+        print(f"[RECON]  K (calib): {_format_K(K)}")
+        print(f"[RECON]  K (scan) : {_format_K(K2)}")
+        K = K2
+
+    _warn_if_principal_point_far(K, (scan_w, scan_h))
+    return K, dist, (scan_w, scan_h)
 
 
 FAKE_CONFIG_PATH = Path("config/fake_projector_config.json")
+UV_CONVENTION_PATH = Path("config/uv_convention.json")
 
 
 def _load_fake_config():
@@ -42,6 +176,120 @@ def _load_fake_config():
         except Exception:
             print(f"[RECON][WARN] Failed to parse {FAKE_CONFIG_PATH}, using defaults.")
     return {}
+
+
+def _load_uv_convention() -> dict:
+    """
+    Optional configuration for mapping (u,v) produced by the scan decoder into the
+    projector calibration coordinate system.
+
+    This is intentionally explicit: if your point cloud looks like a streak/fan but
+    ray intersection errors are low, a swapped/flipped UV convention is a common cause.
+
+    File format:
+      config/uv_convention.json:
+        { "transform": "identity" }
+
+    Supported transforms: identity, swap, flip_u, flip_v, flip_u_flip_v, swap_flip_u, swap_flip_v
+    """
+    if UV_CONVENTION_PATH.exists():
+        try:
+            return json.loads(UV_CONVENTION_PATH.read_text())
+        except Exception:
+            print(f"[RECON][WARN] Failed to parse {UV_CONVENTION_PATH}, using default UV convention.")
+    return {}
+
+
+def _apply_proj_uv_transform(proj_uv: np.ndarray, proj_size: Tuple[int, int], name: str) -> np.ndarray:
+    """
+    Apply a *pure* coordinate convention transform to projector pixel coordinates.
+    This does not change PSP decoding math; it only aligns axis conventions.
+    """
+    name = (name or "identity").strip().lower()
+    if name == "identity":
+        return proj_uv
+
+    proj_w, proj_h = int(proj_size[0]), int(proj_size[1])
+    u = proj_uv[:, 0]
+    v = proj_uv[:, 1]
+
+    if name == "swap":
+        return np.stack([v, u], axis=1).astype(np.float32)
+    if name == "flip_u":
+        return np.stack([(proj_w - 1) - u, v], axis=1).astype(np.float32)
+    if name == "flip_v":
+        return np.stack([u, (proj_h - 1) - v], axis=1).astype(np.float32)
+    if name == "flip_u_flip_v":
+        return np.stack([(proj_w - 1) - u, (proj_h - 1) - v], axis=1).astype(np.float32)
+    if name == "swap_flip_u":
+        # swap then flip new u (which was v)
+        return np.stack([(proj_w - 1) - v, u], axis=1).astype(np.float32)
+    if name == "swap_flip_v":
+        # swap then flip new v (which was u)
+        return np.stack([v, (proj_h - 1) - u], axis=1).astype(np.float32)
+
+    raise ValueError(f"Unknown PROJ_UV_TRANSFORM '{name}'")
+
+
+def _diagnose_proj_uv_transform(
+    cam_uv: np.ndarray,
+    proj_uv: np.ndarray,
+    proj_size: Tuple[int, int],
+    Kc: np.ndarray,
+    dist_c: np.ndarray,
+    Kp: np.ndarray,
+    dist_p: np.ndarray,
+    R: np.ndarray,
+    T: np.ndarray,
+    *,
+    sample: int = 20000,
+) -> None:
+    if cv2 is None:
+        print("[RECON][WARN] UV transform diagnosis requires OpenCV (cv2).")
+        return
+    n = cam_uv.shape[0]
+    if n == 0:
+        return
+    m = min(sample, n)
+    idx = np.random.default_rng(0).choice(n, size=m, replace=False)
+    cam_uv_s = cam_uv[idx].astype(np.float32)
+    proj_uv_s = proj_uv[idx].astype(np.float32)
+
+    cam_norm = cv2.undistortPoints(cam_uv_s.reshape(-1, 1, 2), Kc, dist_c)[:, 0, :]
+
+    def _dirs(norm_xy: np.ndarray) -> np.ndarray:
+        dirs = np.hstack([norm_xy, np.ones((norm_xy.shape[0], 1), dtype=np.float64)])
+        dirs /= np.linalg.norm(dirs, axis=1, keepdims=True) + 1e-12
+        return dirs.astype(np.float32)
+
+    rays_cam = _dirs(cam_norm)
+
+    candidates = ["identity", "swap", "flip_u", "flip_v", "flip_u_flip_v", "swap_flip_u", "swap_flip_v"]
+    stats = []
+    for name in candidates:
+        uv_t = _apply_proj_uv_transform(proj_uv_s, proj_size, name)
+        proj_norm = cv2.undistortPoints(uv_t.reshape(-1, 1, 2), Kp, dist_p)[:, 0, :]
+        dirs_proj = _dirs(proj_norm)
+        dirs_proj_cam = (R.astype(np.float64) @ dirs_proj.T).T
+        dirs_proj_cam /= np.linalg.norm(dirs_proj_cam, axis=1, keepdims=True) + 1e-12
+        _, errs, _, _ = triangulate_rays(rays_cam, dirs_proj_cam.astype(np.float32), T)
+        ok = np.isfinite(errs)
+        if not ok.any():
+            continue
+        stats.append((float(np.nanmedian(errs[ok])), float(np.nanmean(errs[ok])), name))
+
+    if not stats:
+        return
+    stats.sort(key=lambda t: t[0])
+    print("[RECON][DIAG] Projector UV convention candidates (lower is better):")
+    for med, mean, name in stats:
+        print(f"  - {name:12s} median_err={med:.4f} m mean_err={mean:.4f} m")
+    best = stats[0][2]
+    if best != "identity":
+        print(
+            f"[RECON][DIAG] Best candidate is '{best}'. If your point cloud looks wrong, set "
+            f"PROJ_UV_TRANSFORM={best} (or write it into {UV_CONVENTION_PATH})."
+        )
 
 
 def get_fake_projector_parameters(proj_size: Tuple[int, int]):
@@ -303,6 +551,7 @@ def reconstruct_3d_from_scan(scan_dir: str, proj_size: Tuple[int, int], color_pa
             diag_scan = {}
 
     H, W = u_map.shape
+    scan_size = (int(W), int(H))  # (W, H)
     ys, xs = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
 
     valid = mask_used & np.isfinite(u_map) & np.isfinite(v_map)
@@ -316,8 +565,14 @@ def reconstruct_3d_from_scan(scan_dir: str, proj_size: Tuple[int, int], color_pa
     if cam_uv.size == 0:
         raise ValueError("No valid pixels for reconstruction.")
 
-    # Load camera intrinsics
-    Kc, dist, _ = load_camera_intrinsics()
+    # Load camera intrinsics (and enforce resolution consistency)
+    allow_rescale = os.getenv("ALLOW_INTRINSIC_RESCALE", "0") == "1"
+    Kc_file, dist_file, calib_size = load_camera_intrinsics()
+    Kc, dist, _ = prepare_intrinsics_for_image(
+        Kc_file, dist_file, calib_size, scan_size, allow_rescale=allow_rescale, label="camera"
+    )
+    print(f"[RECON] Scan image size: {scan_size[0]}x{scan_size[1]} | Camera calib size: {calib_size[0]}x{calib_size[1]}")
+    print(f"[RECON] Camera intrinsics: {_format_K(Kc)}")
 
     stereo = load_stereo_params()
     stereo_rms = None
@@ -325,7 +580,12 @@ def reconstruct_3d_from_scan(scan_dir: str, proj_size: Tuple[int, int], color_pa
 
     if stereo is not None:
         R_st, T_st, Kc_s, dist_s, Kp_st, dp_st, stereo_rms, _ = stereo
-        Kc, dist = Kc_s, dist_s
+        # Stereo params store camera intrinsics too. The file does not store camera image_size,
+        # so we treat camera_intrinsics.npz's image_size as the reference calibration size.
+        Kc, dist, _ = prepare_intrinsics_for_image(
+            Kc_s, dist_s, calib_size, scan_size, allow_rescale=allow_rescale, label="stereo camera"
+        )
+        # Use projector intrinsics/distortion from stereo file (projector size is independent of camera image size).
         Kp, dp = Kp_st, dp_st
         print(f"[RECON] Using calibrated projector + stereo. Stereo RMS={stereo_rms:.4f}px")
     else:
@@ -353,6 +613,18 @@ def reconstruct_3d_from_scan(scan_dir: str, proj_size: Tuple[int, int], color_pa
     # Do NOT invert or flip here.
     R = R_st
     T = T_st
+
+    proj_uv_raw = proj_uv
+    # Optional diagnostic: evaluate a few UV convention candidates on a random subset.
+    if os.getenv("DIAGNOSE_PROJ_UV_TRANSFORM", "0") == "1":
+        _diagnose_proj_uv_transform(cam_uv, proj_uv_raw, proj_size, Kc, dist, Kp, dp, R, T)
+
+    # Align scan-derived projector (u,v) to calibration convention (optional but common).
+    uv_cfg = _load_uv_convention()
+    uv_transform = os.getenv("PROJ_UV_TRANSFORM", uv_cfg.get("transform", "identity"))
+    if uv_transform and str(uv_transform).lower() != "identity":
+        print(f"[RECON] Applying projector UV transform: {uv_transform}")
+    proj_uv = _apply_proj_uv_transform(proj_uv_raw, proj_size=proj_size, name=str(uv_transform))
 
     if cv2 is not None:
         cam_norm = cv2.undistortPoints(cam_uv.reshape(-1, 1, 2), Kc, dist)[:, 0, :]

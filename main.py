@@ -15,6 +15,7 @@ from core.camera import CameraController
 from core.scan import ScanController
 from core.graycode import generate_graycode_patterns
 from web.server import WebServer
+from core.triangulation import load_camera_intrinsics, prepare_intrinsics_for_image, _format_K
 
 
 # =====================================================================
@@ -89,6 +90,19 @@ def main():
         size_lores=(640, 480),
         framerate=30,
     )
+    # Startup calibration sanity checks.
+    # Reconstruction assumes camera intrinsics correspond to the actual capture resolution.
+    # If the camera stream size changes (crop/ROI/sensor-mode), calibration becomes invalid.
+    try:
+        from pathlib import Path
+        if Path("camera_intrinsics.npz").exists():
+            Kc, dist, calib_size = load_camera_intrinsics("camera_intrinsics.npz")
+            scan_size = tuple(int(x) for x in camera.size_main)
+            allow_rescale = False  # never auto-rescale at startup; keep it explicit in reconstruction via env var
+            prepare_intrinsics_for_image(Kc, dist, calib_size, scan_size, allow_rescale=allow_rescale, label="camera")
+            print(f"[MAIN] Loaded camera_intrinsics.npz: calib_size={calib_size[0]}x{calib_size[1]} K=({_format_K(Kc)})")
+    except Exception as e:
+        print(f"[MAIN][WARN] Camera calibration sanity check failed: {e}")
 
     # ============================================================
     # Scan controller

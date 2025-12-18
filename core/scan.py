@@ -67,6 +67,7 @@ class ScanController:
 
         os.makedirs(self.scan_root, exist_ok=True)
         os.makedirs(self.calib_root, exist_ok=True)
+        self._logged_capture_shape = False
 
         # Calibration session state
         self.calib_session_root: str | None = None
@@ -141,6 +142,10 @@ class ScanController:
                 self.set_surface_callback(patterns[f][n])
                 time.sleep(self.pattern_settle_time)
                 gray = self.camera.capture_gray().astype(np.float32)
+                if not self._logged_capture_shape:
+                    h, w = gray.shape[:2]
+                    print(f"[SCAN] Camera capture_gray() shape: {w}x{h}")
+                    self._logged_capture_shape = True
                 I_dict[(f, n)] = gray
 
                 if prefix:

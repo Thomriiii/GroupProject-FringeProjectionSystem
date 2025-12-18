@@ -37,6 +37,8 @@ class CameraController:
 
         self.picam2 = Picamera2()
         self.camera_lock = threading.Lock()
+        self.size_main = tuple(int(x) for x in size_main)
+        self.size_lores = tuple(int(x) for x in size_lores)
 
         cfg = self.picam2.create_video_configuration(
             main={"size": size_main, "format": "RGB888"},
@@ -51,7 +53,19 @@ class CameraController:
 
         time.sleep(0.5)
 
-        print("[CAMERA] Picamera2 initialized.")
+        # Verify that the configured stream sizes are actually what we receive.
+        # If Picamera2 changes sensor mode / crop / scaler, image dimensions may
+        # silently change and invalidate camera calibration.
+        test = self.capture_rgb()
+        h, w = test.shape[:2]
+        exp_w, exp_h = self.size_main
+        if (w, h) != (exp_w, exp_h):
+            raise RuntimeError(
+                f"[CAMERA] Unexpected main stream size {w}x{h} (expected {exp_w}x{exp_h}). "
+                "This will invalidate camera_intrinsics.npz unless recalibrated or intrinsics are rescaled explicitly."
+            )
+
+        print(f"[CAMERA] Picamera2 initialized. main={w}x{h}, lores={self.size_lores[0]}x{self.size_lores[1]}")
 
     # =====================================================================
     # FRAME CAPTURE
@@ -61,6 +75,14 @@ class CameraController:
         """Capture RGB frame from main stream."""
         with self.camera_lock:
             frame = self.picam2.capture_array("main")
+        # Safety check: prevent silent resolution changes mid-run.
+        h, w = frame.shape[:2]
+        exp_w, exp_h = self.size_main
+        if (w, h) != (exp_w, exp_h):
+            raise RuntimeError(
+                f"[CAMERA] Main stream size changed to {w}x{h} (expected {exp_w}x{exp_h}). "
+                "Stop and re-check camera configuration and calibration consistency."
+            )
         return frame
 
     def capture_gray(self) -> np.ndarray:
