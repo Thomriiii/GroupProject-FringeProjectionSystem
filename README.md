@@ -67,3 +67,24 @@ python3 main.py
    - Decodes projector `(u,v)` per camera pixel, samples projector pixels at detected checkerboard corners, and saves to `calib/projector/session_*/pose_*/`.
 3. After 6–10 diverse poses, click **Finish Projector Calibration**. This runs projector intrinsics + stereo calibration and writes `projector_intrinsics.npz` and `stereo_params.npz` (also copied to repo root).
 4. Run `/scan` and “Reconstruct” — reconstruction will now use calibrated camera↔projector geometry.
+
+---
+
+## Calibration/scan consistency diagnostics
+
+These helpers are designed to catch common issues that produce streak/fan-shaped point clouds (e.g. resolution mismatch, unintended crop/ROI, or inconsistent undistortion):
+
+```bash
+# 1) Verify camera calibration resolution matches captured images / scans
+python3 tools/check_resolution_consistency.py --camera camera_intrinsics.npz --calib-dir calib/camera/session_*
+
+# 2) Visual check: undistort a real frame and inspect straight edges / grid
+python3 tools/diagnose_undistortion.py --image calib/camera/session_*/view_000.png --out undistort_check.png
+
+# 3) Geometry check: fit a plane to a reconstructed point cloud (expects points_filtered.npz)
+python3 tools/plane_fit.py --points scans/<scan>/points_filtered.npz
+```
+
+Reconstruction aborts if scan resolution differs from the calibration resolution. If you *intentionally* resized images (no cropping) and want to rescale intrinsics, run reconstruction with `ALLOW_INTRINSIC_RESCALE=1`.
+
+If scan-derived projector `(u,v)` is in a different axis convention than projector calibration (common symptom: streak/fan-shaped clouds with low intersection error), set `PROJ_UV_TRANSFORM` or edit `config/uv_convention.json`. To print candidate transforms with their median ray error, run with `DIAGNOSE_PROJ_UV_TRANSFORM=1`.

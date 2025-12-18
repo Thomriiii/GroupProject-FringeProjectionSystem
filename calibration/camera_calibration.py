@@ -515,6 +515,24 @@ def run_calibration_from_folder(
     print(f"  cx={cx:.2f}, cy={cy:.2f}")
     print(f"  dist={calib.dist.ravel()}")
     print(f"  images used={len(calib.per_image_errors)} / {len(loaded)} (min required: {min_images})")
+    # Sanity checks:
+    # Calibration is only meaningful if it matches the scan capture resolution and
+    # the estimated intrinsics are physically plausible. Extremely narrow implied FOV
+    # or a principal point far from the image center often indicates:
+    #   - cropping/ROI/rotation between calibration and scan
+    #   - a weak calibration dataset (board too small / too fronto-parallel / not enough tilt)
+    # These issues can produce streak-like point clouds even if ray intersection errors look low.
+    W, H = calib.image_size
+    fov_x = float(2.0 * np.degrees(np.arctan((W / 2.0) / (fx + 1e-9))))
+    fov_y = float(2.0 * np.degrees(np.arctan((H / 2.0) / (fy + 1e-9))))
+    off_x = abs(float(cx) - (W / 2.0)) / float(W)
+    off_y = abs(float(cy) - (H / 2.0)) / float(H)
+    if off_x > 0.10 or off_y > 0.10:
+        print(f"[CALIB][WARN] Principal point far from image center (dx={off_x*100:.1f}%, dy={off_y*100:.1f}%).")
+    if fov_x < 25.0 or fov_y < 20.0:
+        print(f"[CALIB][WARN] Implied FOV is very narrow (fov_x={fov_x:.1f}°, fov_y={fov_y:.1f}°).")
+        print("[CALIB][WARN] This usually means the dataset did not sufficiently constrain focal length.")
+        print("[CALIB][WARN] Re-capture calibration with the board closer and with strong tilt across the frame.")
 
     if calib.per_image_errors:
         worst = max(calib.per_image_errors)
