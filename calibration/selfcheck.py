@@ -7,10 +7,6 @@ For each pose:
   - Solve board pose in the camera using the checkerboard correspondences.
   - Transform board points into the projector frame using stereo extrinsics.
   - Reproject into projector pixels and measure RMS error against decoded UVs.
-
-Usage:
-  python -m calibration.selfcheck --session calib/projector/session_20251215_105522 \\
-      --stereo stereo_params.npz --camera camera_intrinsics.npz
 """
 
 from __future__ import annotations
@@ -27,6 +23,9 @@ from calibration.camera_calibration import load_calibration
 
 
 def load_stereo_params(path: Path):
+    """
+    Load stereo parameters from an NPZ file.
+    """
     data = np.load(path)
     R = data["R"]
     T = data["T"].reshape(3)
@@ -50,20 +49,20 @@ def reproj_pose(
     T_proj_to_cam: np.ndarray,
 ) -> Tuple[float, float]:
     """
-    Returns (rms_cam, rms_proj) for one pose.
+    Reproject a single pose and return (rms_cam, rms_proj).
     """
-    # Solve board pose in camera frame
+    # Solve board pose in camera frame.
     ok, rvec, tvec = cv2.solvePnP(obj, img_cam, Kc, dist_c, flags=cv2.SOLVEPNP_ITERATIVE)
     if not ok:
         return np.nan, np.nan
 
-    # Reproject to camera to check
+    # Reproject to camera to check.
     proj_cam, _ = cv2.projectPoints(obj, rvec, tvec, Kc, dist_c)
     proj_cam = proj_cam.reshape(-1, 2)
     err_cam = np.linalg.norm(proj_cam - img_cam, axis=1)
     rms_cam = float(np.sqrt(np.mean(err_cam**2)))
 
-    # Convert board pose to projector frame: X_p = R_pc * X_c + t_pc
+    # Convert board pose to projector frame: X_p = R_pc * X_c + t_pc.
     R_cam_to_proj = R_proj_to_cam.T
     t_cam_to_proj = -R_cam_to_proj @ T_proj_to_cam
     R_board_in_proj = R_cam_to_proj @ cv2.Rodrigues(rvec)[0]
@@ -78,6 +77,9 @@ def reproj_pose(
 
 
 def run_selfcheck(session_dir: Path, stereo_path: Path, camera_path: Path):
+    """
+    Run reprojection checks across all poses in a session.
+    """
     poses, image_size_cam, image_size_proj = load_session_poses(session_dir)
     if not poses:
         raise ValueError(f"No poses in session {session_dir}")
@@ -109,6 +111,9 @@ def run_selfcheck(session_dir: Path, stereo_path: Path, camera_path: Path):
 
 
 def main():
+    """
+    CLI entry point for stereo self-check.
+    """
     ap = argparse.ArgumentParser()
     ap.add_argument("--session", required=True, type=Path, help="Projector calibration session directory")
     ap.add_argument("--stereo", default=Path("stereo_params.npz"), type=Path, help="Stereo params file")

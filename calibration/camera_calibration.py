@@ -7,7 +7,7 @@ Features:
   - Loads a folder of calibration images.
   - Image quality checks (mean/min/max/std) with rejection.
   - Robust checkerboard detection with SB + legacy fallbacks.
-  - Builds 3D–2D correspondences and runs cv2.calibrateCamera with no
+  - Builds 3D-2D correspondences and runs cv2.calibrateCamera with no
     forced principal point or distortion hacks.
   - Reports global/per-image reprojection error and dataset coverage.
   - Saves/loads calibration results and provides an undistort preview.
@@ -22,22 +22,23 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
-# Types
+# Type aliases for clarity.
 ImageSize = Tuple[int, int]          # (width, height)
 PatternSize = Tuple[int, int]        # (cols, rows) inner corners
 Corners = np.ndarray                 # Nx1x2 float32
 
-# Default thresholds
+# Default thresholds for image quality and board coverage.
 MIN_MEAN = 30.0
 MAX_MEAN = 220.0
 MIN_STD = 10.0
-MIN_BOARD_AREA_FRAC = 0.02           # reject if board is tiny in frame
-MIN_BOARD_ASPECT = 0.18              # reject if board is an extreme sliver (tilted hard)
+MIN_BOARD_AREA_FRAC = 0.02           # Reject if board is tiny in frame.
+MIN_BOARD_ASPECT = 0.18              # Reject if board is an extreme sliver (heavy tilt).
 DEFAULT_MIN_IMAGES = 12
 
 
 @dataclass
 class LoadedImage:
+    """Container for a loaded calibration image and its stats."""
     path: Path
     gray: np.ndarray
     mean: float
@@ -48,6 +49,7 @@ class LoadedImage:
 
 @dataclass
 class DetectionResult:
+    """Result of checkerboard detection for a single image."""
     corners: Optional[Corners]
     method: str
     area_frac: float
@@ -57,6 +59,7 @@ class DetectionResult:
 
 @dataclass
 class CalibrationResult:
+    """Outputs from camera calibration."""
     rms: float
     K: np.ndarray
     dist: np.ndarray
@@ -68,6 +71,9 @@ class CalibrationResult:
 
 
 def list_image_files(folder: Path, extensions: Sequence[str] = ("png", "jpg", "jpeg", "bmp", "tif", "tiff")) -> List[Path]:
+    """
+    Return a sorted list of image files in the given folder.
+    """
     files: List[Path] = []
     for ext in extensions:
         files.extend(folder.glob(f"*.{ext}"))
@@ -76,6 +82,9 @@ def list_image_files(folder: Path, extensions: Sequence[str] = ("png", "jpg", "j
 
 
 def compute_image_stats(gray: np.ndarray) -> Tuple[float, float, float, float]:
+    """
+    Compute mean, standard deviation, min, and max for a grayscale image.
+    """
     mean, std = cv2.meanStdDev(gray)
     return float(mean[0][0]), float(std[0][0]), float(gray.min()), float(gray.max())
 
@@ -143,6 +152,9 @@ def load_calibration_images(
 
 
 def create_object_points(pattern_size: PatternSize, square_size: float) -> np.ndarray:
+    """
+    Create a grid of 3D checkerboard corner points in board coordinates.
+    """
     cols, rows = pattern_size
     objp = np.zeros((rows * cols, 3), np.float32)
     objp[:, :2] = [[i * square_size, j * square_size] for j in range(rows) for i in range(cols)]
@@ -170,7 +182,7 @@ def detect_checkerboard(
     if corners.shape[0] != expected:
         return DetectionResult(corners=None, method=method, area_frac=0.0, aspect_ratio=0.0, reason=f"corner count mismatch ({corners.shape[0]} != {expected})")
 
-    # Refine to subpixel accuracy
+    # Refine to subpixel accuracy.
     corners_refined = cv2.cornerSubPix(gray, corners, (5, 5), (-1, -1), criteria)
 
     h, w = gray.shape[:2]
@@ -208,6 +220,9 @@ def collect_corners(
     min_board_area_frac: float = MIN_BOARD_AREA_FRAC,
     min_board_aspect: float = MIN_BOARD_ASPECT,
 ) -> Tuple[List[np.ndarray], List[np.ndarray], List[Path], List[Dict[str, str]]]:
+    """
+    Detect checkerboard corners across a set of images and collect points.
+    """
     objp = create_object_points(pattern_size, square_size)
     object_points: List[np.ndarray] = []
     image_points: List[np.ndarray] = []
@@ -244,6 +259,9 @@ def calibrate_camera(
     flags: int = 0,
     used_images: Optional[List[Path]] = None,
 ) -> CalibrationResult:
+    """
+    Run OpenCV camera calibration and package the results.
+    """
     if len(object_points) == 0 or len(image_points) == 0:
         raise ValueError("No valid object/image point pairs for calibration.")
 
@@ -278,6 +296,9 @@ def compute_reprojection_errors(
     K: np.ndarray,
     dist: np.ndarray,
 ) -> List[float]:
+    """
+    Compute per-image RMS reprojection error.
+    """
     errors: List[float] = []
     for objp, imgp, rvec, tvec in zip(object_points, image_points, rvecs, tvecs):
         projected, _ = cv2.projectPoints(objp, rvec, tvec, K, dist)
@@ -318,9 +339,9 @@ def report_dataset_coverage(
     }
 
     print("[COVERAGE] Board center x-range (normalized): "
-          f"{coverage['center_x_min']:.3f} – {coverage['center_x_max']:.3f}")
+          f"{coverage['center_x_min']:.3f} - {coverage['center_x_max']:.3f}")
     print("[COVERAGE] Board center y-range (normalized): "
-          f"{coverage['center_y_min']:.3f} – {coverage['center_y_max']:.3f}")
+          f"{coverage['center_y_min']:.3f} - {coverage['center_y_max']:.3f}")
     print("[COVERAGE] Board scale (px per square) min/mean/max: "
           f"{coverage['scale_min']:.1f} / {coverage['scale_mean']:.1f} / {coverage['scale_max']:.1f}")
 
@@ -328,6 +349,9 @@ def report_dataset_coverage(
 
 
 def estimate_board_scale(corners: np.ndarray, pattern_size: PatternSize) -> float:
+    """
+    Estimate average pixel spacing between adjacent checkerboard corners.
+    """
     cols, rows = pattern_size
     grid = corners.reshape(rows, cols, 2)
     dx = np.linalg.norm(grid[:, 1:, :] - grid[:, :-1, :], axis=2)
@@ -381,11 +405,17 @@ def maybe_filter_outliers(
 
 
 def save_calibration(path: Path, K: np.ndarray, dist: np.ndarray, image_size: ImageSize, rms: float) -> None:
+    """
+    Save calibration results to an NPZ file.
+    """
     np.savez_compressed(path, K=K, dist=dist, image_size=np.array(image_size, dtype=np.int32), rms=np.array([rms], dtype=np.float32))
     print(f"[SAVE] Calibration saved to {path}")
 
 
 def load_calibration(path: Path) -> Tuple[np.ndarray, np.ndarray, ImageSize, float]:
+    """
+    Load calibration results from an NPZ file.
+    """
     data = np.load(path)
     K = data["K"]
     dist = data["dist"]
@@ -413,7 +443,7 @@ def undistort_preview(
     new_K, _ = cv2.getOptimalNewCameraMatrix(K, dist, (w, h), alpha)
     undistorted = cv2.undistort(img, K, dist, None, new_K)
 
-    # Overlay simple guide lines
+    # Overlay simple guide lines.
     overlay = undistorted.copy()
     color = (0, 255, 0)
     thickness = 1
@@ -433,6 +463,9 @@ def write_calibration_report(
     quality_rejects: List[Dict[str, str]],
     detect_rejects: List[Dict[str, str]],
 ) -> None:
+    """
+    Write a human-readable calibration report to disk.
+    """
     lines = []
     lines.append("Camera Intrinsic Calibration Report\n")
     lines.append(f"Images used: {len(calib.per_image_errors)}\n")
@@ -500,10 +533,10 @@ def run_calibration_from_folder(
         max_per_view_error,
     )
 
-    # Coverage printout
+    # Coverage printout.
     report_dataset_coverage(image_points, image_size, pattern_size)
 
-    # Save defaults
+    # Save defaults.
     save_calibration(Path("camera_intrinsics.npz"), calib.K, calib.dist, image_size, calib.rms)
     write_calibration_report(Path("calibration_report.txt"), calib, quality_rejects, detection_rejects)
 
@@ -519,8 +552,8 @@ def run_calibration_from_folder(
     # Calibration is only meaningful if it matches the scan capture resolution and
     # the estimated intrinsics are physically plausible. Extremely narrow implied FOV
     # or a principal point far from the image center often indicates:
-    #   - cropping/ROI/rotation between calibration and scan
-    #   - a weak calibration dataset (board too small / too fronto-parallel / not enough tilt)
+    #   - Cropping/ROI/rotation between calibration and scan
+    #   - A weak calibration dataset (board too small or too fronto-parallel)
     # These issues can produce streak-like point clouds even if ray intersection errors look low.
     W, H = calib.image_size
     fov_x = float(2.0 * np.degrees(np.arctan((W / 2.0) / (fx + 1e-9))))
@@ -530,7 +563,7 @@ def run_calibration_from_folder(
     if off_x > 0.10 or off_y > 0.10:
         print(f"[CALIB][WARN] Principal point far from image center (dx={off_x*100:.1f}%, dy={off_y*100:.1f}%).")
     if fov_x < 25.0 or fov_y < 20.0:
-        print(f"[CALIB][WARN] Implied FOV is very narrow (fov_x={fov_x:.1f}°, fov_y={fov_y:.1f}°).")
+        print(f"[CALIB][WARN] Implied FOV is very narrow (fov_x={fov_x:.1f} deg, fov_y={fov_y:.1f} deg).")
         print("[CALIB][WARN] This usually means the dataset did not sufficiently constrain focal length.")
         print("[CALIB][WARN] Re-capture calibration with the board closer and with strong tilt across the frame.")
 

@@ -33,32 +33,35 @@ class WebServer:
     """
     Flask server wrapper for structured-light scanning.
     Handles:
-      - /                  → main UI
-      - /video             → live MJPEG feed
-      - /scan              → run structured-light scan
-      - /calib             → checkerboard camera calibration
-      - /calib/capture     → capture one checkerboard view
-      - /calib/finish      → solve camera intrinsics
-      - /proj_calib        → projector calibration UI
-      - /proj_calib/capture→ capture one projector pose (GrayCode + checkerboard)
-      - /proj_calib/finish → solve projector intrinsics + stereo extrinsics
+      - /                  -> main UI
+      - /video             -> live MJPEG feed
+      - /scan              -> run structured-light scan
+      - /calib             -> checkerboard camera calibration
+      - /calib/capture     -> capture one checkerboard view
+      - /calib/finish      -> solve camera intrinsics
+      - /proj_calib        -> projector calibration UI
+      - /proj_calib/capture-> capture one projector pose (GrayCode + checkerboard)
+      - /proj_calib/finish -> solve projector intrinsics + stereo extrinsics
     """
 
     def __init__(self, camera, scan_controller, set_surface_callback, graycode_set: GrayCodeSet, midgrey_surface):
+        """
+        Initialize the web server state and bind camera/projector helpers.
+        """
         self.camera = camera
         self.scan_controller = scan_controller
         self.set_surface_callback = set_surface_callback
         self.graycode_set = graycode_set
         self.midgrey_surface = midgrey_surface
 
-        # Scan state
+        # State for scan control and status.
         self.scan_lock = threading.Lock()
         self.scan_status = "Idle"
         self.last_scan_dir = None
         self.recon_status = "Idle"
         self.next_scan_polished: bool = False
 
-        # Projector calibration state
+        # State for projector calibration workflow.
         self.proj_lock = threading.Lock()
         self.proj_status = "Not calibrated"
         self.proj_views = 0
@@ -67,7 +70,7 @@ class WebServer:
         self.proj_calib_root = Path(self.scan_controller.calib_root) / "projector"
         self.proj_calib_root.mkdir(parents=True, exist_ok=True)
         self.proj_session = self._start_new_proj_session()
-        self.proj_max_error = 2.0  # drop poses with per-view RMS above this
+        self.proj_max_error = 2.0  # Drop poses with per-view RMS above this value.
         self.pattern_settle_time = 0.12
         self.proj_w = graycode_set.width
         self.proj_h = graycode_set.height
@@ -75,9 +78,9 @@ class WebServer:
         self.white_surface = self._make_uniform_surface(level=1.0)
         self.graycode_midgray = generate_midgray_surface(self.proj_w, self.proj_h, level=0.5, gamma_proj=None)
 
-        # Checkerboard camera calibration state
-        self.cb_checkerboard = (8, 6)        # inner corners (cols, rows) for 9x7 board (10 mm squares)
-        self.cb_square_size = 0.010          # 10 mm squares
+        # State for checkerboard camera calibration.
+        self.cb_checkerboard = (8, 6)        # Inner corners (cols, rows) for a 9x7 board.
+        self.cb_square_size = 0.010          # Square size in meters (10 mm).
         self.cb_views = 0
         self.cb_status = "Not calibrated"
         self.cb_last_rms: float | None = None
@@ -92,15 +95,17 @@ class WebServer:
         )
         self._setup_routes()
 
-    # ============================================================
-    # ROUTES
-    # ============================================================
+    # --- HTTP routes ---
 
     def _setup_routes(self):
+        """
+        Register all Flask routes for the UI, scanning, and calibration.
+        """
         app = self.app
 
         @app.route("/")
         def index():
+            """Render the main status page."""
             return render_template(
                 "index.html",
                 status=self.scan_status,
@@ -118,6 +123,7 @@ class WebServer:
 
         @app.get("/calib")
         def calib():
+            """Render the camera calibration page."""
             return render_template(
                 "calib.html",
                 cb_cols=self.cb_checkerboard[0],
@@ -131,6 +137,7 @@ class WebServer:
 
         @app.get("/proj_calib")
         def proj_calib():
+            """Render the projector calibration page."""
             sessions = sorted(self.proj_calib_root.glob("session_*"))
             return render_template(
                 "proj_calib.html",
@@ -145,6 +152,7 @@ class WebServer:
 
         @app.route("/video")
         def video():
+            """Stream the live MJPEG camera feed."""
             return Response(
                 self._mjpeg_stream(),
                 mimetype="multipart/x-mixed-replace; boundary=frame",
@@ -152,6 +160,7 @@ class WebServer:
 
         @app.post("/scan")
         def scan():
+            """Start a scan in a background thread."""
             polished_flag = str(request.form.get("polished", "false")).lower() in ("1", "true", "on", "yes")
             if not self._start_scan_thread(polished=polished_flag):
                 return "Scan already running. <a href='/'>Back</a>"
@@ -159,11 +168,13 @@ class WebServer:
 
         @app.post("/scan/reconstruct")
         def scan_reconstruct():
+            """Reconstruct the most recent scan."""
             msg = self._run_reconstruct_latest()
             return msg
 
         @app.post("/scan/reconstruct_previous")
         def scan_reconstruct_previous():
+            """Reconstruct a previously captured scan."""
             scan_path = request.form.get("scan_path", "").strip()
             if not scan_path:
                 return "No scan path provided. <a href='/'>Back</a>"
@@ -172,6 +183,7 @@ class WebServer:
 
         @app.post("/calib/capture")
         def calib_capture():
+            """Capture a checkerboard frame for camera calibration."""
             ok, msg = self._capture_checkerboard_view()
             if not ok:
                 print(f"[CAM-CAL] Capture failed: {msg}")
@@ -179,6 +191,7 @@ class WebServer:
 
         @app.post("/calib/finish")
         def calib_finish():
+            """Solve camera intrinsics from captured checkerboard views."""
             ok, msg = self._finish_camera_calibration()
             if not ok:
                 print(f"[CAM-CAL] Calibration failed: {msg}")
@@ -186,6 +199,7 @@ class WebServer:
 
         @app.post("/proj_calib/capture")
         def proj_calib_capture():
+            """Capture a projector pose for calibration."""
             ok, msg = self._capture_projector_pose()
             if not ok:
                 print(f"[PROJ-CALIB] Capture failed: {msg}")
@@ -193,6 +207,7 @@ class WebServer:
 
         @app.post("/proj_calib/finish")
         def proj_calib_finish():
+            """Solve projector intrinsics and stereo extrinsics."""
             try:
                 val = request.form.get("max_error", type=float)
                 if val is not None:
@@ -206,16 +221,18 @@ class WebServer:
 
         @app.post("/proj_calib/select")
         def proj_calib_select():
+            """Load an existing projector calibration session."""
             session_path = request.form.get("session_path", "")
             if session_path:
                 self._set_proj_session(Path(session_path))
             return redirect(url_for("proj_calib"))
 
-    # ============================================================
-    # MJPEG STREAMING
-    # ============================================================
+    # --- MJPEG stream ---
 
     def _mjpeg_stream(self):
+        """
+        Yield a multipart MJPEG stream from the live camera feed.
+        """
         while True:
             frame_rgb = self.camera.capture_rgb()
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
@@ -231,11 +248,12 @@ class WebServer:
                 jpg.tobytes() + b"\r\n"
             )
 
-    # ============================================================
-    # SCAN THREAD HANDLER
-    # ============================================================
+    # --- Scan thread handling ---
 
     def _start_scan_thread(self, polished: bool = False) -> bool:
+        """
+        Start a scan worker thread if one is not already running.
+        """
         if not self.scan_lock.acquire(blocking=False):
             return False
 
@@ -246,6 +264,9 @@ class WebServer:
         return True
 
     def _run_scan_worker(self):
+        """
+        Background worker that performs a scan and releases the lock.
+        """
         try:
             scan_dir = self.scan_controller.run_scan(polished=self.next_scan_polished)
             self.last_scan_dir = scan_dir
@@ -253,11 +274,12 @@ class WebServer:
         finally:
             self.scan_lock.release()
 
-    # ============================================================
-    # RECONSTRUCTION
-    # ============================================================
+    # --- Reconstruction helpers ---
 
     def _run_reconstruct_latest(self) -> str:
+        """
+        Run reconstruction on the most recent scan directory.
+        """
         if self.last_scan_dir is None:
             return "No scan available. Run a scan first."
 
@@ -279,6 +301,9 @@ class WebServer:
             return msg + " <a href='/'>Back</a>"
 
     def _run_reconstruct_scan(self, scan_path: str) -> str:
+        """
+        Run reconstruction for an explicit scan directory path.
+        """
         scan_dir = Path(scan_path)
         if not scan_dir.exists():
             return f"Scan directory not found: {scan_dir} <a href='/'>Back</a>"
@@ -299,11 +324,12 @@ class WebServer:
             self.recon_status = msg
             return msg + " <a href='/'>Back</a>"
 
-    # ============================================================
-    # CHECKERBOARD CALIBRATION
-    # ============================================================
+    # --- Checkerboard calibration helpers ---
 
     def _start_new_calib_session(self) -> Path:
+        """
+        Create a new camera calibration session folder.
+        """
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         session = self.cam_calib_root / f"session_{timestamp}"
         session.mkdir(parents=True, exist_ok=True)
@@ -312,6 +338,9 @@ class WebServer:
         return session
 
     def _capture_checkerboard_view(self):
+        """
+        Capture and validate a checkerboard frame for calibration.
+        """
         with self.cb_lock:
             try:
                 square_form = request.form.get("square_size", type=float)
@@ -350,7 +379,7 @@ class WebServer:
                 self.cb_status = f"Rejected: board extremely tilted (aspect={detection.aspect_ratio:.3f})"
                 return False, self.cb_status
 
-            # Save frame to session directory
+            # Save the frame to the session directory.
             self.cam_calib_session.mkdir(parents=True, exist_ok=True)
             fname = f"view_{self.cb_views:03d}.png"
             out_path = self.cam_calib_session / fname
@@ -364,6 +393,9 @@ class WebServer:
             return True, self.cb_status
 
     def _finish_camera_calibration(self):
+        """
+        Solve camera intrinsics from the current session captures.
+        """
         with self.cb_lock:
             try:
                 square_form = request.form.get("square_size", type=float)
@@ -402,17 +434,21 @@ class WebServer:
             self.cb_status = msg
             return True, msg
 
-    # ============================================================
-    # PROJECTOR CALIBRATION HELPERS
-    # ============================================================
+    # --- Projector calibration helpers ---
 
     def _make_uniform_surface(self, level: float) -> pygame.Surface:
+        """
+        Create a uniform grayscale surface at the given level.
+        """
         img = np.full((self.proj_h, self.proj_w), np.clip(level, 0.0, 1.0), dtype=np.float32)
         img_u8 = np.clip(img * 255.0, 0, 255).astype(np.uint8)
         rgb = np.dstack([img_u8] * 3)
         return pygame.surfarray.make_surface(np.swapaxes(rgb, 0, 1))
 
     def _start_new_proj_session(self) -> Path:
+        """
+        Create a new projector calibration session folder.
+        """
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         session = self.proj_calib_root / f"session_{timestamp}"
         session.mkdir(parents=True, exist_ok=True)
@@ -420,6 +456,9 @@ class WebServer:
         return session
 
     def _ensure_proj_session(self) -> Path:
+        """
+        Ensure a projector calibration session exists and return it.
+        """
         if self.proj_session is None:
             self.proj_session = self._start_new_proj_session()
         return self.proj_session
@@ -437,12 +476,13 @@ class WebServer:
             self.proj_status = f"Session must be under {self.proj_calib_root}"
             return
         self.proj_session = session_path
-        # set next pose index based on existing pose_* folders
+        # Set next pose index from existing pose_* folders.
         pose_dirs = sorted(session_path.glob("pose_*"))
         next_idx = 0
         if pose_dirs:
-            # parse max existing index
+            # Parse the max existing index.
             def _idx(p):
+                """Extract a numeric pose index from a pose folder name."""
                 try:
                     return int(p.name.split("_")[1])
                 except Exception:
@@ -452,6 +492,9 @@ class WebServer:
         self.proj_status = f"Loaded session {session_path.name} (next pose {next_idx:03d})"
 
     def _make_proj_pose_dir(self) -> Path:
+        """
+        Create and return the next projector pose directory.
+        """
         session = self._ensure_proj_session()
         pose_dir = session / f"pose_{self.proj_views:03d}"
         pose_dir.mkdir(parents=True, exist_ok=True)
@@ -479,7 +522,7 @@ class WebServer:
             (x1 < w) & (y1 < h)
         )
 
-        # Require mask validity in surrounding pixels
+        # Require mask validity in surrounding pixels.
         valid &= valid_mask[y0, x0] & valid_mask[y0, x1] & valid_mask[y1, x0] & valid_mask[y1, x1]
 
         samples = np.full(xs.shape, np.nan, dtype=np.float32)
@@ -505,6 +548,9 @@ class WebServer:
         return samples
 
     def _capture_projector_pose(self):
+        """
+        Capture a single projector calibration pose and save its data.
+        """
         with self.proj_lock:
             if not Path("camera_intrinsics.npz").exists():
                 msg = "camera_intrinsics.npz missing. Calibrate camera first."
@@ -518,8 +564,9 @@ class WebServer:
 
             pose_dir = self._make_proj_pose_dir()
 
-            # Auto exposure on mid-grey
+            # Auto exposure using the mid-grey pattern.
             def set_midgrey():
+                """Project a mid-grey pattern for auto exposure."""
                 self.set_surface_callback(self.graycode_midgray)
 
             try:
@@ -544,13 +591,13 @@ class WebServer:
                 fname = f"gray_{pat.name}_{idx:03d}.png"
                 cv2.imwrite(str(pose_dir / fname), gray)
 
-            # Bright frame for checkerboard
+            # Bright frame for checkerboard detection.
             self.set_surface_callback(self.white_surface)
             time_module.sleep(self.pattern_settle_time)
             bright = self.camera.capture_gray().astype(np.float32)
             cv2.imwrite(str(pose_dir / "bright.png"), bright)
 
-            # Return to midgrey
+            # Return to midgrey.
             self.set_surface_callback(self.midgrey_surface)
 
             bright_u8 = np.clip(bright, 0, 255).astype(np.uint8)
@@ -572,7 +619,7 @@ class WebServer:
                 self.proj_status = msg
                 return False, msg
 
-            # Decode GrayCode
+            # Decode the GrayCode sequence.
             debug_dir = pose_dir / "graycode_debug"
             proj_u, proj_v, valid_mask, debug = decode_with_cleaning(
                 frames,
@@ -587,7 +634,7 @@ class WebServer:
             np.save(pose_dir / "proj_u.npy", proj_u.astype(np.float32))
             np.save(pose_dir / "proj_v.npy", proj_v.astype(np.float32))
             np.save(pose_dir / "valid_mask.npy", valid_mask.astype(np.uint8))
-            # Always save debug overlays to inspect failures
+            # Always save debug overlays to inspect failures.
             self._save_proj_debug(pose_dir, bright_u8, detection, proj_u, proj_v, valid_mask, debug)
 
             valid_fraction_total = float(valid_mask.mean())
@@ -628,12 +675,16 @@ class WebServer:
             return True, self.proj_status
 
     def _save_proj_debug(self, pose_dir: Path, bright: np.ndarray, detection, proj_u: np.ndarray, proj_v: np.ndarray, mask: np.ndarray, debug: dict | None = None):
+        """
+        Save diagnostic overlays for a projector calibration pose.
+        """
         pose_dir.mkdir(parents=True, exist_ok=True)
         vis = cv2.cvtColor(bright, cv2.COLOR_GRAY2BGR)
         cv2.drawChessboardCorners(vis, self.cb_checkerboard, detection.corners, True)
         cv2.imwrite(str(pose_dir / "checkerboard_overlay.png"), vis)
 
         def _colorize(arr: np.ndarray, max_val: float) -> np.ndarray:
+            """Convert a float map into a colorized debug image."""
             arr_disp = arr.copy()
             arr_disp[~np.isfinite(arr_disp)] = 0
             arr_disp = np.clip(arr_disp, 0, max_val)
@@ -650,6 +701,7 @@ class WebServer:
 
         if debug is not None and "diff_u" in debug and "diff_v" in debug:
             def _norm_diff(d):
+                """Normalize a diff image to 0..255 for visualization."""
                 d = np.clip((d - d.min()) / (d.max() - d.min() + 1e-6), 0, 1)
                 img = (d * 255).astype(np.uint8)
                 return cv2.applyColorMap(img, cv2.COLORMAP_BONE)
@@ -658,7 +710,7 @@ class WebServer:
 
             dbg_dir = pose_dir / "graycode_debug"
             dbg_dir.mkdir(exist_ok=True)
-            # Save histograms
+            # Save histograms for diagnostics.
             hist, _ = np.histogram(bright, bins=256, range=(0, 255))
             np.savetxt(dbg_dir / "intensity_hist.csv", hist, fmt="%d")
             if "valid" in debug:
@@ -666,6 +718,9 @@ class WebServer:
                 cv2.imwrite(str(dbg_dir / "valid_mask_raw.png"), (valid_mask.astype(np.uint8) * 255))
 
     def _finish_projector_calibration(self):
+        """
+        Solve projector intrinsics and stereo params from captured poses.
+        """
         with self.proj_lock:
             min_views = 6
             if self.proj_views < min_views:
@@ -686,7 +741,7 @@ class WebServer:
                 self.proj_status = msg
                 return False, msg
 
-            # Copy results to root for reconstruction
+            # Copy results to the repo root for reconstruction.
             intr_src = session / "projector_intrinsics.npz"
             stereo_src = session / "stereo_params.npz"
             if intr_src.exists():
@@ -703,10 +758,11 @@ class WebServer:
             self.proj_status = msg
             return True, msg
 
-    # ============================================================
-    # RUN
-    # ============================================================
+    # --- Server run ---
 
     def run(self, host="0.0.0.0", port=5000):
+        """
+        Run the Flask development server.
+        """
         print(f"[WEB] Server at http://{host}:{port}")
         self.app.run(host=host, port=port, threaded=True)

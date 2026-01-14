@@ -1,15 +1,11 @@
 """
 scan.py
 
-Central scanning pipeline for structured-light fringe projection (PSP).
+End-to-end scan pipeline for structured-light PSP capture and decoding.
 
-Features:
-  - Normal scan mode:
-      * Uses full frequency set (e.g. [4, 8, 16, 32])
-      * Uses psp.run_psp_per_frequency
-      * Uses masking.merge_frequency_masks
-      * Temporal unwrapping across all freqs
-      * Outputs phase_final.npy, mask_final.npy, phase_debug.png
+Normal scan mode captures multi-frequency fringe stacks, computes wrapped
+phase and quality masks, temporally unwraps the phase, and derives projector
+UV maps for reconstruction.
 """
 
 from __future__ import annotations
@@ -36,6 +32,12 @@ U_JUMP_MAX = 8.0
 V_JUMP_MAX = 8.0
 
 class ScanController:
+    """
+    Orchestrate capture, decoding, and UV mapping for a scan session.
+
+    The controller owns the scan configuration (frequencies, phases, output
+    roots) and coordinates the camera and projector during capture.
+    """
     def __init__(
         self,
         camera: CameraController,
@@ -50,13 +52,41 @@ class ScanController:
         pattern_settle_time: float = 0.15,
         graycode: object | None = None,
     ):
+        """
+        Create a scan controller bound to a camera and pattern sets.
+
+        Parameters
+        ----------
+        camera : CameraController
+            Camera interface used for capture.
+        patterns : dict[int, list[object]]
+            Vertical fringe surfaces by frequency.
+        midgrey_surface : object
+            Neutral surface used for auto-exposure.
+        set_surface_callback : callable
+            Function to show a surface on the projector.
+        freqs : list[int]
+            Frequencies used for PSP decoding.
+        n_phase : int
+            Number of phase steps per frequency.
+        patterns_horiz : dict[int, list[object]] or None
+            Horizontal fringe surfaces by frequency.
+        scan_root : str
+            Root directory for scan outputs.
+        calib_root : str
+            Root directory for calibration captures.
+        pattern_settle_time : float
+            Time to wait after switching patterns before capture.
+        graycode : object or None
+            Optional GrayCode pattern set for calibration.
+        """
         self.camera = camera
-        self.patterns = patterns              # dict[freq] -> list[pygame.Surface]
+        self.patterns = patterns              # dict[freq] with lists of pygame.Surface
         self.midgrey_surface = midgrey_surface
         self.set_surface_callback = set_surface_callback
         self.freqs = freqs
         self.n_phase = n_phase
-        self.patterns_horiz = patterns_horiz  # optional dict for horizontal fringes
+        self.patterns_horiz = patterns_horiz  # Optional dict for horizontal fringes.
         self.scan_root = scan_root
         self.calib_root = calib_root
         self.pattern_settle_time = pattern_settle_time
@@ -69,15 +99,19 @@ class ScanController:
         os.makedirs(self.calib_root, exist_ok=True)
         self._logged_capture_shape = False
 
-        # Calibration session state
+        # Calibration session bookkeeping (used by the web UI).
         self.calib_session_root: str | None = None
         self.calib_pose_idx: int = 0
 
-    # =====================================================================
-    # INTERNAL HELPERS
-    # =====================================================================
-
     def _make_scan_dir(self) -> str:
+        """
+        Create a timestamped scan output directory.
+
+        Returns
+        -------
+        str
+            Path to the new scan directory.
+        """
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         scan_dir = os.path.join(self.scan_root, timestamp)
         os.makedirs(scan_dir, exist_ok=True)
@@ -85,12 +119,10 @@ class ScanController:
 
     def _ensure_calib_session(self) -> str:
         """
-        Ensure there is an active calibration session directory.
-        Returns the session root path.
+        Ensure a calibration session directory exists and return its path.
 
-        A session has the form:
-            calib/session_YYYYMMDD_HHMMSS
-        and contains pose_XXX subfolders.
+        The layout is:
+        calib/session_YYYYMMDD_HHMMSS/pose_XXX
         """
         if self.calib_session_root is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -103,6 +135,9 @@ class ScanController:
         return self.calib_session_root
 
     def _make_calib_pose_dir(self) -> str:
+        """
+        Create and return a new calibration pose directory.
+        """
         session_root = self._ensure_calib_session()
         pose_name = f"pose_{self.calib_pose_idx:03d}"
         self.calib_pose_idx += 1
@@ -112,12 +147,16 @@ class ScanController:
         return pose_dir
 
     def _run_auto_exposure(self):
+        """
+        Run an auto-exposure pass against the mid-grey reference frame.
+        """
         def set_midgrey():
+            """Switch the projector to the mid-grey surface."""
             self.set_surface_callback(self.midgrey_surface)
 
         exp, gain = self.camera.auto_expose_with_midgrey(
             set_midgrey_surface_callback=set_midgrey,
-            target_mean=90,     # slightly darker target
+            target_mean=90,     # Aim a little darker to preserve highlights.
             tolerance=5,
             max_iters=6,
         )
@@ -130,10 +169,21 @@ class ScanController:
         prefix: str = "",
     ) -> Dict[Tuple[int, int], np.ndarray]:
         """
-        Capture a full PSP sequence for the given patterns dict.
+        Capture a full PSP sequence for the given pattern set.
 
-        patterns[f][n] is the pygame.Surface to show for frequency f
-        and phase index n.
+        Parameters
+        ----------
+        out_dir : str
+            Directory where captured frames are saved.
+        patterns : dict[int, list[object]]
+            Mapping from frequency to a list of phase surfaces.
+        prefix : str
+            Optional prefix for saved filenames.
+
+        Returns
+        -------
+        dict[(int, int), ndarray]
+            Grayscale frames keyed by (frequency, phase index).
         """
         I_dict: Dict[Tuple[int, int], np.ndarray] = {}
 
@@ -160,7 +210,7 @@ class ScanController:
 
     def _save_phase_debug(self, Phi_final, mask_final, out_dir, filename: str = "phase_debug.png"):
         """
-        Save a false-colour debug image of the final unwrapped phase.
+        Save a false-color debug image of an unwrapped phase map.
         """
         phase_display = Phi_final.copy()
         phase_display[~mask_final] = np.nan
@@ -182,7 +232,7 @@ class ScanController:
 
     def _save_psp_quality_maps(self, scan_dir: str, orientation: str, psp_result):
         """
-        Persist per-frequency PSP quality metrics for debugging/diagnostics.
+        Persist per-frequency PSP quality metrics for later diagnostics.
         """
         f_hi = max(self.freqs)
         prefix = "vert" if orientation == "vert" else "horiz"
@@ -199,18 +249,14 @@ class ScanController:
             np.save(os.path.join(scan_dir, f"sat_{prefix}.npy"), psp_result.saturated[f_hi])
 
 
-    # =====================================================================
-    # NORMAL SCAN PIPELINE
-    # =====================================================================
+    # --- Normal scan pipeline ---
 
     def run_scan(self, polished: bool = False) -> str:
         """
-        Full normal scan:
-          - AE on midgrey
-          - capture vertical PSP sequence (self.freqs)
-          - PSP, mask merging, temporal unwrapping
-          - median filter final phase
-          - save phase_final.npy, mask_final.npy, phase_debug.png
+        Run a full scan capture and decode pass.
+
+        The pipeline captures vertical and horizontal fringe stacks, runs PSP,
+        merges masks, unwraps phases, and computes projector UV maps.
 
         Returns
         -------
@@ -220,12 +266,10 @@ class ScanController:
         print(f"[SCAN] Starting scan (polished={polished})...")
         scan_dir = self._make_scan_dir()
 
-        # Auto exposure
+        # Auto exposure against the mid-grey reference.
         self._run_auto_exposure()
 
-        # -----------------------------------------------------------------
-        # Capture and decode VERTICAL patterns (u direction)
-        # -----------------------------------------------------------------
+        # Capture and decode VERTICAL patterns (u direction).
         print("[SCAN] Capturing vertical PSP sequence...")
         I_vert = self._capture_psp_sequence(scan_dir, self.patterns, prefix="scan")
 
@@ -247,22 +291,20 @@ class ScanController:
             phi_wrapped=psp_vert.phi_wrapped,
             mask_merged=masks_vert,
             freqs=self.freqs,
-            spatial_axis=1,   # vertical fringes vary along x → unwrap rows
+            spatial_axis=1,   # Vertical fringes vary along x; unwrap by rows.
         )
 
         Phi_vert = unwrap_vert.Phi_final
         mask_vert = unwrap_vert.mask_final
 
-        # Median filter vertical phase (inside mask)
+        # Median filter vertical phase inside the valid mask.
         print("[SCAN] Applying median filter to vertical phase...")
         Phi_vert_med = median_filter(Phi_vert, size=3)
         Phi_vert_smoothed = Phi_vert.copy()
         Phi_vert_smoothed[mask_vert] = Phi_vert_med[mask_vert]
         Phi_vert = Phi_vert_smoothed
 
-        # -----------------------------------------------------------------
-        # Capture and decode HORIZONTAL patterns (v direction)
-        # -----------------------------------------------------------------
+        # Capture and decode HORIZONTAL patterns (v direction).
         if self.patterns_horiz is None:
             raise RuntimeError("Horizontal pattern set is not available but horizontal PSP is required.")
 
@@ -287,25 +329,23 @@ class ScanController:
             phi_wrapped=psp_horiz.phi_wrapped,
             mask_merged=masks_horiz,
             freqs=self.freqs,
-            spatial_axis=0,   # horizontal fringes vary along y → unwrap columns
+            spatial_axis=0,   # Horizontal fringes vary along y; unwrap by columns.
         )
 
         Phi_horiz = unwrap_horiz.Phi_final
         mask_horiz = unwrap_horiz.mask_final
 
-        # Median filter horizontal phase (inside mask)
+        # Median filter horizontal phase inside the valid mask.
         print("[SCAN] Applying median filter to horizontal phase...")
         Phi_h_med = median_filter(Phi_horiz, size=3)
         Phi_horiz_smoothed = Phi_horiz.copy()
         Phi_horiz_smoothed[mask_horiz] = Phi_h_med[mask_horiz]
         Phi_horiz = Phi_horiz_smoothed
 
-        # in scan.py after Phi_horiz smoothing:
+        # Save a debug view of the horizontal phase map.
         self._save_phase_debug(Phi_horiz, mask_horiz, scan_dir, filename="phase_horiz_debug.png")
 
-        # -----------------------------------------------------------------
-        # Phase-1 quality gating and smoothing
-        # -----------------------------------------------------------------
+        # Phase-1 quality gating and smoothing.
         f_hi = max(self.freqs)
         qual_vert = (
             (psp_vert.gamma[f_hi] > THRESH_GAMMA_PHASE1) &
@@ -342,10 +382,8 @@ class ScanController:
         Phi_horiz = Phi_horiz_filtered
 
 
-        # -----------------------------------------------------------------
-        # Combine masks and compute projector UV mapping
-        # -----------------------------------------------------------------
-        # Use strict intersection for combined validity prior to UV mapping
+        # Combine masks and compute projector UV mapping.
+        # Use strict intersection for combined validity prior to UV mapping.
         mask_both = mask_vert & mask_horiz
 
         print("[SCAN] Computing projector UV maps from phase...")
@@ -363,16 +401,16 @@ class ScanController:
             print(f"[SCAN][UV] u range: {np.nanmin(u_map):.2f} .. {np.nanmax(u_map):.2f} (proj_w={self.proj_w})")
             print(f"[SCAN][UV] v range: {np.nanmin(v_map):.2f} .. {np.nanmax(v_map):.2f} (proj_h={self.proj_h})")
 
-        # UV-gradient rejection inside quality mask
+        # Reject large UV jumps inside the quality mask.
         if mask_quality.any():
             mask_uv_smooth = np.ones_like(mask_quality, dtype=bool)
             mq = mask_quality
-            # right neighbor
+            # Right neighbor jumps.
             du_r = np.abs(u_map[:, :-1] - u_map[:, 1:])
             dv_r = np.abs(v_map[:, :-1] - v_map[:, 1:])
             bad_u_r = (du_r > U_JUMP_MAX) & mq[:, :-1] & mq[:, 1:]
             bad_v_r = (dv_r > V_JUMP_MAX) & mq[:, :-1] & mq[:, 1:]
-            # down neighbor
+            # Down neighbor jumps.
             du_d = np.abs(u_map[:-1, :] - u_map[1:, :])
             dv_d = np.abs(v_map[:-1, :] - v_map[1:, :])
             bad_u_d = (du_d > U_JUMP_MAX) & mq[:-1, :] & mq[1:, :]
@@ -400,7 +438,7 @@ class ScanController:
             rej_uv_pct = 0.0
             remaining_pct = 0.0
 
-        # Diagnostics for summary
+        # Diagnostics for summary.
         diag = {
             "uv_reject_pct": rej_uv_pct,
             "mask_quality_pct": remaining_pct,
@@ -427,10 +465,8 @@ class ScanController:
             import json as _json
             _json.dump(diag, f, indent=2)
 
-        # -----------------------------------------------------------------
-        # Save outputs
-        # -----------------------------------------------------------------
-        np.save(os.path.join(scan_dir, "phase_final.npy"), Phi_vert)  # keep legacy vertical phase
+        # Save outputs for reconstruction and debugging.
+        np.save(os.path.join(scan_dir, "phase_final.npy"), Phi_vert)  # Keep legacy vertical phase.
         np.save(os.path.join(scan_dir, "mask_final.npy"), mask_final)
         np.save(os.path.join(scan_dir, "proj_u.npy"), u_map.astype(np.float32))
         np.save(os.path.join(scan_dir, "proj_v.npy"), v_map.astype(np.float32))

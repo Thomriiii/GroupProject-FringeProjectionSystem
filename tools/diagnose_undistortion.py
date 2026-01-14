@@ -2,18 +2,13 @@
 """
 diagnose_undistortion.py
 
-Diagnostic helper to visually validate the distortion model on a *real* captured image.
+Diagnostic helper to visually validate the distortion model on a real captured image.
 
 It:
   - Loads camera intrinsics (K, dist) from camera_intrinsics.npz
   - Undistorts the image
-  - Overlays guide grid + detected straight lines (Hough) on both original and undistorted views
+  - Overlays a guide grid and detected straight lines on both views
   - Writes a side-by-side PNG for inspection
-
-Usage
------
-  python3 tools/diagnose_undistortion.py --image calib/camera/session_*/view_000.png
-  python3 tools/diagnose_undistortion.py --image scans/.../scan_f004_n00.png --out undistort_check.png
 """
 
 from __future__ import annotations
@@ -31,6 +26,9 @@ except Exception as e:  # pragma: no cover
 
 
 def _load_intrinsics(path: Path) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
+    """
+    Load intrinsics and image size from an NPZ file.
+    """
     data = np.load(path)
     K = data["K"]
     dist = data["dist"]
@@ -39,6 +37,9 @@ def _load_intrinsics(path: Path) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int
 
 
 def _overlay_grid(img_bgr: np.ndarray, color=(0, 255, 0), thickness: int = 1) -> np.ndarray:
+    """
+    Draw a simple rule-of-thirds grid over an image.
+    """
     out = img_bgr.copy()
     h, w = out.shape[:2]
     for frac in (0.25, 0.5, 0.75):
@@ -48,6 +49,9 @@ def _overlay_grid(img_bgr: np.ndarray, color=(0, 255, 0), thickness: int = 1) ->
 
 
 def _overlay_hough_lines(img_bgr: np.ndarray, *, max_lines: int = 80) -> np.ndarray:
+    """
+    Draw a subset of Hough-detected lines for visual inspection.
+    """
     out = img_bgr.copy()
     gray = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 80, 180, apertureSize=3)
@@ -55,7 +59,7 @@ def _overlay_hough_lines(img_bgr: np.ndarray, *, max_lines: int = 80) -> np.ndar
     if lines is None:
         return out
 
-    # Draw strongest/earliest lines. This is a quick qualitative tool, not a metric.
+    # Draw strongest/earliest lines. This is a qualitative check, not a metric.
     for i, ln in enumerate(lines[:max_lines]):
         x1, y1, x2, y2 = (int(v) for v in ln[0])
         cv2.line(out, (x1, y1), (x2, y2), (0, 0, 255), 2)
@@ -65,6 +69,9 @@ def _overlay_hough_lines(img_bgr: np.ndarray, *, max_lines: int = 80) -> np.ndar
 
 
 def main() -> int:
+    """
+    CLI entry point for undistortion diagnostics.
+    """
     ap = argparse.ArgumentParser()
     ap.add_argument("--camera", type=Path, default=Path("camera_intrinsics.npz"), help="camera intrinsics npz")
     ap.add_argument("--image", type=Path, required=True, help="input image (scan/calibration frame)")

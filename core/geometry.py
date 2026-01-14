@@ -3,8 +3,8 @@ geometry.py
 
 Utilities for mapping unwrapped PSP phase maps to projector pixel
 coordinates (u, v). The mapping assumes:
-  - Vertical pattern set varies along projector X (width) → u
-  - Horizontal pattern set varies along projector Y (height) → v
+  - Vertical pattern set varies along projector X (width) -> u
+  - Horizontal pattern set varies along projector Y (height) -> v
 The highest frequency determines scaling from phase to pixels.
 """
 
@@ -18,8 +18,9 @@ TWO_PI = 2.0 * np.pi
 
 def _best_cycle_offset(coord_map: np.ndarray, mask: np.ndarray, size: int, freq: float) -> float:
     """
-    Find an integer-cycle offset that maximises how many samples fall inside
-    the projector bounds. Shifting by one cycle corresponds to size/freq pixels.
+    Find an integer-cycle offset that maximizes in-bounds samples.
+
+    Shifting by one cycle corresponds to size/freq pixels.
     """
     mask_valid = mask & np.isfinite(coord_map)
     if not mask_valid.any():
@@ -29,7 +30,7 @@ def _best_cycle_offset(coord_map: np.ndarray, mask: np.ndarray, size: int, freq:
     best_k = 0
     best_count = -1
 
-    # Search a generous window of possible cycle offsets
+    # Search a generous window of possible cycle offsets.
     for k in range(-int(freq) * 2, int(freq) * 2 + 1):
         shifted = coord_map + k * step
         count = np.count_nonzero(mask_valid & (shifted >= -0.5 * step) & (shifted <= size + 0.5 * step))
@@ -43,7 +44,8 @@ def _best_cycle_offset(coord_map: np.ndarray, mask: np.ndarray, size: int, freq:
 def _affine_normalise_minmax(coord_map: np.ndarray, mask: np.ndarray, size: int) -> tuple[float, float]:
     """
     Compute a scale/offset so the valid coord_map spans the projector pixel range
-    using simple min/max → [0..size).
+    using simple min/max in [0..size).
+
     Returns (scale, offset) such that coord' = coord * scale + offset.
     """
     valid = mask & np.isfinite(coord_map)
@@ -91,17 +93,16 @@ def compute_projector_uv_from_phase(
     offset_u, offset_v : float
         Optional offsets in projector pixels (defaults zero).
     auto_cycle_alignment : bool
-        If True, shifts the maps by integer fringe periods so the majority of
-        samples fall inside the projector bounds. This anchors the absolute
-        fringe order and prevents negative/overflowing coordinates.
+        If True, shift the maps by integer fringe periods so the majority of
+        samples fall inside the projector bounds.
     apply_affine_normalisation : bool
         If True, compute a per-axis affine (scale + offset) so the observed UV
-        distribution maps min→0, max→proj_size.
+        distribution maps min=0, max=proj_size.
 
     Returns
     -------
     u_map, v_map, mask_final : float32 arrays (H, W)
-        Dense projector coordinates. Invalid pixels set to NaN.
+        Dense projector coordinates. Invalid pixels are set to NaN.
     """
     freqs_sorted = sorted(freqs)
     f_high = float(freqs_sorted[-1])
@@ -118,7 +119,7 @@ def compute_projector_uv_from_phase(
     u_map = (phase_vert / denom_u) * proj_w + offset_u
     v_map = (phase_horiz / denom_v) * proj_h + offset_v
 
-    # Optional integer-cycle shift to keep coordinates within projector bounds
+    # Optional integer-cycle shift to keep coordinates within projector bounds.
     if auto_cycle_alignment:
         u_shift = _best_cycle_offset(u_map, mask_final, proj_w, f_high)
         v_shift = _best_cycle_offset(v_map, mask_final, proj_h, f_high)
@@ -136,7 +137,7 @@ def compute_projector_uv_from_phase(
     u_map = u_map.astype(np.float32)
     v_map = v_map.astype(np.float32)
 
-    # Mask out invalids with NaN for clarity downstream and enforce projector bounds
+    # Mask out invalids with NaN for clarity downstream and enforce projector bounds.
     in_bounds = (
         (u_map >= 0.0) & (u_map <= proj_w - 1) &
         (v_map >= 0.0) & (v_map <= proj_h - 1)

@@ -1,7 +1,7 @@
 """
 calibration package
 
-Grouping checkerboard and structured-light calibration utilities.
+Convenience exports for checkerboard and structured-light calibration utilities.
 """
 
 from .camera_calibration import (

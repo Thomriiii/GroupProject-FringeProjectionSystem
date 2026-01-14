@@ -1,7 +1,7 @@
 """
 masking.py
 
-Mask cleanup and merging for structured-light PSP.
+Mask cleanup and merging helpers for structured-light PSP.
 """
 
 from __future__ import annotations
@@ -14,6 +14,9 @@ MaskDict = Dict[int, np.ndarray]
 
 
 def clean_mask(mask: np.ndarray, kernel_size: int = 3) -> np.ndarray:
+    """
+    Apply morphological open/close to remove speckles and fill small gaps.
+    """
     k = np.ones((kernel_size, kernel_size), np.uint8)
     m = mask.astype(np.uint8)
     m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k)
@@ -27,6 +30,25 @@ def merge_frequency_masks(
     kernel_size: int = 3,
     majority_threshold: int | None = None,
 ) -> MaskDict:
+    """
+    Clean per-frequency masks and merge them with a majority vote.
+
+    Parameters
+    ----------
+    masks_raw : dict[int, ndarray]
+        Raw boolean masks for each frequency.
+    freqs : list[int]
+        Frequencies in the mask set.
+    kernel_size : int
+        Kernel size for morphological cleaning.
+    majority_threshold : int or None
+        Minimum number of votes to keep a pixel. Defaults to simple majority.
+
+    Returns
+    -------
+    dict[int, ndarray]
+        Merged mask replicated for each frequency.
+    """
     freqs_sorted = sorted(freqs)
     cleaned_masks: MaskDict = {}
 

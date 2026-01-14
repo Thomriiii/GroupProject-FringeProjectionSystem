@@ -1,17 +1,10 @@
 """
 psp_calib.py
 
-PSP for CAMERA/PROJECTOR CALIBRATION ONLY.
+PSP for camera/projector calibration only.
 
-Key differences from psp.py:
-
-  - Uses ONLY low frequencies (typically [4, 8]) passed in `freqs`.
-  - Much more relaxed thresholds:
-        CALIB_TH1_GAMMA = 0.05
-        CALIB_TH2_MOD   = 4.0
-  - Optional blur on input images.
-  - Designed to keep as many pixels as possible on a tilted white board
-    during calibration, even if modulation is weaker at high tilt.
+Compared to normal scans, this uses lower frequencies and looser thresholds
+to retain more valid pixels on tilted calibration boards.
 """
 
 from __future__ import annotations
@@ -23,8 +16,8 @@ IntensityDict = Dict[Tuple[int, int], np.ndarray]
 PhaseDict = Dict[int, np.ndarray]
 FloatImage = np.ndarray
 
-CALIB_TH1_GAMMA = 0.05   # relaxed gamma threshold
-CALIB_TH2_MOD   = 4.0    # relaxed modulation threshold
+CALIB_TH1_GAMMA = 0.05   # Relaxed gamma threshold.
+CALIB_TH2_MOD   = 4.0    # Relaxed modulation threshold.
 CALIB_BLUR = True
 CALIB_BLUR_KERNEL = (5, 5)
 
@@ -65,34 +58,34 @@ def run_psp_calibration(
     for f in freqs_sorted:
         stack = np.stack([I_dict[(f, k)] for k in range(n_phase)], axis=0)
 
-        # Optional blur to stabilise noisy areas / low modulation
+        # Optional blur to stabilize noisy or low-modulation areas.
         if CALIB_BLUR:
             for k in range(n_phase):
                 stack[k] = cv2.GaussianBlur(stack[k], CALIB_BLUR_KERNEL, 0)
 
-        # Mean intensity
+        # Mean intensity.
         A_f = stack.mean(axis=0)
 
-        # Phase sums
+        # Phase sums.
         S = np.sum(stack * sin_d, axis=0)
         C = np.sum(stack * cos_d, axis=0)
 
-        # Modulation amplitude
+        # Modulation amplitude.
         B = (2.0 / n_phase) * np.sqrt(S * S + C * C)
 
-        # Wrapped phase
+        # Wrapped phase.
         phi = np.arctan2(S, C)
         phi_wrapped[f] = phi
 
-        # Blurred modulation for stable mask
+        # Blurred modulation for a stable mask.
         B_eff = cv2.GaussianBlur(B.astype(np.float32), (7, 7), 0)
 
-        # Gamma = modulation / average brightness
+        # Gamma = modulation / average brightness.
         gamma = np.zeros_like(A_f, dtype=np.float32)
         nz = A_f > 1e-6
         gamma[nz] = B_eff[nz] / A_f[nz]
 
-        # Very tolerant mask (no saturation check; you can add if needed)
+        # Very tolerant mask (no saturation check; add if needed).
         mask_f = (gamma > CALIB_TH1_GAMMA) & (B_eff > CALIB_TH2_MOD)
 
         masks[f] = mask_f

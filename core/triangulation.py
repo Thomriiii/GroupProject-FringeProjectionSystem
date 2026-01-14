@@ -1,9 +1,10 @@
 """
 triangulation.py
 
-Minimal 3D reconstruction utilities using camera-projector ray
-intersection. This uses placeholder projector intrinsics/extrinsics
-until a real calibration is available.
+3D reconstruction utilities using camera-projector ray intersection.
+
+The module supports calibrated projector parameters when available and
+falls back to approximate intrinsics/extrinsics if calibration is missing.
 """
 
 from __future__ import annotations
@@ -20,30 +21,37 @@ except Exception:
     cv2 = None
 
 
-# =====================================================================
-# Intrinsics / Extrinsics
-# =====================================================================
+# --- Intrinsics and extrinsics helpers ---
 
 def load_camera_intrinsics(path: str | Path = "camera_intrinsics.npz"):
+    """
+    Load camera intrinsics, distortion, and image size from an NPZ file.
+    """
     data = np.load(path)
     K = data["K"]
     dist = data["dist"]
     image_size = data["image_size"]
-    # Stored as (W, H) int32
+    # Stored as (W, H) int32 in the file.
     image_size_wh = (int(image_size[0]), int(image_size[1]))
     return K, dist, image_size_wh
 
 
 def _format_K(K: np.ndarray) -> str:
+    """
+    Format a camera matrix into a compact string for logs.
+    """
     fx, fy = float(K[0, 0]), float(K[1, 1])
     cx, cy = float(K[0, 2]), float(K[1, 2])
     return f"fx={fx:.2f}, fy={fy:.2f}, cx={cx:.2f}, cy={cy:.2f}"
 
 
 def _warn_if_principal_point_far(K: np.ndarray, image_size_wh: Tuple[int, int], frac: float = 0.10) -> None:
+    """
+    Print warnings or raise if the principal point looks implausible.
+    """
     w, h = image_size_wh
     cx, cy = float(K[0, 2]), float(K[1, 2])
-    # Hard validity checks (catch swapped axes / wrong units early).
+    # Hard validity checks catch swapped axes or wrong units early.
     if not np.isfinite([cx, cy, K[0, 0], K[1, 1]]).all():
         raise RuntimeError("[RECON][FATAL] Non-finite intrinsics detected.")
     if float(K[0, 0]) <= 0 or float(K[1, 1]) <= 0:
@@ -105,7 +113,7 @@ def load_camera_intrinsics_for_image(
                 "to rescale intrinsics for pure image resizing (no cropping)."
             )
 
-        # Only allow rescale if aspect ratio matches (resize without crop).
+        # Only rescale if aspect ratio matches (resize without crop).
         calib_w, calib_h = calib_size
         if abs((scan_w / scan_h) - (calib_w / calib_h)) > 1e-6:
             raise RuntimeError(
@@ -170,6 +178,9 @@ UV_CONVENTION_PATH = Path("config/uv_convention.json")
 
 
 def _load_fake_config():
+    """
+    Load optional fake projector parameters from config if present.
+    """
     if FAKE_CONFIG_PATH.exists():
         try:
             return json.loads(FAKE_CONFIG_PATH.read_text())
@@ -222,10 +233,10 @@ def _apply_proj_uv_transform(proj_uv: np.ndarray, proj_size: Tuple[int, int], na
     if name == "flip_u_flip_v":
         return np.stack([(proj_w - 1) - u, (proj_h - 1) - v], axis=1).astype(np.float32)
     if name == "swap_flip_u":
-        # swap then flip new u (which was v)
+        # Swap then flip new u (which was v).
         return np.stack([(proj_w - 1) - v, u], axis=1).astype(np.float32)
     if name == "swap_flip_v":
-        # swap then flip new v (which was u)
+        # Swap then flip new v (which was u).
         return np.stack([v, (proj_h - 1) - u], axis=1).astype(np.float32)
 
     raise ValueError(f"Unknown PROJ_UV_TRANSFORM '{name}'")
@@ -244,6 +255,9 @@ def _diagnose_proj_uv_transform(
     *,
     sample: int = 20000,
 ) -> None:
+    """
+    Evaluate candidate UV convention transforms and report ray error stats.
+    """
     if cv2 is None:
         print("[RECON][WARN] UV transform diagnosis requires OpenCV (cv2).")
         return
@@ -258,6 +272,7 @@ def _diagnose_proj_uv_transform(
     cam_norm = cv2.undistortPoints(cam_uv_s.reshape(-1, 1, 2), Kc, dist_c)[:, 0, :]
 
     def _dirs(norm_xy: np.ndarray) -> np.ndarray:
+        """Convert normalized image coordinates into unit ray directions."""
         dirs = np.hstack([norm_xy, np.ones((norm_xy.shape[0], 1), dtype=np.float64)])
         dirs /= np.linalg.norm(dirs, axis=1, keepdims=True) + 1e-12
         return dirs.astype(np.float32)
@@ -326,12 +341,12 @@ def get_fake_extrinsics():
     Approximate projector pose in camera frame based on tape-measured offsets.
     """
     cfg = _load_fake_config()
-    # Projector offset (camera frame): LEFT/RIGHT, UP, FORWARD (negative means behind)
+    # Projector offset in camera frame: left/right, up, forward (negative means behind).
     T = np.array(cfg.get("T", [-0.185, 0.010, -0.015]), dtype=np.float32)
 
-    # Toe-in yaw toward the scene centre (positive because projector sits left).
+    # Toe-in yaw toward the scene center (positive because projector sits left).
     # Point the projector z-axis roughly toward (0, 0, z_target) in camera frame.
-    z_target = float(cfg.get("z_target", 0.60))  # metres in front of camera; used only to derive yaw guess
+    z_target = float(cfg.get("z_target", 0.60))  # Meters in front of camera; used only to derive yaw guess.
     yaw_override = cfg.get("yaw_rad", None)
     vec_to_target = np.array([abs(T[0]), 0.0, z_target - T[2]], dtype=np.float64)
     yaw = float(np.arctan2(vec_to_target[0], vec_to_target[2])) if yaw_override is None else float(yaw_override)
@@ -340,12 +355,15 @@ def get_fake_extrinsics():
         [ c, 0.0,  s],
         [0.0, 1.0, 0.0],
         [-s, 0.0,  c]
-    ], dtype=np.float32)  # projector → camera
+    ], dtype=np.float32)  # projector -> camera
 
     return R, T
 
 
 def load_projector_intrinsics(path: str | Path = "projector_intrinsics.npz"):
+    """
+    Load projector intrinsics from an NPZ file if it exists.
+    """
     path = Path(path)
     if not path.exists():
         return None
@@ -359,6 +377,9 @@ def load_projector_intrinsics(path: str | Path = "projector_intrinsics.npz"):
 
 
 def load_stereo_params(path: str | Path = "stereo_params.npz"):
+    """
+    Load stereo calibration parameters from an NPZ file if it exists.
+    """
     path = Path(path)
     if not path.exists():
         return None
@@ -374,9 +395,7 @@ def load_stereo_params(path: str | Path = "stereo_params.npz"):
     return R, T, Kc, dist_c, Kp, dist_p, rms, uv_bbox
 
 
-# =====================================================================
-# Rays
-# =====================================================================
+# --- Ray construction ---
 
 def compute_camera_rays(cam_uv: np.ndarray, Kc: np.ndarray) -> np.ndarray:
     """
@@ -400,15 +419,13 @@ def compute_projector_rays(proj_uv: np.ndarray, Kp: np.ndarray, R: np.ndarray, T
     norms = np.linalg.norm(dirs_proj, axis=1, keepdims=True) + 1e-12
     dirs_proj = dirs_proj / norms
 
-    # Rotate into camera frame (R maps projector → camera)
+    # Rotate into camera frame (R maps projector -> camera).
     dirs_cam = (R.astype(np.float64) @ dirs_proj.T).T
     norms_cam = np.linalg.norm(dirs_cam, axis=1, keepdims=True) + 1e-12
     return (dirs_cam / norms_cam).astype(np.float32)
 
 
-# =====================================================================
-# Triangulation
-# =====================================================================
+# --- Triangulation ---
 
 def triangulate_rays(rays_cam: np.ndarray, rays_proj_cam: np.ndarray, T: np.ndarray):
     """
@@ -420,51 +437,49 @@ def triangulate_rays(rays_cam: np.ndarray, rays_proj_cam: np.ndarray, T: np.ndar
     Points where the ray parameters are invalid (s<=0 or t<=0) or rays are near-parallel
     are marked as NaN.
     """
-    N = rays_cam.shape[0]
+    a = rays_cam.astype(np.float64)
+    b = rays_proj_cam.astype(np.float64)
+    T = T.astype(np.float64).reshape(3)
+    N = a.shape[0]
+
     points = np.full((N, 3), np.nan, dtype=np.float32)
     errors = np.full((N,), np.nan, dtype=np.float32)
     s_params = np.full((N,), np.nan, dtype=np.float32)
     t_params = np.full((N,), np.nan, dtype=np.float32)
 
-    for i in range(N):
-        a = rays_cam[i]
-        b = rays_proj_cam[i]
-        p0 = np.zeros(3, dtype=np.float32)
-        p1 = T.astype(np.float32)
+    a_dot_a = np.einsum("ij,ij->i", a, a)
+    b_dot_b = np.einsum("ij,ij->i", b, b)
+    a_dot_b = np.einsum("ij,ij->i", a, b)
+    denom = a_dot_a * b_dot_b - a_dot_b * a_dot_b
+    valid = np.abs(denom) >= 1e-9
+    if not np.any(valid):
+        return points, errors, s_params, t_params
 
-        a_dot_a = np.dot(a, a)
-        b_dot_b = np.dot(b, b)
-        a_dot_b = np.dot(a, b)
-        denom = a_dot_a * b_dot_b - a_dot_b * a_dot_b
-        if np.abs(denom) < 1e-9:
-            continue  # nearly parallel
+    r = -T
+    a_dot_r = a @ r
+    b_dot_r = b @ r
 
-        r = p0 - p1
-        a_dot_r = np.dot(a, r)
-        b_dot_r = np.dot(b, r)
+    s = (a_dot_b * b_dot_r - b_dot_b * a_dot_r) / denom
+    t = (a_dot_a * b_dot_r - a_dot_b * a_dot_r) / denom
+    s_params[valid] = s[valid].astype(np.float32)
+    t_params[valid] = t[valid].astype(np.float32)
 
-        s = (a_dot_b * b_dot_r - b_dot_b * a_dot_r) / denom
-        t = (a_dot_a * b_dot_r - a_dot_b * a_dot_r) / denom
-        s_params[i] = float(s)
-        t_params[i] = float(t)
+    valid &= (s > 0.0) & (t > 0.0)
+    if not np.any(valid):
+        return points, errors, s_params, t_params
 
-        if s <= 0.0 or t <= 0.0:
-            continue
+    p_cam = a[valid] * s[valid][:, None]
+    p_proj = T[None, :] + b[valid] * t[valid][:, None]
+    midpoint = 0.5 * (p_cam + p_proj)
+    err = np.linalg.norm(p_cam - p_proj, axis=1)
 
-        p_cam = p0 + s * a
-        p_proj = p1 + t * b
-        midpoint = 0.5 * (p_cam + p_proj)
-        err = np.linalg.norm(p_cam - p_proj)
-
-        points[i] = midpoint.astype(np.float32)
-        errors[i] = float(err)
+    points[valid] = midpoint.astype(np.float32)
+    errors[valid] = err.astype(np.float32)
 
     return points, errors, s_params, t_params
 
 
-# =====================================================================
-# Point cloud output
-# =====================================================================
+# --- Point cloud output ---
 
 def save_point_cloud_ply(filename: str | Path, points: np.ndarray, colors: np.ndarray | None = None):
     """
@@ -522,13 +537,11 @@ def save_mesh_obj(filename: str | Path, vertices: np.ndarray, faces: List[Tuple[
         for v in vertices:
             f.write(f"v {v[0]} {v[1]} {v[2]}\n")
         for tri in faces:
-            # OBJ indices are 1-based
+            # OBJ indices are 1-based.
             f.write(f"f {tri[0] + 1} {tri[1] + 1} {tri[2] + 1}\n")
 
 
-# =====================================================================
-# Reconstruction pipeline
-# =====================================================================
+# --- Reconstruction pipeline ---
 
 def reconstruct_3d_from_scan(scan_dir: str, proj_size: Tuple[int, int], color_path: str | Path | None = None):
     """
@@ -565,7 +578,7 @@ def reconstruct_3d_from_scan(scan_dir: str, proj_size: Tuple[int, int], color_pa
     if cam_uv.size == 0:
         raise ValueError("No valid pixels for reconstruction.")
 
-    # Load camera intrinsics (and enforce resolution consistency)
+    # Load camera intrinsics and enforce resolution consistency.
     allow_rescale = os.getenv("ALLOW_INTRINSIC_RESCALE", "0") == "1"
     Kc_file, dist_file, calib_size = load_camera_intrinsics()
     Kc, dist, _ = prepare_intrinsics_for_image(
@@ -581,7 +594,7 @@ def reconstruct_3d_from_scan(scan_dir: str, proj_size: Tuple[int, int], color_pa
     if stereo is not None:
         R_st, T_st, Kc_s, dist_s, Kp_st, dp_st, stereo_rms, _ = stereo
         # Stereo params store camera intrinsics too. The file does not store camera image_size,
-        # so we treat camera_intrinsics.npz's image_size as the reference calibration size.
+        # so treat camera_intrinsics.npz's image_size as the reference calibration size.
         Kc, dist, _ = prepare_intrinsics_for_image(
             Kc_s, dist_s, calib_size, scan_size, allow_rescale=allow_rescale, label="stereo camera"
         )
@@ -609,8 +622,8 @@ def reconstruct_3d_from_scan(scan_dir: str, proj_size: Tuple[int, int], color_pa
         R_st, T_st = get_fake_extrinsics()
         using_fake = True
 
-    # stereo_params.npz already stores projector->camera extrinsics.
-    # Do NOT invert or flip here.
+    # stereo_params.npz already stores projector-to-camera extrinsics.
+    # Do not invert or flip here.
     R = R_st
     T = T_st
 
@@ -634,6 +647,7 @@ def reconstruct_3d_from_scan(scan_dir: str, proj_size: Tuple[int, int], color_pa
         proj_norm = proj_uv
 
     def _dirs_from_norm(norm_xy: np.ndarray) -> np.ndarray:
+        """Convert normalized image coordinates into unit ray directions."""
         dirs = np.hstack([norm_xy, np.ones((norm_xy.shape[0], 1), dtype=np.float64)])
         norms = np.linalg.norm(dirs, axis=1, keepdims=True) + 1e-12
         return (dirs / norms).astype(np.float32)
@@ -646,13 +660,14 @@ def reconstruct_3d_from_scan(scan_dir: str, proj_size: Tuple[int, int], color_pa
 
     points, errors, s_params, t_params = triangulate_rays(rays_cam, rays_proj_cam, T)
 
-    # Basic validity diagnostics
+    # Basic validity diagnostics.
     z_vals = points[:, 2]
     finite_pts = np.isfinite(points).all(axis=1)
     def neighbor_jump_stats(arr: np.ndarray, mask_in: np.ndarray, thresh: float = 20.0):
-        # right and down neighbors
+        """Compute the percentage of neighbor jumps above a threshold."""
+        # Right and down neighbors.
         mask = mask_in & np.isfinite(arr)
-        # right
+        # Right.
         mr = mask[:, :-1] & mask[:, 1:]
         vr = np.abs(arr[:, :-1] - arr[:, 1:])[mr]
         md = mask[:-1, :] & mask[1:, :]
@@ -670,7 +685,7 @@ def reconstruct_3d_from_scan(scan_dir: str, proj_size: Tuple[int, int], color_pa
         print(f"[RECON] UV range u:{np.nanmin(u_map):.2f}-{np.nanmax(u_map):.2f} v:{np.nanmin(v_map):.2f}-{np.nanmax(v_map):.2f}")
         print(f"[RECON] Depth stats (m): min={np.nanmin(z_valid):.3f}, max={np.nanmax(z_valid):.3f}, mean={np.nanmean(z_valid):.3f}, %Z>0={pos_frac*100:.1f}%")
         print(f"[RECON] Ray intersection error (m): mean={np.nanmean(err_valid):.4f}, median={np.nanmedian(err_valid):.4f}, max={np.nanmax(err_valid):.4f}")
-        # Angle between camera and projector rays (should vary, nonzero)
+        # Angle between camera and projector rays (should vary, nonzero).
         dots = np.einsum("ij,ij->i", rays_cam[finite_pts], rays_proj_cam[finite_pts])
         dots = np.clip(dots, -1.0, 1.0)
         angles = np.rad2deg(np.arccos(dots))
@@ -709,7 +724,7 @@ def reconstruct_3d_from_scan(scan_dir: str, proj_size: Tuple[int, int], color_pa
 
     save_point_cloud_ply(scan_dir / f"points_{suffix}.ply", points, colors=colors)
 
-    # Filter points by triangulation error
+    # Filter points by triangulation error.
     errors_finite = errors[np.isfinite(errors)]
     med_err = float(np.nanmedian(errors_finite)) if errors_finite.size > 0 else float("nan")
     err_cap = None
@@ -749,8 +764,8 @@ def reconstruct_3d_from_scan(scan_dir: str, proj_size: Tuple[int, int], color_pa
     )
     save_point_cloud_ply(scan_dir / "points_filtered.ply", points_filtered, colors=colors_filtered)
 
-    # Build single-view mesh (2.5D) from filtered points
-    mesh_stride = 1  # increase if Pi performance is constrained
+    # Build single-view mesh (2.5D) from filtered points.
+    mesh_stride = 1  # Increase if Pi performance is constrained.
     idx_map = -np.ones((H, W), dtype=np.int32)
     if points_filtered.size > 0:
         idx_map[ys_valid[keep].astype(int), xs_valid[keep].astype(int)] = np.arange(points_filtered.shape[0], dtype=np.int32)
@@ -770,7 +785,7 @@ def reconstruct_3d_from_scan(scan_dir: str, proj_size: Tuple[int, int], color_pa
     save_mesh_ply(scan_dir / "mesh_single_view.ply", points_filtered, faces)
     save_mesh_obj(scan_dir / "mesh_single_view.obj", points_filtered, faces)
 
-    # Diagnostics summary
+    # Diagnostics summary.
     mask_quality_pct = float(100.0 * np.count_nonzero(mask_used) / mask_used.size)
     u_vals = u_map[valid]
     v_vals = v_map[valid]

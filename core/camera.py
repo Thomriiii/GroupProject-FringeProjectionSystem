@@ -1,13 +1,10 @@
 """
 camera.py
 
-Camera setup and auto-exposure routines for structured light scanning.
+Camera setup and auto-exposure routines for structured-light scanning.
 
-This version includes:
-  - Picamera2 initialization
-  - Grayscale/RGB capture helpers
-  - Automatic object detection to determine the AE region
-  - AE routine that locks exposure based on the detected object only
+This module wraps Picamera2, provides RGB/gray capture helpers, and implements
+an auto-exposure routine that targets the object region using a mid-grey frame.
 """
 
 from __future__ import annotations
@@ -21,20 +18,26 @@ from picamera2 import Picamera2
 
 class CameraController:
     """
-    Wrapper for Picamera2 providing:
-      - video configuration
-      - automatic, object-focused AE using mid-grey projection
-      - safe frame capture
+    Wrapper for Picamera2 providing video configuration, capture helpers,
+    and object-focused auto exposure.
     """
 
-    # =====================================================================
-    # INITIALIZATION
-    # =====================================================================
     def __init__(self,
                  size_main=(1280, 720),
                  size_lores=(640, 480),
                  framerate=30):
+        """
+        Configure and start Picamera2 with main and low-res streams.
 
+        Parameters
+        ----------
+        size_main : tuple[int, int]
+            Resolution for the main RGB stream.
+        size_lores : tuple[int, int]
+            Resolution for the low-res YUV stream (unused but available).
+        framerate : int
+            Target capture frame rate.
+        """
         self.picam2 = Picamera2()
         self.camera_lock = threading.Lock()
         self.size_main = tuple(int(x) for x in size_main)
@@ -53,9 +56,7 @@ class CameraController:
 
         time.sleep(0.5)
 
-        # Verify that the configured stream sizes are actually what we receive.
-        # If Picamera2 changes sensor mode / crop / scaler, image dimensions may
-        # silently change and invalidate camera calibration.
+        # Verify the stream size to avoid silent calibration mismatches.
         test = self.capture_rgb()
         h, w = test.shape[:2]
         exp_w, exp_h = self.size_main
@@ -67,12 +68,15 @@ class CameraController:
 
         print(f"[CAMERA] Picamera2 initialized. main={w}x{h}, lores={self.size_lores[0]}x{self.size_lores[1]}")
 
-    # =====================================================================
-    # FRAME CAPTURE
-    # =====================================================================
-
     def capture_rgb(self) -> np.ndarray:
-        """Capture RGB frame from main stream."""
+        """
+        Capture an RGB frame from the main stream.
+
+        Returns
+        -------
+        ndarray
+            RGB image as a numpy array.
+        """
         with self.camera_lock:
             frame = self.picam2.capture_array("main")
         # Safety check: prevent silent resolution changes mid-run.
@@ -86,44 +90,39 @@ class CameraController:
         return frame
 
     def capture_gray(self) -> np.ndarray:
-        """Capture grayscale frame."""
+        """
+        Capture a grayscale frame derived from the RGB stream.
+        """
         frame = self.capture_rgb()
         return cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
 
-    # =====================================================================
-    # OBJECT DETECTION (for AE region)
-    # =====================================================================
-
     def _detect_object_roi(self, gray: np.ndarray):
         """
-        Detect the object in the scene using simple thresholding + contours.
+        Detect the object in the scene using thresholding and contours.
 
         Returns
         -------
-        (x0, y0, x1, y1) bounding box of detected object,
-        or None if detection fails.
+        tuple[int, int, int, int] or None
+            (x0, y0, x1, y1) bounding box, or None if detection fails.
         """
-
-        H, W = gray.shape
-
-        # Normalize slightly to reduce noise
+        # Blur to reduce noise before thresholding.
         blur = cv2.GaussianBlur(gray, (7, 7), 0)
 
-        # Otsu threshold (adaptive)
+        # Otsu threshold to segment the bright region.
         _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-        # Find contours
+        # Find contours.
         contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         if not contours:
             print("[CAMERA-AE] No object contours detected.")
             return None
 
-        # Pick largest contour (assumed to be object)
+        # Pick the largest contour and treat it as the object.
         cnt = max(contours, key=cv2.contourArea)
         area = cv2.contourArea(cnt)
 
-        if area < 500:  # too small
+        if area < 500:  # Too small to be a reliable target.
             print("[CAMERA-AE] Object contour found but too small.")
             return None
 
@@ -132,10 +131,6 @@ class CameraController:
         print(f"[CAMERA-AE] Object detected: x={x}, y={y}, w={w}, h={h}")
 
         return (x, y, x + w, y + h)
-
-    # =====================================================================
-    # AUTO EXPOSURE WITH OBJECT DETECTION
-    # =====================================================================
 
     def auto_expose_with_midgrey(
         self,
@@ -154,27 +149,26 @@ class CameraController:
           2. Enable AE/AWB
           3. Detect object bounding box
           4. Use bounding box as AE area
-          5. If detection fails → use central ROI
+          5. If detection fails, use a central ROI
           6. Lock AE/AWB off after convergence
         """
-
         print("[CAMERA-AE] Starting auto exposure (object-detected region)...")
 
-        # Step 1: project mid-grey frame
+        # Step 1: project mid-grey frame.
         set_midgrey_surface_callback()
         time.sleep(0.4)
 
-        # Step 2: enable AE/AWB
+        # Step 2: enable AE/AWB.
         self.picam2.set_controls({"AeEnable": True, "AwbEnable": True})
 
-        # Capture a frame for object detection
+        # Capture a frame for object detection.
         gray_init = self.capture_gray()
         H, W = gray_init.shape
 
-        # Try to detect object
+        # Try to detect the object.
         roi = self._detect_object_roi(gray_init)
 
-        # If detection fails → fallback to center region
+        # If detection fails, fall back to a central ROI.
         if roi is None:
             roi_w = int(W * fallback_roi_frac)
             roi_h = int(H * fallback_roi_frac)
@@ -188,7 +182,7 @@ class CameraController:
             x0, y0, x1, y1 = roi
             print(f"[CAMERA-AE] Using detected object ROI: {x0}:{x1}, {y0}:{y1}")
 
-        # Step 3: iterative AE adjustment
+        # Step 3: iterative AE adjustment.
         for i in range(max_iters):
             time.sleep(settle_time)
             gray = self.capture_gray()
@@ -200,14 +194,14 @@ class CameraController:
             if abs(mean_val - target_mean) < tolerance:
                 break
 
-        # Step 4: read AE settings
+        # Step 4: read AE settings.
         md = self.picam2.capture_metadata()
         exposure_us = md.get("ExposureTime")
         analogue_gain = md.get("AnalogueGain")
 
-        print(f"[CAMERA-AE] AE settled → Exposure={exposure_us}us Gain={analogue_gain:.3f}")
+        print(f"[CAMERA-AE] AE settled: Exposure={exposure_us}us Gain={analogue_gain:.3f}")
 
-        # Step 5: lock exposure and AWB
+        # Step 5: lock exposure and AWB.
         self.picam2.set_controls({
             "AeEnable": False,
             "AwbEnable": False,
@@ -220,4 +214,3 @@ class CameraController:
         print("[CAMERA-AE] Exposure locked (object-focused).")
 
         return exposure_us, analogue_gain
-# EOF

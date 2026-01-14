@@ -4,8 +4,7 @@ graycode.py
 Binary GrayCode pattern generation and decoding for projector calibration.
 
 This module generates bitwise GrayCode patterns (with inverted pairs) for both
-projector axes and decodes a captured sequence into projector pixel
-coordinates.
+projector axes and decodes a captured sequence into projector pixel coordinates.
 """
 
 from __future__ import annotations
@@ -21,16 +20,18 @@ import pygame
 
 @dataclass
 class GrayPattern:
-    axis: str               # "u" or "v"
-    bit: int                # bit index (0 = MSB)
+    """Single GrayCode pattern frame and its metadata."""
+    axis: str               # "u" or "v".
+    bit: int                # Bit index (0 = MSB).
     inverted: bool
     surface: pygame.Surface
-    raw: np.ndarray         # float32 0..1
+    raw: np.ndarray         # float32 in [0..1].
     name: str
 
 
 @dataclass
 class GrayCodeSet:
+    """Collection of GrayCode patterns plus projector metadata."""
     width: int
     height: int
     bits_u: int
@@ -39,6 +40,7 @@ class GrayCodeSet:
 
 
 def _gray_encode(n: np.ndarray) -> np.ndarray:
+    """Convert integer values to Gray code."""
     return n ^ (n >> 1)
 
 
@@ -56,6 +58,7 @@ def _make_bit_planes(length: int, bits: int) -> np.ndarray:
 
 
 def _apply_gamma(img: np.ndarray, gamma: float | None) -> np.ndarray:
+    """Apply optional gamma compensation to a linear [0..1] image."""
     if gamma is None:
         return img
     eps = 1e-6
@@ -99,7 +102,7 @@ def generate_graycode_patterns(
 
     patterns_list: List[GrayPattern] = []
 
-    # U direction (horizontal codes varying along x)
+    # U direction (horizontal codes varying along x).
     for b in range(bits_u):
         base = np.tile(planes_u[b][None, :], (height, 1)).astype(np.float32)
         mask = base * brightness_scale
@@ -110,7 +113,7 @@ def generate_graycode_patterns(
         surf_inv, raw_inv = _make_surface_from_mask(mask_inv, gamma_proj)
         patterns_list.append(GrayPattern(axis="u", bit=b, inverted=True, surface=surf_inv, raw=raw_inv, name=f"u_b{b:02d}_neg"))
 
-    # V direction (vertical codes varying along y)
+    # V direction (vertical codes varying along y).
     for b in range(bits_v):
         base = np.tile(planes_v[b][:, None], (1, width)).astype(np.float32)
         mask = base * brightness_scale
@@ -191,7 +194,7 @@ def decode_graycode(
 
     frames_f = [f.astype(np.float32) for f in frames]
 
-    # Group by axis/bit
+    # Group by axis/bit.
     normals_u = [None] * pattern_set.bits_u
     inverses_u = [None] * pattern_set.bits_u
     normals_v = [None] * pattern_set.bits_v
@@ -210,6 +213,7 @@ def decode_graycode(
                 normals_v[pat.bit] = frame
 
     def _decode_axis(normals, inverses, bits, axis_name):
+        """Decode GrayCode for one axis (u or v)."""
         if bits == 0:
             return (
                 np.zeros((H, W), dtype=np.float32),

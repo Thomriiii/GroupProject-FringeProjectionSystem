@@ -2,17 +2,11 @@
 """
 check_resolution_consistency.py
 
-Verify that camera calibration resolution matches the images used for scanning / reconstruction.
+Verify that camera calibration resolution matches the images used for scanning or reconstruction.
 
-This is intentionally strict: geometric reconstruction assumes camera intrinsics correspond to the
-actual pixel grid being used. Cropping/ROI, rotation, or resizing without rescaling intrinsics
-will produce warped/streaky point clouds even if ray intersection errors look small.
-
-Examples
---------
-  python3 tools/check_resolution_consistency.py --camera camera_intrinsics.npz
-  python3 tools/check_resolution_consistency.py --scan-dir scans/20251218_120000
-  python3 tools/check_resolution_consistency.py --calib-dir calib/camera/session_20251218_104610
+This check is intentionally strict: geometric reconstruction assumes camera intrinsics correspond
+to the pixel grid being used. Cropping, rotation, or resizing without rescaling intrinsics will
+produce warped or streaky point clouds even if ray intersection errors look small.
 """
 
 from __future__ import annotations
@@ -25,6 +19,9 @@ import numpy as np
 
 
 def _load_camera_intrinsics(path: Path) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
+    """
+    Load camera intrinsics from an NPZ file.
+    """
     data = np.load(path)
     K = data["K"]
     dist = data["dist"]
@@ -33,6 +30,9 @@ def _load_camera_intrinsics(path: Path) -> Tuple[np.ndarray, np.ndarray, Tuple[i
 
 
 def _find_first_image(path: Path) -> Path | None:
+    """
+    Return the first image file found in a directory, if any.
+    """
     exts = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
     for p in sorted(path.glob("*")):
         if p.suffix.lower() in exts:
@@ -41,6 +41,9 @@ def _find_first_image(path: Path) -> Path | None:
 
 
 def _shape_of_npy(path: Path) -> Tuple[int, int] | None:
+    """
+    Return (width, height) for an array stored in an NPY file.
+    """
     try:
         arr = np.load(path)
     except Exception:
@@ -52,6 +55,9 @@ def _shape_of_npy(path: Path) -> Tuple[int, int] | None:
 
 
 def _shape_of_image(path: Path) -> Tuple[int, int] | None:
+    """
+    Return (width, height) for an image file if OpenCV is available.
+    """
     try:
         import cv2
     except Exception:
@@ -66,6 +72,9 @@ def _shape_of_image(path: Path) -> Tuple[int, int] | None:
 
 
 def _collect_shapes_calib(calib_dir: Path) -> Iterable[Tuple[Path, Tuple[int, int] | None]]:
+    """
+    Yield image files and their shapes from a calibration directory.
+    """
     exts = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
     for p in sorted(calib_dir.glob("*")):
         if p.is_file() and p.suffix.lower() in exts:
@@ -73,6 +82,9 @@ def _collect_shapes_calib(calib_dir: Path) -> Iterable[Tuple[Path, Tuple[int, in
 
 
 def main() -> int:
+    """
+    CLI entry point for resolution consistency checks.
+    """
     ap = argparse.ArgumentParser()
     ap.add_argument("--camera", type=Path, default=Path("camera_intrinsics.npz"), help="camera intrinsics npz path")
     ap.add_argument("--scan-dir", type=Path, default=None, help="scan output directory (contains proj_u.npy/proj_v.npy)")

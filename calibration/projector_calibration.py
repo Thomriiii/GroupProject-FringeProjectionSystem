@@ -1,7 +1,7 @@
 """
 projector_calibration.py
 
-Projector intrinsic + stereo calibration using decoded GrayCode correspondences.
+Projector intrinsics and stereo calibration using decoded GrayCode correspondences.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ ImageSize = Tuple[int, int]
 
 @dataclass
 class PoseData:
+    """Decoded projector pose data for a single checkerboard view."""
     name: str
     object_points: np.ndarray      # Nx3 float32
     cam_points: np.ndarray         # Nx2 float32
@@ -32,6 +33,7 @@ class PoseData:
 
 @dataclass
 class CalibrationOutputs:
+    """Projector intrinsics and stereo calibration outputs."""
     Kp: np.ndarray
     dist_p: np.ndarray
     image_size_proj: ImageSize
@@ -45,6 +47,9 @@ class CalibrationOutputs:
 
 
 def _load_pose_file(path: Path) -> PoseData | None:
+    """
+    Load a single pose_data.npz file and return a PoseData instance.
+    """
     data = np.load(path)
     required = ["object_points", "image_points_cam", "image_points_proj"]
     if not all(k in data for k in required):
@@ -75,6 +80,9 @@ def _load_pose_file(path: Path) -> PoseData | None:
 
 
 def load_session_poses(session_dir: Path) -> Tuple[List[PoseData], ImageSize | None, ImageSize | None]:
+    """
+    Load all pose datasets in a session directory.
+    """
     pose_files = sorted(session_dir.glob("pose_*/pose_data.npz"))
     poses: List[PoseData] = []
     image_size_cam = None
@@ -97,6 +105,9 @@ def calibrate_projector_intrinsics(
     poses: List[PoseData],
     image_size_proj: ImageSize,
 ) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], List[np.ndarray], float, List[float], List[PoseData], List[str]]:
+    """
+    Calibrate projector intrinsics from valid pose correspondences.
+    """
     obj_points = []
     proj_points = []
     used_poses: List[PoseData] = []
@@ -136,6 +147,9 @@ def stereo_calibrate(
     dist_p: np.ndarray,
     image_size_cam: ImageSize,
 ) -> Tuple[np.ndarray, np.ndarray, float]:
+    """
+    Run stereo calibration to estimate projector pose in camera coordinates.
+    """
     obj_points = []
     cam_points = []
     proj_points = []
@@ -173,6 +187,9 @@ def write_report(
     path: Path,
     calib: CalibrationOutputs,
 ) -> None:
+    """
+    Write a human-readable projector calibration report.
+    """
     lines = []
     lines.append("Projector + Stereo Calibration Report\n")
     lines.append(f"Projector image size: {calib.image_size_proj[0]} x {calib.image_size_proj[1]}\n")
@@ -199,6 +216,9 @@ def run_from_session(
     min_views: int = 6,
     max_proj_error: float | None = 2.0,
 ) -> CalibrationOutputs:
+    """
+    Load a calibration session, solve projector intrinsics, then stereo extrinsics.
+    """
     session_dir = Path(session_dir)
     if not session_dir.exists():
         raise FileNotFoundError(f"Session directory not found: {session_dir}")
@@ -226,7 +246,7 @@ def run_from_session(
         for r in rejected:
             print(f"  - {r}")
 
-    # Optional rejection of high-error views
+    # Optional rejection of high-error views.
     if max_proj_error is not None:
         keep_mask = [err <= max_proj_error for err in per_view_err]
         if not all(keep_mask) and any(keep_mask):
@@ -252,12 +272,12 @@ def run_from_session(
         image_size_cam=image_size_cam,
     )
 
-    # Convert cam->proj to proj->cam (for reconstruction)
+    # Convert cam-to-proj into proj-to-cam for reconstruction.
     R_proj_to_cam = R_cam_to_proj.T
     T_proj_to_cam = -R_proj_to_cam @ T_cam_to_proj
     baseline = float(np.linalg.norm(T_proj_to_cam))
 
-    # Compute coverage bbox for reference
+    # Compute coverage bbox for reference.
     all_proj = np.vstack([p.proj_points for p in poses_used if len(p.proj_points)])
     uv_bbox = np.array([
         float(np.min(all_proj[:, 0])),
@@ -266,7 +286,7 @@ def run_from_session(
         float(np.max(all_proj[:, 1])),
     ], dtype=np.float32)
 
-    # Save intrinsics
+    # Save intrinsics.
     intr_path = session_dir / "projector_intrinsics.npz"
     np.savez_compressed(
         intr_path,
