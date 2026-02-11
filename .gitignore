@@ -1,7 +1,6 @@
-# Ignore generated scan data and large binary outputs
-scans/
-**/scans/
-calib/
-**/calib/
+data/
+logs/
 __pycache__/
-**/__pycache__/
+.venv/
+*.zip
+mock_data/

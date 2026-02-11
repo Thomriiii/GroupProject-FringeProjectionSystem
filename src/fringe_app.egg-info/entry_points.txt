@@ -1,0 +1,2 @@
+[console_scripts]
+fringe-app = fringe_app.__main__:main

@@ -1,0 +1,43 @@
+web:
+  host: 0.0.0.0
+  port: 8000
+
+display:
+  fullscreen: true
+  screen_index: null
+  driver: kmsdrm  # set to kmsdrm, wayland, or x11 to avoid EGL issues
+
+camera:
+  type: picamera2
+  mock_data: mock_data
+  lores_yuv_format: nv12  # nv12 or i420
+  lores_uv_swap: false
+
+scan:
+  n_steps: 4
+  frequency: 8.0
+  orientation: vertical
+  brightness: 1.0
+  brightness_offset: 0.5
+  contrast: 1.0
+  width: 1024
+  height: 768
+  settle_ms: 50
+  save_patterns: false
+  preview_fps: 10.0
+  phase_convention: "atan2(-S,C)"
+  exposure_us: null
+  analogue_gain: null
+  awb_mode: null
+  awb_enable: null
+  iso: null
+
+phase:
+  sat_low: 5
+  sat_high: 250
+  B_thresh: 10
+  A_min: 0
+  debug_percentiles: [1, 99]
+
+storage:
+  run_root: data/runs

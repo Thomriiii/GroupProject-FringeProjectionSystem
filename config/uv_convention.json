@@ -1,5 +1,0 @@
-{
-  "transform": "swap_flip_u",
-  "note": "Chosen by minimizing ray intersection error on testdata/20251217_160109. If your setup differs, run with DIAGNOSE_PROJ_UV_TRANSFORM=1 to evaluate candidates."
-}
-

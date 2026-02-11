@@ -1,3 +1,18 @@
+Metadata-Version: 2.4
+Name: fringe_app
+Version: 0.1.0
+Summary: Minimal fringe projection capture system
+Author: Fringe App
+License: MIT
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: fastapi>=0.111
+Requires-Dist: uvicorn>=0.29
+Requires-Dist: numpy>=1.24
+Requires-Dist: pygame>=2.5
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: pillow>=10.0
+
 # Fringe App
 
 Minimal fringe projection capture system for Raspberry Pi using pygame for projector output and FastAPI for control.
