@@ -14,7 +14,7 @@ from fringe_app.core.models import ScanParams
 class Picamera2Camera(CameraBase):
     """Camera wrapper using Picamera2/libcamera."""
 
-    def __init__(self, lores_yuv_format: str = "nv12", lores_uv_swap: bool = False) -> None:
+    def __init__(self, lores_yuv_format: str = "i420", lores_uv_swap: bool = False) -> None:
         try:
             from picamera2 import Picamera2  # type: ignore
         except Exception as exc:
@@ -32,6 +32,28 @@ class Picamera2Camera(CameraBase):
 
     def set_exposure(self, exposure_us: int | None) -> None:
         self._exposure_us = exposure_us
+
+    def set_manual_controls(self, exposure_us: int, analogue_gain: float, awb_enable: bool = False) -> None:
+        if self._cam is None:
+            return
+        controls = {
+            "AeEnable": False,
+            "ExposureTime": int(exposure_us),
+            "AnalogueGain": float(analogue_gain),
+            "AwbEnable": bool(awb_enable),
+        }
+        try:
+            self._cam.set_controls(controls)
+        except Exception:
+            return
+        self._applied_controls.update(controls)
+        try:
+            md = self._cam.capture_metadata()
+            for k in ("ExposureTime", "AnalogueGain", "AeEnable", "AwbEnable"):
+                if k in md:
+                    self._applied_controls[f"actual_{k}"] = md[k]
+        except Exception:
+            pass
 
     def start(self, params: ScanParams) -> None:
         if self._cam is not None:
@@ -57,11 +79,17 @@ class Picamera2Camera(CameraBase):
         self._cam.start()
         time.sleep(0.2)
         controls = {}
-        if self._exposure_us is not None:
-            controls["ExposureTime"] = int(self._exposure_us)
+        requested_exposure = params.exposure_us if params.exposure_us is not None else self._exposure_us
+        requested_gain = params.analogue_gain
+        if params.ae_enable is not None:
+            controls["AeEnable"] = bool(params.ae_enable)
+        if requested_exposure is not None or requested_gain is not None:
+            # Manual exposure/gain implies deterministic AE-off capture.
             controls["AeEnable"] = False
-        if params.analogue_gain is not None:
-            controls["AnalogueGain"] = float(params.analogue_gain)
+        if requested_exposure is not None:
+            controls["ExposureTime"] = int(requested_exposure)
+        if requested_gain is not None:
+            controls["AnalogueGain"] = float(requested_gain)
         if params.awb_enable is not None:
             controls["AwbEnable"] = bool(params.awb_enable)
         if params.awb_mode is not None:
@@ -73,7 +101,14 @@ class Picamera2Camera(CameraBase):
                 self._cam.set_controls(controls)
             except Exception:
                 pass
-        self._applied_controls = controls
+        self._applied_controls = dict(controls)
+        try:
+            md = self._cam.capture_metadata()
+            for k in ("ExposureTime", "AnalogueGain", "AeEnable", "AwbEnable"):
+                if k in md:
+                    self._applied_controls[f"actual_{k}"] = md[k]
+        except Exception:
+            pass
 
     def capture_pair(self) -> tuple[np.ndarray, np.ndarray]:
         if self._cam is None:
@@ -108,11 +143,16 @@ class Picamera2Camera(CameraBase):
         if height is not None:
             h = min(h, height)
         y = yuv[:h, :w]
-        uv = yuv[h:h + h // 2, :w].reshape((h // 2, w))
         if yuv_format == "i420":
-            u = uv[:, :w // 2]
-            v = uv[:, w // 2:]
+            # I420 is planar in bytes: Y (h*w), then U (h/2*w/2), then V (h/2*w/2).
+            uv_bytes = yuv[h:, :w].reshape(-1)
+            plane_size = (h // 2) * (w // 2)
+            if uv_bytes.size < 2 * plane_size:
+                raise ValueError("I420 buffer too small for expected UV planes")
+            u = uv_bytes[:plane_size].reshape((h // 2, w // 2))
+            v = uv_bytes[plane_size:2 * plane_size].reshape((h // 2, w // 2))
         elif yuv_format == "nv12":
+            uv = yuv[h:h + h // 2, :w].reshape((h // 2, w))
             u = uv[:, 0::2]
             v = uv[:, 1::2]
         else:

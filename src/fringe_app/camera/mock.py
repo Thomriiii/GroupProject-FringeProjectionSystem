@@ -42,3 +42,6 @@ class MockCamera(CameraBase):
 
     def get_applied_controls(self) -> dict:
         return {}
+
+    def set_manual_controls(self, exposure_us: int, analogue_gain: float, awb_enable: bool = False) -> None:
+        return None

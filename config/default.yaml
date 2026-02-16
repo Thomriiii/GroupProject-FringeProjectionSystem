@@ -10,34 +10,160 @@ display:
 camera:
   type: picamera2
   mock_data: mock_data
-  lores_yuv_format: nv12  # nv12 or i420
+  lores_yuv_format: i420  # nv12 or i420
   lores_uv_swap: false
 
 scan:
-  n_steps: 4
-  frequency: 8.0
+  n_steps_fast: 4
+  n_steps_stable: 8
+  mode: stable
+  n_steps: 8
+  frequencies: [1.0, 4.0, 16.0]
+  frequency_semantics: cycles_across_dimension
   orientation: vertical
   brightness: 1.0
-  brightness_offset: 0.5
-  contrast: 1.0
   width: 1024
   height: 768
-  settle_ms: 50
+  settle_ms: 150
+  settle_ms_first_step: 350
+  settle_ms_freq_switch: 350
+  freq_switch_warmup_ms: 250
+  flush_frames_per_step: 1
+  flush_frames_on_freq_switch: 2
+  max_freq_retries: 2
+  step_sanity:
+    min_step_mean_dn: 5.0
+    min_step_mean_ratio: 0.15
+    max_step_mean_ratio: 2.50
+    low_light_dn: 20.0
+    min_step_mean_dn_low_light: 1.0
+    use_center_patch: true
+    center_patch_frac: 0.30
   save_patterns: false
   preview_fps: 10.0
   phase_convention: "atan2(-S,C)"
-  exposure_us: null
-  analogue_gain: null
+  exposure_us: 2000
+  analogue_gain: 1.0
   awb_mode: null
-  awb_enable: null
+  awb_enable: false
+  ae_enable: false
   iso: null
 
+patterns:
+  contrast: 0.6
+  brightness_offset: 0.45
+  min_intensity: 0.10
+
 phase:
-  sat_low: 5
+  sat_low: 0
   sat_high: 250
-  B_thresh: 10
-  A_min: 0
+  B_thresh: 7
+  A_min: 15
   debug_percentiles: [1, 99]
+  postmask_cleanup:
+    enabled: true
+    min_component_area: 200
+    fill_small_holes: true
+    max_hole_area: 200
+  masks:
+    defects:
+      enabled: true
+      keep_largest_component: true
+      dilate_radius_px: 3
+      erosion_radius_px: 0
+      fill_small_holes: false
+    display:
+      enabled: true
+      use_b_smooth: true
+      b_smooth_ksize: 5
+      b_thresh_display: 5
+
+unwrap:
+  mask_post:
+    enabled: true
+    keep_largest_component: true
+    closing_radius_px: 3
+    erosion_radius_px: 2
+    min_area_px: 5000
+
+roi:
+  ref_method: "median_over_frames"
+  downscale_max_w: 640
+  blur_ksize: 7
+  black_bg_percentile: 82
+  threshold_offset: 22
+  min_area_ratio: 0.01
+  max_area_ratio: 0.50
+  close_iters: 1
+  open_iters: 2
+  fill_holes: true
+  post:
+    enabled: true
+    keep_largest_component: true
+    fill_small_holes: true
+    max_hole_area: 2000
+    dilate_radius_px: 10
 
 storage:
   run_root: data/runs
+
+polish:
+  target_roi_valid_ratio: 0.95
+  target_roi_largest_component_ratio: 0.90
+  target_roi_edge_noise_ratio: 0.20
+  target_clipped_any_pct_roi: 0.01
+  exposure_us_candidates: [2000, 2500, 3000, 3500]
+  gain_candidates: [1.0, 1.5]
+  contrast_candidates: [0.6, 0.7, 0.8]
+  brightness_offset_candidates: [0.45, 0.50, 0.55]
+  min_intensity_candidates: [0.10, 0.12, 0.15]
+
+quality_gate:
+  max_clipped_any_pct_roi: 0.01
+  max_clipped_step_pct_roi: 0.01
+  max_residual_p95: 0.8
+  min_roi_valid_ratio_high_freq: 0.83
+  min_unwrap_pixels: 3000
+
+uv_gate:
+  enabled: true
+  min_u_range_px: 40
+  min_v_range_px: 40
+  max_edge_pct: 0.10
+  max_zero_pct: 0.01
+  min_valid_ratio: 0.03
+
+quality:
+  residual:
+    p95_threshold_start: 0.8
+    p95_threshold_tight: 0.4
+    p95_threshold_final: 0.2
+    tighten_after_passes: 10
+    final_after_passes: 30
+
+normalise:
+  enabled: true
+  target_A_mean: 120.0
+  target_A_tolerance: 10.0
+  sat_high: 250
+  max_clip_roi: 0.01
+  exposure_min_us: 500
+  gain_min: 1.0
+  exposure_max_safe_us: 4000
+  gain_max_safe: 2.0
+  allow_extend: true
+  exposure_max_extended_us: 12000
+  gain_max_extended: 4.0
+  extend_trigger_roi_mean_dn: 60.0
+  extend_requires_clip_below: 0.0
+  max_iters: 10
+  allow_pattern_adjust: false
+  contrast_min: 0.50
+  contrast_max: 0.70
+  brightness_offset_min: 0.42
+  brightness_offset_max: 0.50
+  min_intensity: 0.10
+  calib_white_dn: 230
+  warmup_ms: 250
+  settle_ms: 200
+  flush_frames: 2

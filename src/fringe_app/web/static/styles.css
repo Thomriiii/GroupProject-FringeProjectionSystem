@@ -25,21 +25,8 @@ header {
   border-radius: 4px;
 }
 
-.controls .row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 12px;
-  margin-bottom: 12px;
-}
-
-label {
-  display: flex;
-  flex-direction: column;
-  font-size: 14px;
-}
-
 .actions {
-  margin-top: 10px;
+  margin: 14px 0;
 }
 
 .preview img {
@@ -54,12 +41,5 @@ label {
 }
 
 .runs li {
-  padding: 6px 0;
-}
-
-.phase-preview {
-  display: block;
-  max-width: 320px;
-  border: 1px solid #ccc;
-  margin-top: 6px;
+  padding: 8px 0;
 }

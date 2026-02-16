@@ -26,6 +26,10 @@ class CameraBase(ABC):
         """Return last applied camera controls/settings."""
         return {}
 
+    def set_manual_controls(self, exposure_us: int, analogue_gain: float, awb_enable: bool = False) -> None:
+        """Optional: lock manual camera controls during runtime."""
+        return None
+
     @abstractmethod
     def stop(self) -> None:
         pass

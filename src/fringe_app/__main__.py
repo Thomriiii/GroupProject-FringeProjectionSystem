@@ -43,11 +43,16 @@ def _create_camera(cfg: dict):
 
 def _default_scan_params(cfg: dict) -> ScanParams:
     scan_cfg = cfg.get("scan", {})
+    pat_cfg = cfg.get("patterns", {})
     width = int(scan_cfg.get("width", 1024))
     height = int(scan_cfg.get("height", 768))
+    frequencies = scan_cfg.get("frequencies")
+    if not frequencies:
+        frequencies = [float(scan_cfg.get("frequency", 8.0))]
     return ScanParams(
         n_steps=int(scan_cfg.get("n_steps", 4)),
-        frequency=float(scan_cfg.get("frequency", 8.0)),
+        frequency=float(frequencies[0]),
+        frequencies=[float(f) for f in frequencies],
         orientation=str(scan_cfg.get("orientation", "vertical")),
         brightness=float(scan_cfg.get("brightness", 1.0)),
         resolution=(width, height),
@@ -59,9 +64,13 @@ def _default_scan_params(cfg: dict) -> ScanParams:
         analogue_gain=scan_cfg.get("analogue_gain"),
         awb_mode=scan_cfg.get("awb_mode"),
         awb_enable=scan_cfg.get("awb_enable"),
+        ae_enable=scan_cfg.get("ae_enable"),
         iso=scan_cfg.get("iso"),
-        brightness_offset=float(scan_cfg.get("brightness_offset", 0.5)),
-        contrast=float(scan_cfg.get("contrast", 1.0)),
+        brightness_offset=float(pat_cfg.get("brightness_offset", scan_cfg.get("brightness_offset", 0.45))),
+        contrast=float(pat_cfg.get("contrast", scan_cfg.get("contrast", 0.6))),
+        min_intensity=float(pat_cfg.get("min_intensity", scan_cfg.get("min_intensity", 0.10))),
+        auto_normalise=bool(scan_cfg.get("auto_normalise", True)),
+        expert_mode=False,
     )
 def main() -> None:
     if len(sys.argv) > 1:

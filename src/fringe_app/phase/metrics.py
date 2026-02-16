@@ -20,6 +20,7 @@ class MaskScore:
     roi_largest_component_ratio: float
     roi_edge_noise_ratio: float
     roi_b_median: float
+    roi_b_p90: float
     roi_score: float
 
 
@@ -106,20 +107,23 @@ def score_mask(
     roi_largest_ratio = largest_ratio
     roi_edge_ratio = edge_ratio
     roi_b_median = b_median
+    roi_b_p90 = b_p90
     roi_score = score
     use_roi_score = False
 
     if roi_mask is not None:
         roi_mask = roi_mask.astype(bool)
         roi_valid = mask & roi_mask
-        roi_area = roi_mask.sum()
+        roi_area = int(roi_mask.sum())
+        roi_valid_count = int(roi_valid.sum())
         if roi_area > 0 and roi_area / float(mask.size) >= 0.01:
-            roi_valid_ratio = float(roi_valid.mean())
-            roi_largest_ratio = float(_largest_component_size(roi_valid) / max(int(roi_valid.sum()), 1))
+            roi_valid_ratio = float(roi_valid_count / max(roi_area, 1))
+            roi_largest_ratio = float(_largest_component_size(roi_valid) / max(roi_valid_count, 1))
             roi_edge_ratio = _edge_noise_ratio(roi_valid)
-            if roi_valid.sum() > 0:
+            if roi_valid_count > 0:
                 roi_vals = B[roi_valid]
                 roi_b_median = float(np.median(roi_vals))
+                roi_b_p90 = float(np.percentile(roi_vals, 90))
             roi_score = (
                 2.0 * clamp(roi_valid_ratio / target_valid_ratio, 0.0, 1.5) +
                 2.0 * roi_largest_ratio +
@@ -141,5 +145,6 @@ def score_mask(
         roi_largest_component_ratio=roi_largest_ratio,
         roi_edge_noise_ratio=roi_edge_ratio,
         roi_b_median=roi_b_median,
+        roi_b_p90=roi_b_p90,
         roi_score=float(roi_score),
     )
