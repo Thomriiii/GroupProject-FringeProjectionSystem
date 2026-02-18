@@ -104,6 +104,30 @@ class ScanController:
                 "ended_at": self._ended_at,
             }
 
+    def capture_single_frame(self, flush_frames: int = 1) -> np.ndarray:
+        """
+        Capture one full-resolution frame while idle.
+        Used by web calibration flow.
+        """
+        with self._lock:
+            if self._state == "RUNNING":
+                raise RuntimeError("Cannot capture calibration frame while scan is running")
+        params = self._preview_params
+        if params is None:
+            raise RuntimeError("Preview camera parameters not initialised")
+        with self._camera_lock:
+            if not self._camera_started:
+                self.camera.start(params)
+                self._camera_started = True
+            for _ in range(max(0, int(flush_frames))):
+                try:
+                    self.camera.capture_pair()
+                except Exception:
+                    break
+            main_frame, preview_frame = self.camera.capture_pair()
+        self.preview.update(preview_frame, run_id=self._run_id or "idle", step=0, total=0)
+        return main_frame
+
     def start_preview_loop(self, params: ScanParams) -> None:
         self._preview_params = params
         if self._preview_thread and self._preview_thread.is_alive():

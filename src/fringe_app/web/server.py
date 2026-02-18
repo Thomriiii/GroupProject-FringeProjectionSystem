@@ -15,7 +15,9 @@ import traceback
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from PIL import Image
 
+from fringe_app.calibration import CalibrationConfig, CalibrationManager
 from fringe_app.core.models import ScanParams
 from fringe_app.core.controller import ScanController
 from fringe_app.io.run_store import RunStore
@@ -35,6 +37,16 @@ class FringeServer:
         self.controller = controller
         self.run_store = run_store
         self.config = config
+        calib_cfg = self.config.get("calibration", {}) or {}
+        self.calibration = CalibrationManager(
+            CalibrationConfig(
+                root=str(calib_cfg.get("root", "data/calibration")),
+                checkerboard_cols=int(calib_cfg.get("checkerboard", {}).get("cols", 9)),
+                checkerboard_rows=int(calib_cfg.get("checkerboard", {}).get("rows", 6)),
+                square_size_mm=float(calib_cfg.get("checkerboard", {}).get("square_size_mm", 25.0)),
+                min_valid_detections=int(calib_cfg.get("min_valid_detections", 10)),
+            )
+        )
         self._pipeline_lock = asyncio.Lock()
         self._pipeline_task: asyncio.Task | None = None
         self._pipeline_state: str = "idle"
@@ -240,6 +252,153 @@ class FringeServer:
                 return FileResponse(first[0])
             return JSONResponse({"error": "capture not found"}, status_code=404)
 
+        @self.app.post("/api/runs/{run_id}/unwrap/compute")
+        async def unwrap_compute(run_id: str):
+            try:
+                params = self._params_from_meta(run_id)
+                freqs = params.get_frequencies()
+                if len(freqs) < 2:
+                    return JSONResponse({"ok": False, "error": "Need at least two frequencies"}, status_code=400)
+                phases = []
+                masks = []
+                for freq in freqs:
+                    phase_dir = Path(self.run_store.root) / run_id / "phase" / self.run_store._freq_tag(freq)
+                    phases.append(np.load(phase_dir / "phi_wrapped.npy"))
+                    mask_path = phase_dir / "mask_for_unwrap.npy"
+                    if not mask_path.exists():
+                        mask_path = phase_dir / "mask_clean.npy"
+                    if not mask_path.exists():
+                        mask_path = phase_dir / "mask.npy"
+                    masks.append(np.load(mask_path))
+                roi_mask = None
+                roi_path = Path(self.run_store.root) / run_id / "roi" / "roi_mask.png"
+                if roi_path.exists():
+                    roi_mask = np.array(Image.open(roi_path)) > 0
+                phi_abs, mask_unwrap, meta, residual = unwrap_multi_frequency(
+                    phases,
+                    masks,
+                    freqs,
+                    roi_mask=roi_mask,
+                    use_roi=True,
+                )
+                save_unwrap_outputs(
+                    Path(self.run_store.root) / run_id,
+                    phi_abs,
+                    mask_unwrap,
+                    meta,
+                    f_max=max(freqs),
+                    residual=residual,
+                )
+                return {"ok": True, "run_id": run_id, "meta": meta}
+            except Exception as exc:
+                log.error("Unwrap compute failed for %s: %s", run_id, exc)
+                log.error(traceback.format_exc())
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+        @self.app.get("/api/runs/{run_id}/unwrap/preview")
+        async def unwrap_preview(run_id: str):
+            unwrap_dir = Path(self.run_store.root) / run_id / "unwrap"
+            fixed = unwrap_dir / "phi_abs_debug_fixed.png"
+            auto = unwrap_dir / "phi_abs_debug_autoscale.png"
+            if fixed.exists():
+                return FileResponse(fixed)
+            if auto.exists():
+                return FileResponse(auto)
+            return JSONResponse({"error": "unwrap preview not found"}, status_code=404)
+
+        @self.app.get("/api/runs/{run_id}/unwrap/status")
+        async def unwrap_status(run_id: str):
+            unwrap_dir = Path(self.run_store.root) / run_id / "unwrap"
+            exists = (unwrap_dir / "phi_abs_debug_fixed.png").exists() or (unwrap_dir / "phi_abs_debug_autoscale.png").exists()
+            return {"exists": exists}
+
+        @self.app.post("/api/calibration/sessions")
+        async def calibration_create_session():
+            session = self.calibration.create_session()
+            return {"ok": True, "session": session}
+
+        @self.app.get("/api/calibration/sessions")
+        async def calibration_list_sessions():
+            return {"ok": True, "sessions": self.calibration.list_sessions()}
+
+        @self.app.get("/api/calibration/sessions/{session_id}")
+        async def calibration_get_session(session_id: str):
+            try:
+                return {"ok": True, "session": self.calibration.load_session(session_id)}
+            except FileNotFoundError as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
+
+        @self.app.post("/api/calibration/sessions/{session_id}/capture")
+        async def calibration_capture(session_id: str):
+            try:
+                calib_cfg = self.config.get("calibration", {}) or {}
+                flush_frames = int(calib_cfg.get("capture_flush_frames", 1))
+                frame = self.controller.capture_single_frame(flush_frames=flush_frames)
+                result = self.calibration.capture(session_id, frame)
+                session = self.calibration.load_session(session_id)
+                found_count = int(sum(1 for c in session.get("captures", []) if c.get("found")))
+                return {
+                    "ok": True,
+                    "capture": result["record"],
+                    "detection": result["detection"],
+                    "found_count": found_count,
+                    "total_count": len(session.get("captures", [])),
+                }
+            except FileNotFoundError as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
+            except RuntimeError as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
+            except Exception as exc:
+                log.error("Calibration capture failed: %s", exc)
+                log.error(traceback.format_exc())
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+        @self.app.post("/api/calibration/sessions/{session_id}/calibrate")
+        async def calibration_run(session_id: str):
+            try:
+                intrinsics = self.calibration.calibrate(session_id)
+                return {
+                    "ok": True,
+                    "intrinsics": intrinsics,
+                    "rms": float(intrinsics.get("rms", 0.0)),
+                }
+            except ValueError as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+            except FileNotFoundError as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
+            except Exception as exc:
+                log.error("Calibration failed: %s", exc)
+                log.error(traceback.format_exc())
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+        @self.app.get("/api/calibration/sessions/{session_id}/captures/{capture_id}/image")
+        async def calibration_capture_image(session_id: str, capture_id: str):
+            p = self.calibration.capture_image_path(session_id, capture_id)
+            if not p.exists():
+                return JSONResponse({"ok": False, "error": "image not found"}, status_code=404)
+            return FileResponse(p)
+
+        @self.app.get("/api/calibration/sessions/{session_id}/captures/{capture_id}/overlay")
+        async def calibration_capture_overlay(session_id: str, capture_id: str):
+            p = self.calibration.overlay_image_path(session_id, capture_id)
+            if not p.exists():
+                return JSONResponse({"ok": False, "error": "overlay not found"}, status_code=404)
+            return FileResponse(p)
+
+        @self.app.get("/api/calibration/sessions/{session_id}/captures/{capture_id}/detection")
+        async def calibration_capture_detection(session_id: str, capture_id: str):
+            p = self.calibration.detection_path(session_id, capture_id)
+            if not p.exists():
+                return JSONResponse({"ok": False, "error": "detection not found"}, status_code=404)
+            return JSONResponse(json.loads(p.read_text()))
+
+        @self.app.get("/api/calibration/sessions/{session_id}/intrinsics")
+        async def calibration_intrinsics(session_id: str):
+            p = self.calibration.intrinsics_path(session_id)
+            if not p.exists():
+                return JSONResponse({"ok": False, "error": "intrinsics not found"}, status_code=404)
+            return JSONResponse(json.loads(p.read_text()))
+
         @self.app.websocket("/ws/preview")
         async def preview_ws(websocket: WebSocket):
             await websocket.accept()
@@ -259,6 +418,10 @@ class FringeServer:
         @self.app.get("/")
         async def index():
             return FileResponse(static_dir / "index.html")
+
+        @self.app.get("/calibration")
+        async def calibration_page():
+            return FileResponse(static_dir / "calibration.html")
 
         self.app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
@@ -408,50 +571,3 @@ class FringeServer:
                 return 0.0
         subdirs.sort(key=lambda p: _tag_to_freq(p.name))
         return subdirs[-1]
-        @self.app.post("/api/runs/{run_id}/unwrap/compute")
-        async def unwrap_compute(run_id: str):
-            try:
-                params = self._params_from_meta(run_id)
-                freqs = params.get_frequencies()
-                if len(freqs) < 2:
-                    return JSONResponse({"ok": False, "error": "Need at least two frequencies"}, status_code=400)
-                phases = []
-                masks = []
-                for f in freqs:
-                    phase_dir = Path(self.run_store.root) / run_id / "phase" / self.run_store._freq_tag(f)
-                    phases.append(np.load(phase_dir / "phi_wrapped.npy"))
-                    mask_path = phase_dir / "mask_for_unwrap.npy"
-                    if not mask_path.exists():
-                        mask_path = phase_dir / "mask_clean.npy"
-                    if not mask_path.exists():
-                        mask_path = phase_dir / "mask.npy"
-                    masks.append(np.load(mask_path))
-                roi_mask = None
-                roi_path = Path(self.run_store.root) / run_id / "roi" / "roi_mask.png"
-                if roi_path.exists():
-                    from PIL import Image
-                    roi_mask = np.array(Image.open(roi_path)) > 0
-                phi_abs, mask_unwrap, meta, residual = unwrap_multi_frequency(phases, masks, freqs, roi_mask=roi_mask, use_roi=True)
-                save_unwrap_outputs(Path(self.run_store.root) / run_id, phi_abs, mask_unwrap, meta, f_max=max(freqs), residual=residual)
-                return {"ok": True, "run_id": run_id, "meta": meta}
-            except Exception as exc:
-                log.error("Unwrap compute failed for %s: %s", run_id, exc)
-                log.error(traceback.format_exc())
-                return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
-
-        @self.app.get("/api/runs/{run_id}/unwrap/preview")
-        async def unwrap_preview(run_id: str):
-            unwrap_dir = Path(self.run_store.root) / run_id / "unwrap"
-            fixed = unwrap_dir / "phi_abs_debug_fixed.png"
-            auto = unwrap_dir / "phi_abs_debug_autoscale.png"
-            if fixed.exists():
-                return FileResponse(fixed)
-            if auto.exists():
-                return FileResponse(auto)
-            return JSONResponse({"error": "unwrap preview not found"}, status_code=404)
-
-        @self.app.get("/api/runs/{run_id}/unwrap/status")
-        async def unwrap_status(run_id: str):
-            unwrap_dir = Path(self.run_store.root) / run_id / "unwrap"
-            exists = (unwrap_dir / "phi_abs_debug_fixed.png").exists() or (unwrap_dir / "phi_abs_debug_autoscale.png").exists()
-            return {"exists": exists}

@@ -18,6 +18,23 @@ python -m fringe_app
 
 Open the UI at `http://<pi-ip>:8000/`.
 
+## Checkerboard Calibration (Web UI)
+
+1. Open `http://<pi-ip>:8000/calibration`.
+2. Click `New Session`.
+3. Capture checkerboard images at varied poses.
+4. Click `Run Calibrate`.
+
+Artifacts are saved under `data/calibration/sessions/<session_id>/`:
+- `captures/capture_XXX.png`
+- `captures/capture_XXX_overlay.png`
+- `detections/capture_XXX.json`
+- `intrinsics.json`
+
+Latest intrinsics are mirrored to `data/calibration/intrinsics_latest.json`.
+Calibration uses only captures with `found=true`. If too few are found, UI shows:
+`Need at least 10 valid checkerboard detections.`
+
 ## Multi-Frequency Unwrap (Temporal)
 
 You can capture multiple frequencies and compute an absolute phase map:

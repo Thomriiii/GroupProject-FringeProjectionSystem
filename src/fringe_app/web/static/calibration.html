@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Camera Calibration</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Camera Calibration</h1>
+      <a href="/">Back to Pipeline</a>
+    </header>
+
+    <section class="actions">
+      <button id="new_session_btn">New Session</button>
+      <button id="capture_btn" disabled>Capture Checkerboard</button>
+      <button id="calibrate_btn" disabled>Run Calibrate</button>
+    </section>
+
+    <section>
+      <div id="calib_status" class="status">No session</div>
+      <div id="calib_error" class="error"></div>
+      <div id="calib_summary"></div>
+    </section>
+
+    <section class="preview">
+      <h2>Live Preview</h2>
+      <img id="preview_img" alt="live preview" />
+    </section>
+
+    <section>
+      <h2>Captures</h2>
+      <div id="captures_grid" class="captures-grid"></div>
+    </section>
+  </div>
+
+  <script src="/static/calibration.js"></script>
+</body>
+</html>

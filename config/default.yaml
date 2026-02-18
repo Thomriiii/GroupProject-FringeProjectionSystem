@@ -107,6 +107,15 @@ roi:
 storage:
   run_root: data/runs
 
+calibration:
+  root: data/calibration
+  min_valid_detections: 10
+  capture_flush_frames: 1
+  checkerboard:
+    cols: 9
+    rows: 6
+    square_size_mm: 25.0
+
 polish:
   target_roi_valid_ratio: 0.95
   target_roi_largest_component_ratio: 0.90
