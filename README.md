@@ -1,6 +1,21 @@
 # Fringe App
 
-Minimal fringe projection capture system for Raspberry Pi using pygame for projector output and FastAPI for control.
+Raspberry Pi fringe projection capture + processing system.
+
+Current pipeline supports:
+- Pattern projection and synchronized camera capture
+- Multi-frequency PSP phase compute
+- ROI detection and mask generation
+- Temporal unwrapping
+- UV map generation (vertical + horizontal runs)
+- Quality gating and safe pipeline execution
+- Web UI with live preview, one-click pipeline run, downloads, and checkerboard camera calibration
+
+## Requirements
+
+- Python 3.11+
+- Raspberry Pi + libcamera/Picamera2 for real capture
+- OpenCV (`cv2`) for checkerboard calibration and corner overlays
 
 ## Install
 
@@ -16,74 +31,120 @@ pip install -e .
 python -m fringe_app
 ```
 
-Open the UI at `http://<pi-ip>:8000/`.
+Open:
+- Main UI: `http://<pi-ip>:8000/`
+- Calibration UI: `http://<pi-ip>:8000/calibration`
 
-## Checkerboard Calibration (Web UI)
+## Main UI
 
-1. Open `http://<pi-ip>:8000/calibration`.
-2. Click `New Session`.
-3. Capture checkerboard images at varied poses.
-4. Click `Run Calibrate`.
+Main page is intentionally minimal:
+- Start end-to-end pipeline scan button
+- Live camera preview
+- Run ZIP downloads
 
-Artifacts are saved under `data/calibration/sessions/<session_id>/`:
-- `captures/capture_XXX.png`
-- `captures/capture_XXX_overlay.png`
-- `detections/capture_XXX.json`
-- `intrinsics.json`
+## Checkerboard Calibration UI
 
-Latest intrinsics are mirrored to `data/calibration/intrinsics_latest.json`.
-Calibration uses only captures with `found=true`. If too few are found, UI shows:
-`Need at least 10 valid checkerboard detections.`
+Workflow:
+1. Open `/calibration`
+2. Click `New Session`
+3. Capture checkerboard images (varied poses/angles/distances)
+4. Click `Run Calibrate`
 
-## Multi-Frequency Unwrap (Temporal)
+Saved artifacts:
+- `data/calibration/sessions/<session_id>/captures/capture_XXX.png`
+- `data/calibration/sessions/<session_id>/captures/capture_XXX_overlay.png`
+- `data/calibration/sessions/<session_id>/detections/capture_XXX.json`
+- `data/calibration/sessions/<session_id>/intrinsics.json`
+- `data/calibration/intrinsics_latest.json`
 
-You can capture multiple frequencies and compute an absolute phase map:
+Important rule:
+- Calibration uses only captures where checkerboard detection has `found=true`.
+- If too few valid detections are available, calibration returns:
+  - `Need at least 10 valid checkerboard detections.`
+
+## CLI Commands
+
+Basic capture:
 
 ```bash
-python -m fringe_app scan --n 4 --frequencies 4 16 --orientation vertical --settle-ms 150
+python -m fringe_app scan --n 8 --frequencies 1 4 16 --orientation vertical --settle-ms 150
+```
+
+Phase + unwrap + score for existing run:
+
+```bash
 python -m fringe_app phase --run <run_id>
 python -m fringe_app unwrap --run <run_id> --use-roi auto
+python -m fringe_app score --run <run_id>
 ```
 
-## Camera
-
-- **Picamera2 (real camera)**: set `camera.type: picamera2` in `config/default.yaml`.
-- **Mock (dev only)**: set `camera.type: mock` and place images in `mock_data/`.
-
-## Projector Display Selection
-
-- Use `display.screen_index` in `config/default.yaml` to select the target display.
-- `display.fullscreen` controls fullscreen mode.
-
-## Self Test
-
-1. Start the app: `python -m fringe_app`.
-2. Start a scan:
+Safe full pipeline (single orientation):
 
 ```bash
-curl -X POST http://localhost:8000/api/scan/start \
-  -H 'Content-Type: application/json' \
-  -d '{"n_steps":4,"frequency":8.0,"orientation":"vertical","brightness":1.0,"settle_ms":10,"preview_fps":5}'
+python -m fringe_app pipeline-run-safe --print-hints
 ```
 
-4. Verify output under `data/runs/<timestamp>/` with `captures/` and `meta.json`.
+Safe UV pipeline (vertical + horizontal + UV outputs):
 
-## ROI + Masking Notes
+```bash
+python -m fringe_app pipeline-run-uv --print-hints
+```
 
-ROI:
-- ROI is detected from the first capture frame (object brighter than black background).
-- ROI mask is saved under `data/runs/<run_id>/roi/roi_mask.png`.
+Quality state:
 
-Masking:
-- The phase valid mask uses: `valid = (B>=B_thresh) & (A>=A_min) & (max_frame<=sat_high)`.
-- Low-saturation is ignored (dark troughs don’t invalidate).
-- The stored `mask.png` is ROI-gated (valid pixels inside ROI only).
-- `valid_in_roi.png` shows valid∩ROI pixels explicitly.
+```bash
+python -m fringe_app quality-state --show
+python -m fringe_app quality-state --reset
+```
 
-Example metrics:
-- Before: `roi_valid_ratio ~ 0.004` (wrong denominator + low-sat rejection).
-- After: `roi_valid_ratio ~ 0.55` (valid∩ROI / ROI).
+## Data Layout
 
-## Why Not Multi-Frequency Yet
+### Regular scan runs
 
-Multiple frequencies are for unwrapping/absolute phase, not for improving mask quality. Mask quality should be stable on a single frequency first. Higher frequencies also reduce modulation due to blur/MTF, which shrinks valid masks.
+`data/runs/<run_id>/` contains:
+- `captures/`
+- `phase/`
+- `unwrap/`
+- `roi/`
+- `overlays/`
+- `normalise/`
+- `quality_report.json`
+- `meta.json`
+
+For UV combined runs:
+- `vertical/` and `horizontal/` sub-runs
+- `projector_uv/` with `u.npy`, `v.npy`, `mask_uv.npy`, debug images, `uv_meta.json`
+
+### Calibration
+
+`data/calibration/` contains:
+- `sessions/<session_id>/...`
+- `intrinsics_latest.json`
+
+## Key Config
+
+Main configuration file: `config/default.yaml`
+
+Notable sections:
+- `scan` (steps, frequencies, settle/flush timing, retries)
+- `patterns` (contrast, brightness offset, min intensity)
+- `phase` (A/B thresholds, saturation threshold, mask cleanup)
+- `unwrap` (unwrap mask post-processing)
+- `roi` (ROI detection and post-processing)
+- `normalise` (auto exposure/gain normalization policy)
+- `quality_gate` / `quality` (phase+unwrap thresholds and staged residual policy)
+- `uv_gate` (UV validation thresholds)
+- `calibration` (checkerboard config and min valid detections)
+
+## Notes
+
+- For stable results, use manual camera controls via safe pipeline commands.
+- If run quality fails, inspect `quality_report.json` and per-stage metadata.
+- Calibration is checkerboard-only in this version.
+
+## Out of Scope (Current)
+
+- Projector calibration
+- Camera-projector stereo calibration
+- Triangulation / point clouds
+- Charuco workflow
