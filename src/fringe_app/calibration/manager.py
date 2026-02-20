@@ -20,7 +20,7 @@ from .checkerboard import (
 
 @dataclass(slots=True)
 class CalibrationConfig:
-    root: str = "data/calibration"
+    root: str = "data/calibration/camera"
     checkerboard_cols: int = 9
     checkerboard_rows: int = 6
     square_size_mm: float = 25.0
@@ -33,8 +33,29 @@ class CalibrationManager:
     def __init__(self, cfg: CalibrationConfig) -> None:
         self.cfg = cfg
         self.root = Path(cfg.root)
+        self._migrate_legacy_layout_if_needed()
         self.sessions_root = self.root / "sessions"
         self.sessions_root.mkdir(parents=True, exist_ok=True)
+
+    def _migrate_legacy_layout_if_needed(self) -> None:
+        """
+        Move old camera-calibration paths:
+        data/calibration/sessions -> data/calibration/camera/sessions
+        data/calibration/intrinsics_latest.json -> data/calibration/camera/intrinsics_latest.json
+        """
+        if self.root.name != "camera":
+            return
+        legacy_root = self.root.parent
+        legacy_sessions = legacy_root / "sessions"
+        new_sessions = self.root / "sessions"
+        if legacy_sessions.exists() and not new_sessions.exists():
+            self.root.mkdir(parents=True, exist_ok=True)
+            legacy_sessions.rename(new_sessions)
+        legacy_latest = legacy_root / "intrinsics_latest.json"
+        new_latest = self.root / "intrinsics_latest.json"
+        if legacy_latest.exists() and not new_latest.exists():
+            self.root.mkdir(parents=True, exist_ok=True)
+            legacy_latest.rename(new_latest)
 
     def create_session(self) -> dict[str, Any]:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")

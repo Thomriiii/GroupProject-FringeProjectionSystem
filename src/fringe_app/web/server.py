@@ -13,11 +13,18 @@ import logging
 import traceback
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 
 from fringe_app.calibration import CalibrationConfig, CalibrationManager
+from fringe_app.calibration.projector_stereo import (
+    create_session as create_projector_session,
+    list_views as list_projector_views,
+    capture_view as capture_projector_view,
+    delete_view as delete_projector_view,
+    stereo_calibrate as stereo_calibrate_projector,
+)
 from fringe_app.core.models import ScanParams
 from fringe_app.core.controller import ScanController
 from fringe_app.io.run_store import RunStore
@@ -28,6 +35,7 @@ from fringe_app.vision.object_roi import detect_object_roi, ObjectRoiConfig
 from fringe_app.overlays.generate import overlay_masks
 from fringe_app.unwrap.temporal import unwrap_multi_frequency, save_unwrap_outputs
 from fringe_app.cli import cmd_phase, cmd_unwrap, cmd_score
+from fringe_app.recon import load_stereo_model, reconstruct_uv_run, save_reconstruction_outputs
 
 
 class FringeServer:
@@ -38,9 +46,10 @@ class FringeServer:
         self.run_store = run_store
         self.config = config
         calib_cfg = self.config.get("calibration", {}) or {}
+        camera_root = self._camera_calibration_root()
         self.calibration = CalibrationManager(
             CalibrationConfig(
-                root=str(calib_cfg.get("root", "data/calibration")),
+                root=str(camera_root),
                 checkerboard_cols=int(calib_cfg.get("checkerboard", {}).get("cols", 9)),
                 checkerboard_rows=int(calib_cfg.get("checkerboard", {}).get("rows", 6)),
                 square_size_mm=float(calib_cfg.get("checkerboard", {}).get("square_size_mm", 25.0)),
@@ -48,6 +57,8 @@ class FringeServer:
             )
         )
         self._pipeline_lock = asyncio.Lock()
+        self._projector_capture_lock = asyncio.Lock()
+        self._projector_calibrate_lock = asyncio.Lock()
         self._pipeline_task: asyncio.Task | None = None
         self._pipeline_state: str = "idle"
         self._pipeline_run_id: str | None = None
@@ -315,7 +326,47 @@ class FringeServer:
         @self.app.post("/api/calibration/sessions")
         async def calibration_create_session():
             session = self.calibration.create_session()
+            # Pre-apply calibration camera controls so preview/captures are not underexposed.
+            calib_cfg = self.config.get("calibration", {}) or {}
+            cam_cfg = calib_cfg.get("camera", {}) or {}
+            try:
+                self.controller.capture_single_frame(
+                    flush_frames=0,
+                    exposure_us=cam_cfg.get("exposure_us"),
+                    analogue_gain=cam_cfg.get("analogue_gain"),
+                    awb_enable=cam_cfg.get("awb_enable"),
+                    settle_ms=int(cam_cfg.get("settle_ms", 120)),
+                )
+            except Exception:
+                pass
             return {"ok": True, "session": session}
+
+        @self.app.post("/api/calibration/camera/apply")
+        async def calibration_apply_camera():
+            calib_cfg = self.config.get("calibration", {}) or {}
+            cam_cfg = calib_cfg.get("camera", {}) or {}
+            try:
+                frame = self.controller.capture_single_frame(
+                    flush_frames=0,
+                    exposure_us=cam_cfg.get("exposure_us"),
+                    analogue_gain=cam_cfg.get("analogue_gain"),
+                    awb_enable=cam_cfg.get("awb_enable"),
+                    settle_ms=int(cam_cfg.get("settle_ms", 120)),
+                )
+                if frame.ndim == 3:
+                    gray = 0.299 * frame[:, :, 0] + 0.587 * frame[:, :, 1] + 0.114 * frame[:, :, 2]
+                else:
+                    gray = frame
+                return {
+                    "ok": True,
+                    "mean_dn": float(np.mean(gray)),
+                    "min_dn": float(np.min(gray)),
+                    "max_dn": float(np.max(gray)),
+                }
+            except RuntimeError as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
         @self.app.get("/api/calibration/sessions")
         async def calibration_list_sessions():
@@ -333,7 +384,14 @@ class FringeServer:
             try:
                 calib_cfg = self.config.get("calibration", {}) or {}
                 flush_frames = int(calib_cfg.get("capture_flush_frames", 1))
-                frame = self.controller.capture_single_frame(flush_frames=flush_frames)
+                cam_cfg = calib_cfg.get("camera", {}) or {}
+                frame = self.controller.capture_single_frame(
+                    flush_frames=flush_frames,
+                    exposure_us=cam_cfg.get("exposure_us"),
+                    analogue_gain=cam_cfg.get("analogue_gain"),
+                    awb_enable=cam_cfg.get("awb_enable"),
+                    settle_ms=int(cam_cfg.get("settle_ms", 120)),
+                )
                 result = self.calibration.capture(session_id, frame)
                 session = self.calibration.load_session(session_id)
                 found_count = int(sum(1 for c in session.get("captures", []) if c.get("found")))
@@ -399,6 +457,245 @@ class FringeServer:
                 return JSONResponse({"ok": False, "error": "intrinsics not found"}, status_code=404)
             return JSONResponse(json.loads(p.read_text()))
 
+        @self.app.post("/api/calibration/projector/session/new")
+        async def projector_calibration_new_session():
+            try:
+                root = self._calibration_root()
+                session_id = create_projector_session(root, self.config)
+                return {"ok": True, "session_id": session_id}
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+        @self.app.get("/api/calibration/projector/sessions")
+        async def projector_calibration_list_sessions():
+            root = self._calibration_root()
+            sessions_dir = root / "projector" / "sessions"
+            sessions: list[dict[str, Any]] = []
+            if sessions_dir.exists():
+                for p in sorted(sessions_dir.iterdir(), reverse=True):
+                    if not p.is_dir():
+                        continue
+                    sess_path = p / "session.json"
+                    if not sess_path.exists():
+                        continue
+                    try:
+                        sess = json.loads(sess_path.read_text())
+                    except Exception:
+                        continue
+                    views = sess.get("views", []) or []
+                    valid = sum(1 for v in views if v.get("status") == "valid")
+                    sessions.append({
+                        "session_id": str(sess.get("session_id", p.name)),
+                        "created_at": sess.get("created_at"),
+                        "views_total": int(len(views)),
+                        "views_valid": int(valid),
+                    })
+            return {"ok": True, "sessions": sessions}
+
+        @self.app.post("/api/calibration/projector/illumination")
+        async def projector_calibration_illumination(payload: Dict[str, Any] | None = None):
+            payload = payload or {}
+            enabled = bool(payload.get("enabled", True))
+            pcal = self.config.get("projector_calibration", {}) or {}
+            cap = pcal.get("capture", {}) or {}
+            dn = int(payload.get("dn", cap.get("checkerboard_white_dn", 230)))
+            try:
+                self.controller.set_projector_calibration_light(enabled=enabled, dn=dn)
+            except RuntimeError as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+            return {"ok": True, "enabled": enabled, "dn": dn}
+
+        @self.app.get("/api/calibration/projector/session/{session_id}")
+        async def projector_calibration_get_session(session_id: str):
+            root = self._calibration_root()
+            sdir = root / "projector" / "sessions" / session_id
+            if not sdir.exists():
+                return JSONResponse({"ok": False, "error": "session not found"}, status_code=404)
+            try:
+                sess = json.loads((sdir / "session.json").read_text())
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+            return {"ok": True, "session": sess, "views": list_projector_views(sdir)}
+
+        @self.app.post("/api/calibration/projector/session/{session_id}/capture")
+        async def projector_calibration_capture_view(session_id: str):
+            root = self._calibration_root()
+            sdir = root / "projector" / "sessions" / session_id
+            if not sdir.exists():
+                return JSONResponse({"ok": False, "error": "session not found"}, status_code=404)
+            try:
+                async with self._projector_capture_lock:
+                    summary = await asyncio.to_thread(
+                        capture_projector_view,
+                        sdir,
+                        self.controller,
+                        self.config,
+                    )
+                return {"ok": True, "view": summary}
+            except Exception as exc:
+                log.error("Projector calibration capture failed: %s", exc)
+                log.error(traceback.format_exc())
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+        @self.app.delete("/api/calibration/projector/session/{session_id}/view/{view_id}")
+        async def projector_calibration_delete_view(session_id: str, view_id: str):
+            root = self._calibration_root()
+            sdir = root / "projector" / "sessions" / session_id
+            if not sdir.exists():
+                return JSONResponse({"ok": False, "error": "session not found"}, status_code=404)
+            try:
+                delete_projector_view(sdir, view_id)
+                return {"ok": True}
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+        @self.app.post("/api/calibration/projector/session/{session_id}/calibrate")
+        async def projector_calibration_calibrate(session_id: str):
+            root = self._calibration_root()
+            sdir = root / "projector" / "sessions" / session_id
+            if not sdir.exists():
+                return JSONResponse({"ok": False, "error": "session not found"}, status_code=404)
+            try:
+                intr_path = self._find_camera_intrinsics_latest()
+                async with self._projector_calibrate_lock:
+                    result = await asyncio.to_thread(
+                        stereo_calibrate_projector,
+                        sdir,
+                        self.config,
+                        intr_path,
+                    )
+                return {"ok": True, "result": result}
+            except ValueError as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+            except FileNotFoundError as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
+            except Exception as exc:
+                log.error("Projector calibration failed: %s", exc)
+                log.error(traceback.format_exc())
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+        @self.app.get("/api/calibration/projector/session/{session_id}/view/{view_id}/image")
+        async def projector_calibration_view_image(session_id: str, view_id: str):
+            root = self._calibration_root()
+            p = root / "projector" / "sessions" / session_id / "views" / view_id / "camera.png"
+            if not p.exists():
+                return JSONResponse({"ok": False, "error": "image not found"}, status_code=404)
+            return FileResponse(p)
+
+        @self.app.get("/api/calibration/projector/session/{session_id}/view/{view_id}/overlay")
+        async def projector_calibration_view_overlay(session_id: str, view_id: str):
+            root = self._calibration_root()
+            base = root / "projector" / "sessions" / session_id / "views" / view_id
+            p = base / "corner_validity_overlay.png"
+            if not p.exists():
+                p = base / "overlay.png"
+            if not p.exists():
+                return JSONResponse({"ok": False, "error": "overlay not found"}, status_code=404)
+            return FileResponse(p)
+
+        @self.app.get("/api/calibration/projector/session/{session_id}/view/{view_id}/diag")
+        async def projector_calibration_view_diag(session_id: str, view_id: str):
+            root = self._calibration_root()
+            p = root / "projector" / "sessions" / session_id / "views" / view_id / "view_diag.json"
+            if not p.exists():
+                return JSONResponse({"ok": False, "error": "view_diag not found"}, status_code=404)
+            return JSONResponse(json.loads(p.read_text()))
+
+        @self.app.get("/api/calibration/projector/session/{session_id}/view/{view_id}/uv_preview")
+        async def projector_calibration_view_uv_preview(session_id: str, view_id: str):
+            root = self._calibration_root()
+            p = root / "projector" / "sessions" / session_id / "views" / view_id / "uv" / "uv_overlay.png"
+            if not p.exists():
+                return JSONResponse({"ok": False, "error": "uv overlay not found"}, status_code=404)
+            return FileResponse(p)
+
+        @self.app.get("/api/reconstruction/runs")
+        async def reconstruction_runs():
+            runs: list[dict[str, Any]] = []
+            for meta in self.run_store.list_runs():
+                run_id = meta.run_id
+                run_dir = Path(self.run_store.root) / run_id
+                if not (run_dir / "projector_uv" / "u.npy").exists():
+                    continue
+                runs.append(
+                    {
+                        "run_id": run_id,
+                        "status": meta.status,
+                        "started_at": meta.started_at,
+                        "has_reconstruction": (run_dir / "reconstruction" / "reconstruction_meta.json").exists(),
+                    }
+                )
+            return {"ok": True, "runs": runs}
+
+        @self.app.post("/api/reconstruction/run")
+        async def reconstruction_run(payload: Dict[str, Any]):
+            run_id = str((payload or {}).get("run_id", "")).strip()
+            if not run_id:
+                return JSONResponse({"ok": False, "error": "run_id is required"}, status_code=400)
+            run_dir = Path(self.run_store.root) / run_id
+            if not run_dir.exists():
+                return JSONResponse({"ok": False, "error": f"run not found: {run_id}"}, status_code=404)
+            if not (run_dir / "projector_uv" / "u.npy").exists():
+                return JSONResponse({"ok": False, "error": "run does not contain projector_uv outputs"}, status_code=400)
+            try:
+                summary = await asyncio.to_thread(self._run_reconstruction, run_id)
+                return {"ok": True, "run_id": run_id, "summary": summary}
+            except FileNotFoundError as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
+            except ValueError as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+            except Exception as exc:
+                log.error("Reconstruction failed for %s: %s", run_id, exc)
+                log.error(traceback.format_exc())
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+        @self.app.get("/api/reconstruction/status")
+        async def reconstruction_status(run_id: str):
+            run_dir = Path(self.run_store.root) / run_id
+            meta_path = run_dir / "reconstruction" / "reconstruction_meta.json"
+            if not meta_path.exists():
+                return {"ok": True, "exists": False}
+            return {"ok": True, "exists": True, "meta": json.loads(meta_path.read_text())}
+
+        @self.app.get("/api/reconstruction/outputs")
+        async def reconstruction_outputs(run_id: str):
+            run_dir = Path(self.run_store.root) / run_id
+            rec_dir = run_dir / "reconstruction"
+            if not rec_dir.exists():
+                return {"ok": True, "exists": False, "files": []}
+            files = []
+            for p in sorted(rec_dir.rglob("*")):
+                if not p.is_file():
+                    continue
+                rel = p.relative_to(rec_dir).as_posix()
+                files.append(
+                    {
+                        "name": rel,
+                        "size_bytes": int(p.stat().st_size),
+                        "url": f"/api/reconstruction/file/{run_id}/{rel}",
+                    }
+                )
+            meta = {}
+            meta_path = rec_dir / "reconstruction_meta.json"
+            if meta_path.exists():
+                meta = json.loads(meta_path.read_text())
+            return {"ok": True, "exists": True, "files": files, "meta": meta}
+
+        @self.app.get("/api/reconstruction/file/{run_id}/{file_path:path}")
+        async def reconstruction_file(run_id: str, file_path: str):
+            run_dir = Path(self.run_store.root) / run_id
+            rec_dir = (run_dir / "reconstruction").resolve()
+            target = (rec_dir / file_path).resolve()
+            try:
+                target.relative_to(rec_dir)
+            except ValueError:
+                return JSONResponse({"ok": False, "error": "invalid path"}, status_code=400)
+            if not target.exists() or not target.is_file():
+                return JSONResponse({"ok": False, "error": "file not found"}, status_code=404)
+            return FileResponse(target)
+
         @self.app.websocket("/ws/preview")
         async def preview_ws(websocket: WebSocket):
             await websocket.accept()
@@ -421,7 +718,36 @@ class FringeServer:
 
         @self.app.get("/calibration")
         async def calibration_page():
-            return FileResponse(static_dir / "calibration.html")
+            page = (static_dir / "calibration.html").read_text()
+            return HTMLResponse(
+                page,
+                headers={
+                    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                    "Pragma": "no-cache",
+                },
+            )
+
+        @self.app.get("/projector-calibration")
+        async def projector_calibration_page():
+            page = (static_dir / "projector_calibration.html").read_text()
+            return HTMLResponse(
+                page,
+                headers={
+                    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                    "Pragma": "no-cache",
+                },
+            )
+
+        @self.app.get("/reconstruction")
+        async def reconstruction_page():
+            page = (static_dir / "reconstruction.html").read_text()
+            return HTMLResponse(
+                page,
+                headers={
+                    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                    "Pragma": "no-cache",
+                },
+            )
 
         self.app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
@@ -554,6 +880,75 @@ class FringeServer:
             expert_mode=bool(p.get("expert_mode", False)),
             quality_retry_count=int(p.get("quality_retry_count", 0)),
         )
+
+    def _calibration_root(self) -> Path:
+        cfg = self.config.get("calibration", {}) or {}
+        return Path(str(cfg.get("root", "data/calibration")))
+
+    def _camera_calibration_root(self) -> Path:
+        cfg = self.config.get("calibration", {}) or {}
+        camera_root = cfg.get("camera_root")
+        if camera_root:
+            return Path(str(camera_root))
+        return self._calibration_root() / "camera"
+
+    def _find_camera_intrinsics_latest(self) -> Path:
+        camera_root = self._camera_calibration_root()
+        candidates = [
+            camera_root / "intrinsics_latest.json",
+            # Legacy fallbacks:
+            self._calibration_root() / "camera_intrinsics" / "intrinsics_latest.json",
+            self._calibration_root() / "intrinsics_latest.json",
+        ]
+        for p in candidates:
+            if p.exists():
+                return p
+        raise FileNotFoundError(
+            "Camera intrinsics not found. Expected "
+            "data/calibration/camera/intrinsics_latest.json"
+        )
+
+    def _find_projector_stereo_latest(self) -> Path:
+        root = self._calibration_root()
+        candidates = [
+            root / "projector" / "stereo_latest.json",
+            root / "projector" / "results" / "stereo_latest.json",  # legacy
+        ]
+        for p in candidates:
+            if p.exists():
+                return p
+        raise FileNotFoundError(
+            "Projector stereo calibration not found. Expected "
+            "data/calibration/projector/stereo_latest.json"
+        )
+
+    def _run_reconstruction(self, run_id: str) -> dict[str, Any]:
+        run_dir = Path(self.run_store.root) / run_id
+        camera_intr = self._find_camera_intrinsics_latest()
+        stereo = self._find_projector_stereo_latest()
+        model = load_stereo_model(camera_intr, stereo)
+        result = reconstruct_uv_run(
+            run_dir,
+            model,
+            recon_cfg=self.config.get("reconstruction", {}) or {},
+        )
+        out_dir = run_dir / "reconstruction"
+        meta = save_reconstruction_outputs(
+            out_dir,
+            result,
+            recon_cfg=self.config.get("reconstruction", {}) or {},
+        )
+        return {
+            "run_id": run_id,
+            "output_dir": str(out_dir),
+            "camera_intrinsics": str(camera_intr),
+            "projector_stereo": str(stereo),
+            "valid_recon_points": int(meta.get("valid_recon_points", 0)),
+            "exported_points": int(meta.get("exported_points", 0)),
+            "depth_median_m": meta.get("depth_median_m"),
+            "reproj_err_cam_median": meta.get("reproj_err_cam_median"),
+            "reproj_err_proj_median": meta.get("reproj_err_proj_median"),
+        }
 
     def _select_phase_dir(self, phase_dir: Path) -> Path:
         if not phase_dir.exists():

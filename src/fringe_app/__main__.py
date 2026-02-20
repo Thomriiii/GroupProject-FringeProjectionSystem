@@ -44,6 +44,7 @@ def _create_camera(cfg: dict):
 def _default_scan_params(cfg: dict) -> ScanParams:
     scan_cfg = cfg.get("scan", {})
     pat_cfg = cfg.get("patterns", {})
+    calib_cam_cfg = (cfg.get("calibration", {}) or {}).get("camera", {}) or {}
     width = int(scan_cfg.get("width", 1024))
     height = int(scan_cfg.get("height", 768))
     frequencies = scan_cfg.get("frequencies")
@@ -60,11 +61,13 @@ def _default_scan_params(cfg: dict) -> ScanParams:
         save_patterns=bool(scan_cfg.get("save_patterns", False)),
         preview_fps=float(scan_cfg.get("preview_fps", 10.0)),
         phase_convention=str(scan_cfg.get("phase_convention", "atan2(-S,C)")),
-        exposure_us=scan_cfg.get("exposure_us"),
-        analogue_gain=scan_cfg.get("analogue_gain"),
+        # Preview stream should be usable in ambient light, so allow calibration
+        # camera defaults to override dark scan defaults.
+        exposure_us=calib_cam_cfg.get("exposure_us", scan_cfg.get("exposure_us")),
+        analogue_gain=calib_cam_cfg.get("analogue_gain", scan_cfg.get("analogue_gain")),
         awb_mode=scan_cfg.get("awb_mode"),
-        awb_enable=scan_cfg.get("awb_enable"),
-        ae_enable=scan_cfg.get("ae_enable"),
+        awb_enable=calib_cam_cfg.get("awb_enable", scan_cfg.get("awb_enable")),
+        ae_enable=calib_cam_cfg.get("ae_enable", scan_cfg.get("ae_enable")),
         iso=scan_cfg.get("iso"),
         brightness_offset=float(pat_cfg.get("brightness_offset", scan_cfg.get("brightness_offset", 0.45))),
         contrast=float(pat_cfg.get("contrast", scan_cfg.get("contrast", 0.6))),

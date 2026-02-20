@@ -109,12 +109,71 @@ storage:
 
 calibration:
   root: data/calibration
+  camera_root: data/calibration/camera
   min_valid_detections: 10
   capture_flush_frames: 1
+  camera:
+    # Calibration page uses brighter manual controls than scan defaults.
+    exposure_us: 12000
+    analogue_gain: 3.0
+    awb_enable: true
+    ae_enable: false
+    settle_ms: 120
   checkerboard:
-    cols: 9
+    cols: 8
     rows: 6
-    square_size_mm: 25.0
+    square_size_mm: 10.0
+
+projector_calibration:
+  checkerboard:
+    corners_x: 8
+    corners_y: 6
+    square_size_m: 0.010
+  projector:
+    width: 1024
+    height: 768
+    strict_resolution_match: false
+  camera:
+    # Lock camera during projector calibration capture and UV run.
+    exposure_us: 12000
+    analogue_gain: 3.0
+    awb_enable: true
+    ae_enable: false
+    settle_ms: 120
+  capture:
+    min_views: 10
+    settle_ms: 150
+    flush_frames: 1
+    checkerboard_white_dn: 230
+    checkerboard_white_settle_ms: 200
+    checkerboard_off_dn: 0
+    checkerboard_off_settle_ms: 60
+    min_corner_valid_ratio: 0.90
+    max_corner_uv_edge_px: 1
+    max_retries: 2
+    low_b_median_threshold: 8.0
+    retry_exposure_bump_factor: 1.25
+    uv_sample:
+      method: bilinear
+      patch_radius_px: 2
+      use_patch_median: true
+      min_finite_samples: 8
+  uv_mask_policy:
+    use_roi: false
+    unwrap_mask:
+      closing_radius_px: 3
+      erosion_radius_px: 0
+      keep_largest_component: true
+      min_area_px: 2000
+      b_thresh_unwrap: 5.0
+      a_min_unwrap: 10.0
+  uv_gate:
+    enabled: true
+    min_u_range_px: 30
+    min_v_range_px: 30
+    max_edge_pct: 0.15
+    max_zero_pct: 0.02
+    min_valid_ratio: 0.01
 
 polish:
   target_roi_valid_ratio: 0.95
@@ -141,6 +200,18 @@ uv_gate:
   max_edge_pct: 0.10
   max_zero_pct: 0.01
   min_valid_ratio: 0.03
+
+reconstruction:
+  enabled: true
+  max_points: 800000
+  max_reproj_err_px: 2.0
+  z_min_m: 0.05
+  z_max_m: 5.0
+  downsample:
+    enabled: true
+    stride: 2
+  ply:
+    write_rgb: true
 
 quality:
   residual:

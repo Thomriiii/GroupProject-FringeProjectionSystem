@@ -35,7 +35,7 @@ class Picamera2Camera(CameraBase):
 
     def set_manual_controls(self, exposure_us: int, analogue_gain: float, awb_enable: bool = False) -> None:
         if self._cam is None:
-            return
+            raise RuntimeError("Camera not started")
         controls = {
             "AeEnable": False,
             "ExposureTime": int(exposure_us),
@@ -44,8 +44,8 @@ class Picamera2Camera(CameraBase):
         }
         try:
             self._cam.set_controls(controls)
-        except Exception:
-            return
+        except Exception as exc:
+            raise RuntimeError(f"Failed to apply manual camera controls: {exc}") from exc
         self._applied_controls.update(controls)
         try:
             md = self._cam.capture_metadata()

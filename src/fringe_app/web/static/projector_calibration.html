@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Projector Calibration</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Projector Calibration</h1>
+      <a href="/">Back to Pipeline</a>
+    </header>
+
+    <section class="actions">
+      <button id="new_session_btn">New Session</button>
+      <select id="session_select"></select>
+      <button id="continue_session_btn">Continue Session</button>
+      <button id="capture_view_btn" disabled>Capture Calibration Pose</button>
+      <button id="calibrate_btn" disabled>Calibrate Projector Stereo</button>
+    </section>
+
+    <section>
+      <div id="status" class="status">No session</div>
+      <div id="error" class="error"></div>
+      <div id="summary"></div>
+    </section>
+
+    <section class="preview">
+      <h2>Live Preview</h2>
+      <img id="preview_img" alt="live preview" />
+    </section>
+
+    <section>
+      <h2>Views</h2>
+      <div id="views_grid" class="captures-grid"></div>
+    </section>
+
+    <section>
+      <h2>Results</h2>
+      <pre id="results_json"></pre>
+    </section>
+  </div>
+
+  <script src="/static/projector_calibration.js"></script>
+</body>
+</html>

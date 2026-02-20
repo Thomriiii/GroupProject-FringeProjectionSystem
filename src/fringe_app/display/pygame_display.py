@@ -73,3 +73,8 @@ class PygameProjectorDisplay:
         pygame.display.quit()
         self._opened = False
         self.screen = None
+
+    def get_projector_surface_size(self) -> tuple[int, int] | None:
+        if not self._opened or self.screen is None:
+            return None
+        return tuple(int(v) for v in self.screen.get_size())

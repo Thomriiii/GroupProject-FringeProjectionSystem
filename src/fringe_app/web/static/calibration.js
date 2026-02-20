@@ -111,6 +111,17 @@ function setupPreview() {
 async function init() {
   updateButtons();
   setupPreview();
+  try {
+    const applyRes = await fetch('/api/calibration/camera/apply', { method: 'POST' });
+    const apply = await applyRes.json();
+    if (!apply.ok) {
+      setError(apply.error || 'Failed to apply calibration camera controls');
+    } else {
+      summaryEl.textContent = `Preview DN: mean ${Number(apply.mean_dn).toFixed(1)} (min ${Number(apply.min_dn).toFixed(1)}, max ${Number(apply.max_dn).toFixed(1)})`;
+    }
+  } catch (err) {
+    setError('Failed to apply calibration camera controls');
+  }
   const res = await fetch('/api/calibration/sessions');
   const data = await res.json();
   const sessions = (data.sessions || []);

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import replace
 from datetime import datetime
 from typing import Optional, Dict, Any, Literal
 
@@ -104,7 +105,14 @@ class ScanController:
                 "ended_at": self._ended_at,
             }
 
-    def capture_single_frame(self, flush_frames: int = 1) -> np.ndarray:
+    def capture_single_frame(
+        self,
+        flush_frames: int = 1,
+        exposure_us: int | None = None,
+        analogue_gain: float | None = None,
+        awb_enable: bool | None = None,
+        settle_ms: int = 120,
+    ) -> np.ndarray:
         """
         Capture one full-resolution frame while idle.
         Used by web calibration flow.
@@ -119,6 +127,43 @@ class ScanController:
             if not self._camera_started:
                 self.camera.start(params)
                 self._camera_started = True
+            if exposure_us is not None or analogue_gain is not None:
+                exp = int(exposure_us if exposure_us is not None else (params.exposure_us or 2000))
+                gain = float(
+                    analogue_gain if analogue_gain is not None else (params.analogue_gain or 1.0)
+                )
+                awb = bool(awb_enable) if awb_enable is not None else False
+                controls_applied = False
+                try:
+                    self.camera.set_manual_controls(
+                        exposure_us=exp,
+                        analogue_gain=gain,
+                        awb_enable=awb,
+                    )
+                    controls_applied = True
+                    if settle_ms > 0:
+                        time.sleep(float(settle_ms) / 1000.0)
+                except Exception as exc:
+                    self.log.warning("set_manual_controls failed, falling back to camera restart: %s", exc)
+                # Some camera backends ignore runtime control changes while streaming.
+                # Fallback: restart camera with explicit manual params.
+                if not controls_applied:
+                    try:
+                        self.camera.stop()
+                    except Exception:
+                        pass
+                    self._camera_started = False
+                    override = replace(
+                        params,
+                        exposure_us=exp,
+                        analogue_gain=gain,
+                        awb_enable=awb,
+                        ae_enable=False,
+                    )
+                    self.camera.start(override)
+                    self._camera_started = True
+                    if settle_ms > 0:
+                        time.sleep(float(settle_ms) / 1000.0)
             for _ in range(max(0, int(flush_frames))):
                 try:
                     self.camera.capture_pair()
@@ -140,6 +185,34 @@ class ScanController:
         self._preview_stop.set()
         if self._preview_thread and self._preview_thread.is_alive():
             self._preview_thread.join(timeout=2.0)
+
+    def set_projector_calibration_light(self, enabled: bool, dn: int = 230) -> None:
+        """
+        Keep projector output at a fixed grayscale frame while user positions
+        the checkerboard during projector calibration.
+        """
+        with self._lock:
+            if self._state == "RUNNING":
+                raise RuntimeError("Cannot toggle projector calibration light while scan is running")
+        if not enabled:
+            try:
+                self.display.close()
+            except Exception:
+                pass
+            return
+
+        scan_cfg = self.config.get("scan", {}) or {}
+        disp_cfg = self.config.get("display", {}) or {}
+        if self._preview_params is not None:
+            width, height = self._preview_params.resolution
+        else:
+            width = int(scan_cfg.get("width", 1024))
+            height = int(scan_cfg.get("height", 768))
+        screen_index = scan_cfg.get("projector_screen_index", disp_cfg.get("screen_index"))
+        frame = np.full((int(height), int(width)), int(np.clip(dn, 0, 255)), dtype=np.uint8)
+        self.display.open(fullscreen=True, screen_index=screen_index)
+        self.display.show_gray(frame)
+        self.display.pump()
 
     def _scan_worker(self, params: ScanParams) -> None:
         run_id = None
@@ -172,6 +245,9 @@ class ScanController:
                 screen_index = self.config.get("display", {}).get("screen_index")
 
             self.display.open(fullscreen=True, screen_index=screen_index)
+            surface_size = self.display.get_projector_surface_size()
+            if surface_size is not None:
+                device_info["projector_surface_size"] = [int(surface_size[0]), int(surface_size[1])]
             if not self._preview_running:
                 with self._camera_lock:
                     self.camera.start(params)

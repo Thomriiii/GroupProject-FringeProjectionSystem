@@ -43,6 +43,7 @@ from fringe_app.vision.object_roi import detect_object_roi, ObjectRoiConfig
 from fringe_app.overlays.generate import overlay_masks, overlay_clipping
 from fringe_app.unwrap.temporal import unwrap_multi_frequency, save_unwrap_outputs
 from fringe_app.uv import phase_to_uv, save_uv_outputs
+from fringe_app.recon import load_stereo_model, reconstruct_uv_run, save_reconstruction_outputs
 
 
 @dataclass(slots=True)
@@ -64,6 +65,41 @@ def _load_config() -> dict:
         return {}
     import yaml
     return yaml.safe_load(cfg_path.read_text()) or {}
+
+
+def _calibration_root(cfg: dict) -> Path:
+    return Path(str((cfg.get("calibration", {}) or {}).get("root", "data/calibration")))
+
+
+def _camera_intrinsics_latest_path(cfg: dict) -> Path:
+    c = cfg.get("calibration", {}) or {}
+    root = _calibration_root(cfg)
+    camera_root = Path(str(c.get("camera_root", str(root / "camera"))))
+    candidates = [
+        camera_root / "intrinsics_latest.json",
+        root / "camera_intrinsics" / "intrinsics_latest.json",  # legacy
+        root / "intrinsics_latest.json",  # legacy
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    raise FileNotFoundError(
+        "Camera intrinsics not found. Expected data/calibration/camera/intrinsics_latest.json"
+    )
+
+
+def _projector_stereo_latest_path(cfg: dict) -> Path:
+    root = _calibration_root(cfg)
+    candidates = [
+        root / "projector" / "stereo_latest.json",
+        root / "projector" / "results" / "stereo_latest.json",  # legacy
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    raise FileNotFoundError(
+        "Projector stereo calibration not found. Expected data/calibration/projector/stereo_latest.json"
+    )
 
 
 def _camera_from_cfg(cfg: dict):
@@ -859,11 +895,23 @@ def _build_uv_from_orientation_runs(
         from PIL import Image
         roi_mask = (np.array(Image.open(roi_path)) > 0)
 
-    proj_w, proj_h = params.resolution
     v_meta = json.loads((vertical_run / "meta.json").read_text())
     h_meta = json.loads((horizontal_run / "meta.json").read_text())
     v_params = v_meta.get("params", {})
     h_params = h_meta.get("params", {})
+    v_surface = (v_meta.get("device_info", {}) or {}).get("projector_surface_size")
+    h_surface = (h_meta.get("device_info", {}) or {}).get("projector_surface_size")
+    if (
+        isinstance(v_surface, (list, tuple))
+        and isinstance(h_surface, (list, tuple))
+        and len(v_surface) == 2
+        and len(h_surface) == 2
+        and int(v_surface[0]) == int(h_surface[0])
+        and int(v_surface[1]) == int(h_surface[1])
+    ):
+        proj_w, proj_h = int(v_surface[0]), int(v_surface[1])
+    else:
+        proj_w, proj_h = params.resolution
     freq_semantics = str(v_params.get("frequency_semantics", params.frequency_semantics))
     uv_res = phase_to_uv(
         phi_abs_vertical=phi_v,
@@ -1051,6 +1099,50 @@ def cmd_pipeline_run_uv(args) -> int:
     return 0 if combined_ok else 12
 
 
+def cmd_reconstruct(args) -> int:
+    cfg = _load_config()
+    run_root = Path(cfg.get("storage", {}).get("run_root", "data/runs"))
+    run_dir = run_root / str(args.run)
+    if not run_dir.exists():
+        raise SystemExit(f"Run not found: {run_dir}")
+    if not (run_dir / "projector_uv" / "u.npy").exists():
+        raise SystemExit(f"Run does not contain projector_uv outputs: {run_dir}")
+
+    camera_intr_path = _camera_intrinsics_latest_path(cfg)
+    stereo_path = _projector_stereo_latest_path(cfg)
+    model = load_stereo_model(camera_intr_path, stereo_path)
+    result = reconstruct_uv_run(run_dir, model, recon_cfg=cfg.get("reconstruction", {}))
+
+    out_dir = Path(args.out) if args.out else (run_dir / "reconstruction")
+    meta = save_reconstruction_outputs(out_dir, result, recon_cfg=cfg.get("reconstruction", {}))
+    print(json.dumps({
+        "run_id": str(args.run),
+        "camera_intrinsics": str(camera_intr_path),
+        "projector_stereo": str(stereo_path),
+        "output_dir": str(out_dir),
+        "valid_recon_points": meta.get("valid_recon_points"),
+        "exported_points": meta.get("exported_points"),
+        "depth_median_m": meta.get("depth_median_m"),
+        "reproj_err_cam_median": meta.get("reproj_err_cam_median"),
+        "reproj_err_proj_median": meta.get("reproj_err_proj_median"),
+    }, indent=2))
+    return 0
+
+
+def cmd_pipeline_run_3d(args) -> int:
+    cfg = _load_config()
+    run_root = Path(cfg.get("storage", {}).get("run_root", "data/runs"))
+    t0 = time.time()
+    rc_uv = cmd_pipeline_run_uv(args)
+    if rc_uv != 0 and not bool(getattr(args, "force", False)):
+        return rc_uv
+    run_id = _latest_run_after(run_root, t0)
+    if not run_id:
+        print("Could not determine combined UV run id for reconstruction")
+        return rc_uv if rc_uv != 0 else 13
+    return cmd_reconstruct(argparse.Namespace(run=run_id, out=None))
+
+
 def cmd_experiment(args) -> int:
     cfg = _load_config()
     params = _build_params(args, cfg)
@@ -1072,6 +1164,88 @@ def cmd_quality_state(args) -> int:
         return 0
     state = load_quality_state(cfg)
     print(json.dumps(state, indent=2))
+    return 0
+
+
+def cmd_projector_calib_diagnose(args) -> int:
+    cfg = _load_config()
+    calib_root = Path((cfg.get("calibration", {}) or {}).get("root", "data/calibration"))
+    session_dir = calib_root / "projector" / "sessions" / str(args.session)
+    if not session_dir.exists():
+        raise SystemExit(f"Projector calibration session not found: {session_dir}")
+
+    session = json.loads((session_dir / "session.json").read_text()) if (session_dir / "session.json").exists() else {}
+    views = sorted([p for p in (session_dir / "views").glob("view_*") if p.is_dir()])
+    if not views:
+        print("No views in session")
+        return 0
+
+    print("view_id | valid_ratio | ok | nan_uv | mask_uv_false | near_edge | uv_gate_ok | res_mismatch")
+    reason_counts: Dict[str, int] = {}
+    corner_agg = {"nan_uv": 0, "mask_uv_false": 0, "near_edge": 0, "oob": 0}
+    by_id = {str(v.get("view_id")): v for v in session.get("views", [])}
+
+    for view_dir in views:
+        vid = view_dir.name
+        diag_path = view_dir / "view_diag.json"
+        corr_path = view_dir / "correspondences.json"
+        uv_meta_path = view_dir / "uv" / "uv_meta.json"
+
+        if diag_path.exists():
+            diag = json.loads(diag_path.read_text())
+        else:
+            corr = json.loads(corr_path.read_text()) if corr_path.exists() else {}
+            uv_meta = json.loads(uv_meta_path.read_text()) if uv_meta_path.exists() else {}
+            valid_mask = np.asarray(corr.get("valid_mask", []), dtype=bool)
+            proj_pts = np.asarray(corr.get("projector_corners_px", []), dtype=float)
+            nan_uv = int(np.isnan(proj_pts).any(axis=1).sum()) if proj_pts.size else 0
+            ok = int(np.count_nonzero(valid_mask))
+            diag = {
+                "uv": {
+                    "valid_ratio": float(corr.get("valid_ratio", 0.0)),
+                    "uv_gate_ok": bool(uv_meta.get("uv_gate_ok", False)),
+                },
+                "corner_validity_breakdown": {
+                    "ok": ok,
+                    "nan_uv": nan_uv,
+                    "mask_uv_false": 0,
+                    "near_edge": 0,
+                    "oob": 0,
+                },
+                "projector_resolution": {
+                    "mismatch": bool((uv_meta.get("projector_resolution", {}) or {}).get("mismatch", False)),
+                },
+            }
+            diag_path.write_text(json.dumps(diag, indent=2))
+
+        uv = diag.get("uv", {}) or {}
+        bd = diag.get("corner_validity_breakdown", {}) or {}
+        ok = int(bd.get("ok", 0))
+        nan_uv = int(bd.get("nan_uv", 0))
+        mask_false = int(bd.get("mask_uv_false", 0))
+        near_edge = int(bd.get("near_edge", 0))
+        oob = int(bd.get("oob", 0))
+        uv_gate_ok = bool(uv.get("uv_gate_ok", False))
+        mismatch = bool((diag.get("projector_resolution", {}) or {}).get("mismatch", False))
+        valid_ratio = float(uv.get("valid_ratio", 0.0))
+        print(
+            f"{vid} | {valid_ratio:>10.3f} | {ok:>2d} | {nan_uv:>6d} | {mask_false:>13d} | "
+            f"{near_edge:>9d} | {str(uv_gate_ok):>10s} | {str(mismatch):>12s}"
+        )
+        for k in corner_agg.keys():
+            corner_agg[k] += int(bd.get(k, 0))
+
+        session_reason_raw = (by_id.get(vid) or {}).get("reason", "")
+        session_reason = str(session_reason_raw).split(":", 1)[0].strip()
+        if session_reason and session_reason.lower() not in {"none", "null"}:
+            reason_counts[session_reason] = reason_counts.get(session_reason, 0) + 1
+
+    print("\nTop failure reasons:")
+    for reason, count in sorted(reason_counts.items(), key=lambda kv: kv[1], reverse=True)[:3]:
+        print(f"- {reason}: {count}")
+    print("\nAggregated corner invalidity:")
+    for k, v in corner_agg.items():
+        print(f"- {k}: {v}")
     return 0
 
 
@@ -1876,9 +2050,35 @@ def build_parser() -> argparse.ArgumentParser:
     pipeline_uv.add_argument("--no-retry", action="store_true")
     pipeline_uv.add_argument("--print-hints", action="store_true")
 
+    pipeline_3d = sub.add_parser("pipeline-run-3d")
+    pipeline_3d.add_argument("--n", type=int, default=None)
+    pipeline_3d.add_argument("--mode", type=str, choices=["stable", "fast"], default=None)
+    pipeline_3d.add_argument("--frequency", type=float, default=None)
+    pipeline_3d.add_argument("--frequencies", type=float, nargs="+", default=None)
+    pipeline_3d.add_argument("--settle-ms", type=int, default=150)
+    pipeline_3d.add_argument("--exposure-us", type=int, default=None)
+    pipeline_3d.add_argument("--gain", "--analogue-gain", dest="gain", type=float, default=None)
+    pipeline_3d.add_argument("--ae-enable", type=lambda v: str(v).lower() in {"1", "true", "yes", "on"}, default=None)
+    pipeline_3d.add_argument("--brightness-offset", type=float, default=None)
+    pipeline_3d.add_argument("--contrast", type=float, default=None)
+    pipeline_3d.add_argument("--min-intensity", type=float, default=None)
+    pipeline_3d.add_argument("--auto-normalise", dest="auto_normalise", action="store_true", default=True)
+    pipeline_3d.add_argument("--no-auto-normalise", dest="auto_normalise", action="store_false")
+    pipeline_3d.add_argument("--expert", action="store_true")
+    pipeline_3d.add_argument("--force", action="store_true")
+    pipeline_3d.add_argument("--no-retry", action="store_true")
+    pipeline_3d.add_argument("--print-hints", action="store_true")
+
+    reconstruct = sub.add_parser("reconstruct")
+    reconstruct.add_argument("--run", required=True, help="UV run id containing projector_uv/")
+    reconstruct.add_argument("--out", default=None, help="Optional output directory (defaults to run/reconstruction)")
+
     qstate = sub.add_parser("quality-state")
     qstate.add_argument("--reset", action="store_true")
     qstate.add_argument("--show", action="store_true")
+
+    pdiag = sub.add_parser("projector-calib-diagnose")
+    pdiag.add_argument("--session", required=True)
 
     return p
 
@@ -1908,7 +2108,13 @@ def main(argv: List[str] | None = None) -> int:
         return cmd_pipeline_run_safe(args)
     if args.cmd == "pipeline-run-uv":
         return cmd_pipeline_run_uv(args)
+    if args.cmd == "pipeline-run-3d":
+        return cmd_pipeline_run_3d(args)
+    if args.cmd == "reconstruct":
+        return cmd_reconstruct(args)
     if args.cmd == "quality-state":
         return cmd_quality_state(args)
+    if args.cmd == "projector-calib-diagnose":
+        return cmd_projector_calib_diagnose(args)
     parser.print_help()
     return 0
