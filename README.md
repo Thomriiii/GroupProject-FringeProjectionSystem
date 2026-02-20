@@ -1,90 +1,167 @@
-# Fringe Projection Scanner
+# Fringe App
 
-Structured-light fringe projection scanner built around a projector, a camera, and a Flask UI.
-The system generates phase-shift patterns, captures them with a camera, unwraps phase, and
-triangulates camera and projector rays into a 3D point cloud.
+Fringe projection system for Raspberry Pi with:
+- synchronized projector pattern display + camera capture
+- multi-frequency PSP (`[1, 4, 16]` default)
+- ROI-aware masking and temporal unwrapping
+- UV correspondence map generation
+- projector stereo calibration (camera ↔ projector)
+- stage-3 triangulation and point cloud export
 
-## Hardware and OS
-- Raspberry Pi or Linux host with Picamera2 support.
-- HDMI-connected projector or external display.
-- Camera calibrated at the same resolution used for scanning.
+## Requirements
 
-## Quick start
-1. Create and activate a virtual environment:
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate
-   ```
-2. Install dependencies:
-   ```bash
-   pip install numpy opencv-python flask pygame picamera2 scipy
-   ```
-   On Raspberry Pi, install Picamera2 and libcamera from the system packages.
-3. Run the scanner:
-   ```bash
-   cd GroupProject-FringeProjectionSystem
-   python3 main.py
-   ```
-4. Open the UI: `http://<device-ip>:5000`
+- Python 3.11+
+- Raspberry Pi camera stack (`libcamera`/`Picamera2`) for hardware capture
+- OpenCV (`cv2`) for checkerboard detection/calibration/triangulation utilities
 
-## How it works
-- `core/patterns.py` generates sinusoidal PSP patterns for vertical and horizontal fringes.
-- `core/camera.py` captures RGB/gray frames and locks exposure using a mid-grey reference.
-- `core/psp.py` computes wrapped phase and quality masks per frequency.
-- `core/unwrap.py` temporally unwraps phase from low to high frequency.
-- `core/geometry.py` converts unwrapped phase into projector pixel coordinates (u, v).
-- `core/triangulation.py` intersects camera and projector rays to form a point cloud.
-- `core/scan.py` orchestrates capture, decoding, and output persistence.
-- `web/server.py` provides the Flask UI, live MJPEG, and calibration routes.
+## Install
 
-## Calibration workflow
-### Camera calibration (`/calib`)
-1. Capture multiple checkerboard views (tilt and move across the frame).
-2. Click **Finish** to solve intrinsics.
-3. Outputs:
-   - `camera_intrinsics.npz`
-   - `calibration_report.txt`
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+```
 
-### Projector calibration (`/proj_calib`)
-1. Capture multiple poses. Each pose projects GrayCode frames, captures them, and
-   uses a bright checkerboard frame to link projector pixels to board corners.
-2. Click **Finish** to solve projector intrinsics and stereo extrinsics.
-3. Outputs (session folder and repo root):
-   - `projector_intrinsics.npz`
-   - `stereo_params.npz`
+## Run Server
 
-### Self-check
-Use `python -m calibration.selfcheck --session <session_dir>` to validate reprojection
-error against captured poses.
+```bash
+python -m fringe_app
+```
 
-## Scanning and reconstruction
-- Start scans from the UI or by calling `ScanController.run_scan`.
-- Each scan produces a timestamped folder under `scans/` containing:
-  - `phase_final.npy`, `mask_final.npy`
-  - `proj_u.npy`, `proj_v.npy`
-  - debug images and quality maps
-- Reconstruction is triggered from the UI or by calling
-  `core.triangulation.reconstruct_3d_from_scan`.
-  Outputs include `points_filtered.ply` and a simple single-view mesh.
+Pages:
+- Pipeline: `http://<pi-ip>:8000/`
+- Camera calibration: `http://<pi-ip>:8000/calibration`
+- Projector calibration: `http://<pi-ip>:8000/projector-calibration`
+- Reconstruction: `http://<pi-ip>:8000/reconstruction`
 
-## Diagnostics tools
-- `tools/check_resolution_consistency.py` verifies scan and calibration resolutions.
-- `tools/diagnose_undistortion.py` overlays grids and Hough lines for distortion checks.
-- `tools/plane_fit.py` fits a plane to a point cloud to spot streak/fan artifacts.
+## Core CLI
+
+Single-orientation scan:
+```bash
+python -m fringe_app scan --n 8 --frequencies 1 4 16 --orientation vertical --settle-ms 150
+```
+
+Phase, unwrap, score:
+```bash
+python -m fringe_app phase --run <run_id>
+python -m fringe_app unwrap --run <run_id> --use-roi auto
+python -m fringe_app score --run <run_id>
+```
+
+Safe pipeline (single orientation):
+```bash
+python -m fringe_app pipeline-run-safe --print-hints
+```
+
+UV pipeline (vertical + horizontal + projector UV):
+```bash
+python -m fringe_app pipeline-run-uv --print-hints
+```
+
+3D pipeline (UV + triangulation):
+```bash
+python -m fringe_app pipeline-run-3d --print-hints
+```
+
+Reconstruct from an existing UV run:
+```bash
+python -m fringe_app reconstruct --run <run_id>_uv
+```
+
+Quality state:
+```bash
+python -m fringe_app quality-state --show
+python -m fringe_app quality-state --reset
+```
+
+## Camera Calibration (Checkerboard)
+
+Workflow:
+1. Open `/calibration`
+2. Create session
+3. Capture checkerboard poses
+4. Calibrate
+
+Saved under:
+- `data/calibration/camera/sessions/<session_id>/...`
+- `data/calibration/camera/intrinsics_latest.json`
+
+Only captures with successful checkerboard detection are used for solving.
+
+## Projector Calibration (Stereo)
+
+Workflow:
+1. Open `/projector-calibration`
+2. Create or continue session
+3. Capture multiple checkerboard views
+4. Run projector stereo calibration
+
+Per-view data includes:
+- camera frame + checkerboard corners
+- UV artifacts (`u.npy`, `v.npy`, `mask_uv.npy`, `uv_meta.json`)
+- camera↔projector corner correspondences
+- diagnostics (`view_diag.json`, corner validity overlays)
+
+Calibration outputs:
+- `data/calibration/projector/sessions/<session_id>/results/stereo.json`
+- `data/calibration/projector/sessions/<session_id>/results/stereo.npz`
+- `data/calibration/projector/stereo_latest.json`
+
+## Reconstruction Outputs
+
+For UV run `data/runs/<run_id>_uv/`:
+
+`reconstruction/`
+- `xyz.npy` (H×W×3, NaN invalid)
+- `xyzrgb.npy` (optional exported xyz+rgb points)
+- `depth.npy`
+- `depth_debug_fixed.png`
+- `depth_debug_autoscale.png`
+- `cloud.ply`
+- `reprojection errors` (`reproj_err_cam.npy`, `reproj_err_proj.npy`)
+- `reconstruction_meta.json`
+- `masks/mask_uv.npy|png`, `masks/mask_recon.npy|png`
+
+Triangulation is done in the camera coordinate frame with distortion-aware normalized-point triangulation.
+
+## Data Layout
+
+### Runs
+
+Single-orientation run:
+- `data/runs/<run_id>/captures/`
+- `data/runs/<run_id>/phase/`
+- `data/runs/<run_id>/unwrap/`
+- `data/runs/<run_id>/roi/`
+- `data/runs/<run_id>/normalise/`
+- `data/runs/<run_id>/quality_report.json`
+
+Combined UV run:
+- `data/runs/<run_id>_uv/vertical/...`
+- `data/runs/<run_id>_uv/horizontal/...`
+- `data/runs/<run_id>_uv/projector_uv/...`
+- `data/runs/<run_id>_uv/reconstruction/...`
+
+### Calibration
+
+- `data/calibration/camera/...`
+- `data/calibration/projector/...`
 
 ## Configuration
-- `main.py` controls scan defaults such as `FREQS`, `N_PHASE`, and output roots.
-- `config/uv_convention.json` and `PROJ_UV_TRANSFORM` align scan UVs with calibration UVs.
-- `config/fake_projector_config.json` supplies fallback projector parameters.
-- Environment flags:
-  - `ALLOW_INTRINSIC_RESCALE=1` to rescale intrinsics for pure image resize (no crop).
-  - `PROJ_UV_TRANSFORM=<name>` to override UV axis convention.
-  - `DIAGNOSE_PROJ_UV_TRANSFORM=1` to print candidate UV transforms.
-  - `REQUIRE_PROJECTOR_CALIB=1` to disallow fake projector parameters.
 
-## Project layout
-- `core/`: capture, PSP, unwrapping, UV mapping, and reconstruction.
-- `calibration/`: camera and projector calibration routines.
-- `web/`, `templates/`, `static/`: Flask UI and assets.
-- `tools/`: diagnostics and geometry checks.
-- `scans/`, `calib/`: output folders created at runtime.
+Main config: `config/default.yaml`
+
+Important sections:
+- `scan`, `patterns`, `phase`, `unwrap`, `roi`
+- `normalise`, `quality_gate`, `quality`, `uv_gate`
+- `calibration`, `projector_calibration`
+- `reconstruction`
+
+## Notes
+
+- The pipeline is strict about clipping and quality gates unless `--force` is used.
+- Projector and camera calibration resolutions must match UV run expectations.
+- If 3D reconstruction fails, check:
+  - `data/calibration/projector/stereo_latest.json`
+  - `data/runs/<run_id>_uv/projector_uv/uv_meta.json`
+  - `data/runs/<run_id>_uv/reconstruction/reconstruction_meta.json`

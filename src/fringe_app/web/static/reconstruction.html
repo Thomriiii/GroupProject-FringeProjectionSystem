@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Reconstruction</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>3D Reconstruction</h1>
+      <a href="/">Back to Pipeline</a>
+    </header>
+
+    <section class="actions">
+      <label for="uv_run_select">UV Run</label>
+      <select id="uv_run_select"></select>
+      <button id="refresh_runs_btn">Refresh Runs</button>
+      <button id="reconstruct_btn">Reconstruct Point Cloud</button>
+    </section>
+
+    <section>
+      <div id="status" class="status">idle</div>
+      <div id="error" class="error"></div>
+      <pre id="summary_json"></pre>
+    </section>
+
+    <section class="preview">
+      <h2>Live Preview</h2>
+      <img id="preview_img" alt="live preview" />
+    </section>
+
+    <section>
+      <h2>Depth Preview</h2>
+      <div class="captures-grid">
+        <div class="capture-card">
+          <div class="capture-title">Fixed</div>
+          <img id="depth_fixed_img" alt="depth fixed" />
+        </div>
+        <div class="capture-card">
+          <div class="capture-title">Autoscale</div>
+          <img id="depth_auto_img" alt="depth autoscale" />
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Outputs</h2>
+      <ul id="outputs_list"></ul>
+    </section>
+  </div>
+
+  <script src="/static/reconstruction.js"></script>
+</body>
+</html>

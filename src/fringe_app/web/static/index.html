@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Fringe App</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Fringe Pipeline</h1>
+      <div class="header-right">
+        <a href="/calibration">Calibration</a>
+        <a href="/projector-calibration">Projector Calibration</a>
+        <a href="/reconstruction">Reconstruction</a>
+        <div id="status" class="status">idle</div>
+      </div>
+    </header>
+
+    <section class="actions">
+      <button id="start_pipeline_btn">Start End-to-End Pipeline Scan</button>
+    </section>
+
+    <section class="preview">
+      <h2>Live Preview</h2>
+      <img id="preview_img" alt="preview" />
+    </section>
+
+    <section class="runs">
+      <h2>Run Downloads</h2>
+      <ul id="runs_list"></ul>
+    </section>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
