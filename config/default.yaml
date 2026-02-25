@@ -112,6 +112,8 @@ calibration:
   camera_root: data/calibration/camera
   min_valid_detections: 10
   capture_flush_frames: 1
+  residual_p95_board_threshold: 1.2
+  residual_gt_1rad_pct_board_max: 0.15
   camera:
     # Calibration page uses brighter manual controls than scan defaults.
     exposure_us: 12000
@@ -167,6 +169,14 @@ projector_calibration:
       min_area_px: 2000
       b_thresh_unwrap: 5.0
       a_min_unwrap: 10.0
+  uv_refinement:
+    enabled: true
+    patch_radius: 4
+    min_valid_points: 15
+    robust_refit: true
+    robust_reject_frac: 0.10
+    max_cond: 10000.0
+    min_view_valid_ratio: 0.85
   uv_gate:
     enabled: true
     min_u_range_px: 30

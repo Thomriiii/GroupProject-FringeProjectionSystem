@@ -1249,6 +1249,83 @@ def cmd_projector_calib_diagnose(args) -> int:
     return 0
 
 
+def cmd_projector_calibrate(args) -> int:
+    cfg = _load_config()
+    calib_root = Path((cfg.get("calibration", {}) or {}).get("root", "data/calibration"))
+    session_dir = calib_root / "projector" / "sessions" / str(args.session)
+    if not session_dir.exists():
+        raise SystemExit(f"Projector calibration session not found: {session_dir}")
+
+    intr_path = _camera_intrinsics_latest_path(cfg)
+    # Local import avoids circular import at module load.
+    from fringe_app.calibration.projector_stereo import stereo_calibrate, stereo_calibrate_refined
+
+    use_refine = bool(getattr(args, "refine_uv", False))
+    if use_refine:
+        result = stereo_calibrate_refined(
+            session_dir=session_dir,
+            cfg=cfg,
+            camera_intrinsics_path=intr_path,
+            recalibrate=bool(getattr(args, "recalibrate", False)),
+            prune=bool(getattr(args, "prune", False)),
+        )
+        print(f"session={args.session}")
+        print(f"baseline_rms={float(result.get('baseline_rms', float('nan'))):.4f}")
+        print(f"refined_rms={float(result.get('refined_rms', float('nan'))):.4f}")
+        print(f"refined_pruned_rms={float(result.get('refined_pruned_rms', float('nan'))):.4f}")
+        best_views = result.get("best_view_ids", []) or []
+        print("best_view_ids=" + (", ".join(str(v) for v in best_views) if best_views else "(none)"))
+        compare = result.get("compare_summary", {}) or {}
+        pruned = compare.get("refined_pruned", {}) or {}
+        per_path = session_dir / "results" / "stereo_refined_pruned.json"
+        if per_path.exists():
+            try:
+                per = json.loads(per_path.read_text()).get("per_view_errors", []) or []
+                worst = sorted(per, key=lambda x: float(x.get("projector_reproj_error_px", 0.0)), reverse=True)[:3]
+                print("top3_worst_projector_reproj=" + ", ".join(
+                    f"{w.get('view_id')}:{float(w.get('projector_reproj_error_px', float('nan'))):.3f}px" for w in worst
+                ))
+            except Exception:
+                pass
+        print(f"uv_refine_report={session_dir / 'results' / 'uv_refine_session_report.json'}")
+        if bool(getattr(args, "recalibrate", False)):
+            print(f"stereo_refined={session_dir / 'results' / 'stereo_refined.json'}")
+        if bool(getattr(args, "prune", False)):
+            print(f"stereo_refined_pruned={session_dir / 'results' / 'stereo_refined_pruned.json'}")
+            print(f"prune_refined_report={session_dir / 'results' / 'prune_refined_report.json'}")
+        print(f"compare_summary={session_dir / 'reports' / 'refine_compare' / 'compare_summary.json'}")
+        return 0
+
+    result = stereo_calibrate(
+        session_dir=session_dir,
+        cfg=cfg,
+        camera_intrinsics_path=intr_path,
+        prune=bool(getattr(args, "prune", False)),
+    )
+
+    rms = float(result.get("rms_stereo", float("nan")))
+    views_used = int(result.get("views_used", 0))
+    print(f"session={args.session}")
+    print(f"rms_stereo={rms:.4f}")
+    print(f"views_used={views_used}")
+
+    if bool(getattr(args, "prune", False)):
+        report = result.get("prune_report", {}) or {}
+        initial_rms = report.get("initial_rms")
+        final_rms = report.get("final_rms")
+        removed = report.get("views_removed", []) or []
+        if initial_rms is not None and final_rms is not None:
+            print(f"Initial RMS: {float(initial_rms):.4f}")
+            print(f"Final RMS: {float(final_rms):.4f}")
+        print("Removed views: " + (", ".join(str(v) for v in removed) if removed else "(none)"))
+        print(f"prune_report={session_dir / 'results' / 'prune_report.json'}")
+        print(f"stereo_pruned={session_dir / 'results' / 'stereo_pruned.json'}")
+    else:
+        print(f"stereo={session_dir / 'results' / 'stereo.json'}")
+
+    return 0
+
+
 def _print_score(score):
     print(
         f"valid_ratio={score.valid_ratio:.3f} | largest_component_ratio={score.largest_component_ratio:.3f} | "
@@ -2080,6 +2157,12 @@ def build_parser() -> argparse.ArgumentParser:
     pdiag = sub.add_parser("projector-calib-diagnose")
     pdiag.add_argument("--session", required=True)
 
+    pcal = sub.add_parser("projector-calibrate")
+    pcal.add_argument("--session", required=True)
+    pcal.add_argument("--prune", action="store_true")
+    pcal.add_argument("--refine-uv", action="store_true")
+    pcal.add_argument("--recalibrate", action="store_true")
+
     return p
 
 
@@ -2116,5 +2199,7 @@ def main(argv: List[str] | None = None) -> int:
         return cmd_quality_state(args)
     if args.cmd == "projector-calib-diagnose":
         return cmd_projector_calib_diagnose(args)
+    if args.cmd == "projector-calibrate":
+        return cmd_projector_calibrate(args)
     parser.print_help()
     return 0

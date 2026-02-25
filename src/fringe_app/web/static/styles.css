@@ -79,3 +79,22 @@ header {
   height: auto;
   border: 1px solid #ccc;
 }
+
+#coverage_heatmap {
+  margin-top: 8px;
+  display: grid;
+  grid-template-columns: repeat(8, 20px);
+  gap: 4px;
+}
+
+.coverage-cell {
+  width: 20px;
+  height: 20px;
+  border: 1px solid #bbb;
+  background: #eee;
+}
+
+.coverage-cell.filled {
+  background: #4ba96f;
+  border-color: #2f754a;
+}

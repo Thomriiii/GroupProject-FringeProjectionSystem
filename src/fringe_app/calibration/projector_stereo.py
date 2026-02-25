@@ -7,6 +7,7 @@ import json
 import shutil
 import time
 from collections import Counter
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -22,8 +23,21 @@ else:
     _cv2_import_error = None
 
 from PIL import Image
+from PIL import ImageDraw
 
 from fringe_app.calibration.checkerboard import detect_checkerboard, save_image
+from fringe_app.calibration.projector_session import (
+    add_view_if_valid,
+    load_session as load_projector_session,
+    next_view_id,
+    recent_accepted_poses,
+    save_session as save_projector_session,
+)
+from fringe_app.calibration.projector_view_gating import (
+    ProjectorViewDiagnostics,
+    evaluate_projector_view,
+)
+from fringe_app.calibration.uv_refine import UvRefineConfig, refine_uv_at_corners
 from fringe_app.cli import cmd_phase, cmd_unwrap
 from fringe_app.core.models import ScanParams
 from fringe_app.phase.masking_post import build_unwrap_mask
@@ -54,14 +68,11 @@ def _session_json_path(session_dir: Path) -> Path:
 
 
 def _load_session(session_dir: Path) -> dict[str, Any]:
-    p = _session_json_path(session_dir)
-    if not p.exists():
-        raise FileNotFoundError(f"Projector calibration session not found: {session_dir.name}")
-    return json.loads(p.read_text())
+    return load_projector_session(session_dir)
 
 
 def _save_session(session_dir: Path, data: dict[str, Any]) -> None:
-    _session_json_path(session_dir).write_text(json.dumps(data, indent=2))
+    save_projector_session(session_dir, data)
 
 
 def _make_scan_params(cfg: dict, orientation: str) -> ScanParams:
@@ -137,6 +148,20 @@ def _load_json(path: Path) -> dict[str, Any]:
         return {}
 
 
+def _find_camera_intrinsics_latest(cfg: dict) -> Path | None:
+    calib = cfg.get("calibration", {}) or {}
+    candidates = [
+        Path(calib.get("camera_root", "data/calibration/camera")) / "intrinsics_latest.json",
+        Path(calib.get("root", "data/calibration")) / "camera" / "intrinsics_latest.json",
+        Path("data/calibration/camera/intrinsics_latest.json"),
+        Path("data/calibration/camera_intrinsics/intrinsics_latest.json"),
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
+
+
 def create_session(root_dir: Path, cfg: dict) -> str:
     sessions_dir = _sessions_root(root_dir)
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -159,6 +184,7 @@ def create_session(root_dir: Path, cfg: dict) -> str:
         "capture": pcal.get("capture", {}),
         "uv_mask_policy": pcal.get("uv_mask_policy", {}),
         "uv_gate": pcal.get("uv_gate", {}),
+        "uv_refinement": pcal.get("uv_refinement", {}),
     }
     (session_dir / "config.json").write_text(json.dumps(session_cfg, indent=2))
     session = {
@@ -166,9 +192,30 @@ def create_session(root_dir: Path, cfg: dict) -> str:
         "created_at": datetime.now().isoformat(),
         "config": session_cfg,
         "views": [],
+        "accepted_pose_history": [],
+        "coverage_map": {
+            "projector_size": [
+                int((session_cfg.get("projector", {}) or {}).get("width", 1024)),
+                int((session_cfg.get("projector", {}) or {}).get("height", 768)),
+            ],
+            "bins_x": 8,
+            "bins_y": 8,
+            "grid": [[0 for _ in range(8)] for _ in range(8)],
+            "covered_bins": 0,
+            "total_bins": 64,
+            "coverage_ratio": 0.0,
+        },
+        "capture_attempts": 0,
+        "last_capture_result": None,
         "results": None,
     }
     _save_session(session_dir, session)
+    try:
+        (session_dir / "session_coverage.json").write_text(
+            json.dumps(session["coverage_map"], indent=2)
+        )
+    except Exception:
+        pass
     return session_id
 
 
@@ -183,6 +230,52 @@ def delete_view(session_dir: Path, view_id: str) -> None:
     if vdir.exists():
         shutil.rmtree(vdir)
     session["views"] = [v for v in session.get("views", []) if v.get("view_id") != view_id]
+    # Rebuild coverage map from remaining accepted views.
+    proj_cfg = (session.get("config", {}) or {}).get("projector", {}) or {}
+    pw = int(proj_cfg.get("width", 1024))
+    ph = int(proj_cfg.get("height", 768))
+    cov = {
+        "projector_size": [pw, ph],
+        "bins_x": 8,
+        "bins_y": 8,
+        "grid": [[0 for _ in range(8)] for _ in range(8)],
+        "covered_bins": 0,
+        "total_bins": 64,
+        "coverage_ratio": 0.0,
+    }
+    for view in session.get("views", []) or []:
+        vid = str(view.get("view_id", ""))
+        if not vid:
+            continue
+        corr_path = session_dir / "views" / vid / "correspondences.json"
+        if not corr_path.exists():
+            continue
+        try:
+            corr = json.loads(corr_path.read_text())
+            pts = np.asarray(corr.get("projector_corners_px", []), dtype=np.float32).reshape(-1, 2)
+            vm = np.asarray(corr.get("valid_mask", []), dtype=bool).reshape(-1)
+            pts = pts[vm]
+            if pts.size == 0:
+                continue
+            grid = np.asarray(cov["grid"], dtype=np.int32)
+            u = np.clip(pts[:, 0], 0.0, float(pw - 1))
+            v = np.clip(pts[:, 1], 0.0, float(ph - 1))
+            bx = np.clip((u / float(max(1, pw))) * 8, 0.0, 7.999).astype(np.int32)
+            by = np.clip((v / float(max(1, ph))) * 8, 0.0, 7.999).astype(np.int32)
+            grid[by, bx] = 1
+            cov["grid"] = grid.astype(int).tolist()
+        except Exception:
+            continue
+    g = np.asarray(cov["grid"], dtype=np.int32)
+    cov["covered_bins"] = int(np.count_nonzero(g))
+    cov["coverage_ratio"] = float(cov["covered_bins"] / 64.0)
+    session["coverage_map"] = cov
+    # Conservative reset of pose history after deletion to avoid stale duplicate checks.
+    session["accepted_pose_history"] = []
+    try:
+        (session_dir / "session_coverage.json").write_text(json.dumps(cov, indent=2))
+    except Exception:
+        pass
     _save_session(session_dir, session)
 
 
@@ -304,6 +397,11 @@ def _calibration_uv_policy(cfg: dict) -> dict[str, Any]:
         "keep_largest_component": bool(unwrap_policy.get("keep_largest_component", True)),
         "min_area_px": int(unwrap_policy.get("min_area_px", 2000)),
     }
+
+
+def _uv_refine_config(cfg: dict) -> UvRefineConfig:
+    pcal = cfg.get("projector_calibration", {}) or {}
+    return UvRefineConfig.from_dict((pcal.get("uv_refinement", {}) or {}))
 
 
 def _build_unwrap_masks_for_run(
@@ -524,11 +622,15 @@ def _sample_uv(
     pcal = cfg.get("projector_calibration", {}) or {}
     cap_cfg = pcal.get("capture", {}) or {}
     uv_cfg = cap_cfg.get("uv_sample", {}) or {}
+    uv_refine_cfg = pcal.get("uv_refinement", {}) or {}
     method = str(uv_cfg.get("method", "bilinear"))
-    patch_radius = int(uv_cfg.get("patch_radius_px", 2))
+    patch_radius = max(3, int(uv_cfg.get("patch_radius_px", 2)))
     use_patch_median = bool(uv_cfg.get("use_patch_median", True))
     min_finite_samples = int(uv_cfg.get("min_finite_samples", 8))
-    edge_margin = int(cap_cfg.get("max_corner_uv_edge_px", 2))
+    edge_margin = max(2, int(cap_cfg.get("max_corner_uv_edge_px", 2)))
+    refine_enabled = bool(uv_refine_cfg.get("enabled", True))
+    refine_radius = max(1, int(uv_refine_cfg.get("patch_radius", 4)))
+    refine_min_points = max(3, int(uv_refine_cfg.get("min_valid_points", 10)))
     proj = pcal.get("projector", {}) or {}
     if projector_size is not None:
         pw = int(projector_size[0])
@@ -542,6 +644,9 @@ def _sample_uv(
     valid = np.zeros((cam.shape[0],), dtype=bool)
     reasons: list[str] = []
     finite_counts: list[int] = []
+    refine_used = 0
+    refine_patch_points: list[int] = []
+    refine_residuals: list[float] = []
 
     h, w = u.shape
     for i, (x, y) in enumerate(cam):
@@ -555,6 +660,48 @@ def _sample_uv(
 
         us = float("nan")
         vs = float("nan")
+        # Subpixel UV refinement via local plane fitting.
+        # When enabled, this path is authoritative for corner validity.
+        if refine_enabled and refine_radius > 0:
+            xr0 = max(0, int(np.floor(float(x))) - refine_radius)
+            xr1 = min(w, int(np.floor(float(x))) + refine_radius + 1)
+            yr0 = max(0, int(np.floor(float(y))) - refine_radius)
+            yr1 = min(h, int(np.floor(float(y))) + refine_radius + 1)
+            pm = mask_uv[yr0:yr1, xr0:xr1]
+            pu = u[yr0:yr1, xr0:xr1]
+            pv = v[yr0:yr1, xr0:xr1]
+            local_valid = pm & np.isfinite(pu) & np.isfinite(pv)
+            if np.any(local_valid):
+                ys_local, xs_local = np.where(local_valid)
+                xs_abs = xs_local.astype(np.float64) + float(xr0)
+                ys_abs = ys_local.astype(np.float64) + float(yr0)
+                us_vals = pu[local_valid].astype(np.float64)
+                vs_vals = pv[local_valid].astype(np.float64)
+                finite_count = int(min(us_vals.size, vs_vals.size))
+                if finite_count >= refine_min_points:
+                    A = np.column_stack([xs_abs, ys_abs, np.ones(xs_abs.shape[0], dtype=np.float64)])
+                    try:
+                        coeff_u, *_ = np.linalg.lstsq(A, us_vals, rcond=None)
+                        coeff_v, *_ = np.linalg.lstsq(A, vs_vals, rcond=None)
+                        us_pred = float(coeff_u[0] * float(x) + coeff_u[1] * float(y) + coeff_u[2])
+                        vs_pred = float(coeff_v[0] * float(x) + coeff_v[1] * float(y) + coeff_v[2])
+                        if np.isfinite(us_pred) and np.isfinite(vs_pred):
+                            us = us_pred
+                            vs = vs_pred
+                            refine_used += 1
+                            refine_patch_points.append(finite_count)
+                            u_fit = A @ coeff_u
+                            v_fit = A @ coeff_v
+                            r_u = float(np.mean(np.abs(us_vals - u_fit)))
+                            r_v = float(np.mean(np.abs(vs_vals - v_fit)))
+                            refine_residuals.append(0.5 * (r_u + r_v))
+                    except Exception:
+                        pass
+                # Refinement mode rejects sparse/unstable local UV support.
+                if not (np.isfinite(us) and np.isfinite(vs)):
+                    reasons.append("nan_uv")
+                    finite_counts.append(finite_count)
+                    continue
         if use_patch_median and patch_radius > 0:
             x0 = max(0, xi - patch_radius)
             x1 = min(w, xi + patch_radius + 1)
@@ -566,7 +713,7 @@ def _sample_uv(
             vals_u = pu[patch_mask & np.isfinite(pu)]
             vals_v = pv[patch_mask & np.isfinite(pv)]
             finite_count = int(min(vals_u.size, vals_v.size))
-            if finite_count >= max(1, min_finite_samples):
+            if finite_count >= max(1, min_finite_samples) and not (np.isfinite(us) and np.isfinite(vs)):
                 us = float(np.median(vals_u))
                 vs = float(np.median(vals_v))
         if not (np.isfinite(us) and np.isfinite(vs)):
@@ -611,6 +758,14 @@ def _sample_uv(
         "use_patch_median": use_patch_median,
         "patch_radius_px": patch_radius,
         "min_finite_samples": min_finite_samples,
+        "uv_refinement": {
+            "enabled": refine_enabled,
+            "patch_radius": refine_radius,
+            "min_valid_points": refine_min_points,
+            "refined_corners": int(refine_used),
+            "mean_patch_size": float(np.mean(refine_patch_points)) if refine_patch_points else 0.0,
+            "plane_fit_residual_mean": float(np.mean(refine_residuals)) if refine_residuals else 0.0,
+        },
         "max_corner_uv_edge_px": edge_margin,
         "projector_size_for_sampling": [int(pw), int(ph)],
     }
@@ -681,6 +836,136 @@ def _draw_corner_validity_overlay(
     return out
 
 
+def _save_uv_refine_delta_overlay(
+    image: np.ndarray,
+    corners_cam: np.ndarray,
+    uv_raw: np.ndarray,
+    uv_refined: np.ndarray,
+    valid_refined: np.ndarray,
+    out_path: Path,
+) -> dict[str, float]:
+    if image.ndim == 2:
+        rgb = np.stack([image, image, image], axis=2).astype(np.uint8)
+    else:
+        rgb = image[:, :, :3].astype(np.uint8).copy()
+    canvas = Image.fromarray(rgb)
+    draw = ImageDraw.Draw(canvas)
+
+    corners = np.asarray(corners_cam, dtype=np.float32).reshape(-1, 2)
+    raw = np.asarray(uv_raw, dtype=np.float32).reshape(-1, 2)
+    refined = np.asarray(uv_refined, dtype=np.float32).reshape(-1, 2)
+    valid = np.asarray(valid_refined, dtype=bool).reshape(-1)
+    if corners.shape[0] != raw.shape[0] or raw.shape[0] != refined.shape[0] or refined.shape[0] != valid.shape[0]:
+        canvas.save(out_path)
+        return {"mean_delta_px": float("nan"), "p95_delta_px": float("nan"), "max_delta_px": float("nan")}
+
+    delta = np.linalg.norm(refined - raw, axis=1)
+    finite = np.isfinite(delta) & np.isfinite(raw[:, 0]) & np.isfinite(raw[:, 1]) & np.isfinite(refined[:, 0]) & np.isfinite(refined[:, 1])
+    delta_valid = delta[valid & finite]
+    dmax = float(np.max(delta_valid)) if delta_valid.size else 1.0
+    if dmax <= 1e-6:
+        dmax = 1.0
+
+    for (x, y), d, ok in zip(corners, delta, valid):
+        if not np.isfinite(x) or not np.isfinite(y):
+            continue
+        if not ok or not np.isfinite(d):
+            color = (255, 64, 64)
+        else:
+            t = float(np.clip(d / dmax, 0.0, 1.0))
+            color = (int(255 * t), int(255 * (1.0 - t)), 80)
+        r = 4
+        draw.ellipse((x - r, y - r, x + r, y + r), outline=color, width=1)
+
+    mean_delta = float(np.mean(delta_valid)) if delta_valid.size else float("nan")
+    p95_delta = float(np.percentile(delta_valid, 95)) if delta_valid.size else float("nan")
+    max_delta = float(np.max(delta_valid)) if delta_valid.size else float("nan")
+    label = f"mean={mean_delta:.3f}px p95={p95_delta:.3f}px"
+    draw.rectangle((8, 8, 360, 36), fill=(0, 0, 0))
+    draw.text((14, 12), label, fill=(255, 255, 64))
+    canvas.save(out_path)
+    return {"mean_delta_px": mean_delta, "p95_delta_px": p95_delta, "max_delta_px": max_delta}
+
+
+def _draw_simple_bar_plot(
+    values: list[float],
+    labels: list[str],
+    out_path: Path,
+    title: str,
+) -> None:
+    w, h = 900, 520
+    m_l, m_r, m_t, m_b = 70, 30, 60, 80
+    img = Image.new("RGB", (w, h), (20, 20, 24))
+    draw = ImageDraw.Draw(img)
+    draw.text((20, 18), title, fill=(235, 235, 235))
+
+    finite_vals = [v for v in values if np.isfinite(v)]
+    ymax = max(finite_vals) if finite_vals else 1.0
+    if ymax <= 0:
+        ymax = 1.0
+    n = max(1, len(values))
+    plot_w = w - m_l - m_r
+    plot_h = h - m_t - m_b
+    bar_w = max(12, int(plot_w / (n * 1.8)))
+    gap = (plot_w - n * bar_w) / max(1, n + 1)
+    draw.line((m_l, h - m_b, w - m_r, h - m_b), fill=(120, 120, 120), width=1)
+    draw.line((m_l, m_t, m_l, h - m_b), fill=(120, 120, 120), width=1)
+
+    for i, (v, lbl) in enumerate(zip(values, labels)):
+        x0 = int(m_l + gap * (i + 1) + bar_w * i)
+        x1 = x0 + bar_w
+        if np.isfinite(v):
+            bh = int(plot_h * (v / ymax))
+            y0 = h - m_b - bh
+            draw.rectangle((x0, y0, x1, h - m_b), fill=(74, 154, 255))
+            draw.text((x0 - 4, y0 - 18), f"{v:.3f}", fill=(220, 220, 220))
+        draw.text((x0 - 4, h - m_b + 8), lbl, fill=(220, 220, 220))
+    img.save(out_path)
+
+
+def _draw_group_bar_plot(
+    categories: list[str],
+    before_vals: list[float],
+    after_vals: list[float],
+    out_path: Path,
+    title: str,
+) -> None:
+    w, h = 1000, 560
+    m_l, m_r, m_t, m_b = 70, 30, 60, 110
+    img = Image.new("RGB", (w, h), (20, 20, 24))
+    draw = ImageDraw.Draw(img)
+    draw.text((20, 18), title, fill=(235, 235, 235))
+
+    vals = [v for v in (before_vals + after_vals) if np.isfinite(v)]
+    ymax = max(vals) if vals else 1.0
+    if ymax <= 0:
+        ymax = 1.0
+    n = max(1, len(categories))
+    plot_w = w - m_l - m_r
+    plot_h = h - m_t - m_b
+    group_w = plot_w / n
+    bw = max(6, int(group_w * 0.28))
+    draw.line((m_l, h - m_b, w - m_r, h - m_b), fill=(120, 120, 120), width=1)
+    draw.line((m_l, m_t, m_l, h - m_b), fill=(120, 120, 120), width=1)
+    for i, cat in enumerate(categories):
+        gx = m_l + int(i * group_w + group_w * 0.5)
+        b = before_vals[i] if i < len(before_vals) else float("nan")
+        a = after_vals[i] if i < len(after_vals) else float("nan")
+        if np.isfinite(b):
+            bh = int(plot_h * (b / ymax))
+            draw.rectangle((gx - bw - 2, h - m_b - bh, gx - 2, h - m_b), fill=(255, 146, 76))
+        if np.isfinite(a):
+            ah = int(plot_h * (a / ymax))
+            draw.rectangle((gx + 2, h - m_b - ah, gx + bw + 2, h - m_b), fill=(76, 175, 80))
+        draw.text((gx - 24, h - m_b + 8), cat, fill=(220, 220, 220))
+    draw.rectangle((w - 240, 16, w - 28, 52), fill=(0, 0, 0))
+    draw.rectangle((w - 230, 22, w - 212, 36), fill=(255, 146, 76))
+    draw.text((w - 206, 20), "before", fill=(220, 220, 220))
+    draw.rectangle((w - 140, 22, w - 122, 36), fill=(76, 175, 80))
+    draw.text((w - 116, 20), "after", fill=(220, 220, 220))
+    img.save(out_path)
+
+
 def _board_mask_from_corners(shape: tuple[int, int], corners: np.ndarray) -> np.ndarray:
     cv = _require_cv2()
     h, w = shape
@@ -701,6 +986,65 @@ def _sample_b_on_board(run_dir: Path, freq: float, board_mask: np.ndarray) -> fl
     if vals.size == 0:
         return 0.0
     return float(np.median(vals))
+
+
+def _board_residual_stats(
+    run_dir_vertical: Path,
+    run_dir_horizontal: Path,
+    board_mask: np.ndarray,
+) -> dict[str, float]:
+    def _load_residual(run_dir: Path) -> np.ndarray | None:
+        p = run_dir / "unwrap" / "residual.npy"
+        if not p.exists():
+            return None
+        try:
+            return np.load(p).astype(np.float32)
+        except Exception:
+            return None
+
+    rv = _load_residual(run_dir_vertical)
+    rh = _load_residual(run_dir_horizontal)
+    area_ratio = float(np.mean(board_mask)) if board_mask.size else 0.0
+
+    def _p95_on_board(arr: np.ndarray | None) -> float:
+        if arr is None or arr.shape != board_mask.shape:
+            return float("nan")
+        vals = arr[board_mask & np.isfinite(arr)]
+        if vals.size == 0:
+            return float("nan")
+        return float(np.percentile(vals, 95))
+
+    p95_v = _p95_on_board(rv)
+    p95_h = _p95_on_board(rh)
+    if np.isfinite(p95_v) and np.isfinite(p95_h):
+        p95 = float(max(p95_v, p95_h))
+    elif np.isfinite(p95_v):
+        p95 = float(p95_v)
+    elif np.isfinite(p95_h):
+        p95 = float(p95_h)
+    else:
+        p95 = float("nan")
+
+    gt_vals: list[np.ndarray] = []
+    for arr in (rv, rh):
+        if arr is None or arr.shape != board_mask.shape:
+            continue
+        vals = arr[board_mask & np.isfinite(arr)]
+        if vals.size:
+            gt_vals.append(vals)
+    if gt_vals:
+        stacked = np.concatenate(gt_vals)
+        gt_1 = float(np.mean(np.abs(stacked) > 1.0))
+    else:
+        gt_1 = float("nan")
+
+    return {
+        "unwrap_residual_p95_board": p95,
+        "unwrap_residual_vertical_p95_board": p95_v,
+        "unwrap_residual_horizontal_p95_board": p95_h,
+        "unwrap_residual_gt_1rad_pct_board": gt_1,
+        "board_mask_area_ratio": area_ratio,
+    }
 
 
 def _build_view_hints(
@@ -742,19 +1086,9 @@ def capture_view(session_dir: Path, controller, cfg: dict) -> dict[str, Any]:
     """
     _require_cv2()
     session = _load_session(session_dir)
-    existing_ids: set[str] = {
-        str(v.get("view_id"))
-        for v in session.get("views", [])
-        if v.get("view_id")
-    }
-    for p in (session_dir / "views").glob("view_*"):
-        if p.is_dir():
-            existing_ids.add(p.name)
-    view_idx = 1
-    view_id = f"view_{view_idx:04d}"
-    while view_id in existing_ids:
-        view_idx += 1
-        view_id = f"view_{view_idx:04d}"
+    proj_cfg0 = ((session.get("config", {}) or {}).get("projector", {}) or {})
+    proj_size0 = (int(proj_cfg0.get("width", 1024)), int(proj_cfg0.get("height", 768)))
+    view_id = next_view_id(session_dir, proj_size0)
     view_dir = session_dir / "views" / view_id
     view_dir.mkdir(parents=True, exist_ok=False)
 
@@ -773,12 +1107,18 @@ def capture_view(session_dir: Path, controller, cfg: dict) -> dict[str, Any]:
     low_b_threshold = float(cap_cfg.get("low_b_median_threshold", 8.0))
     retry_exposure_bump = float(cap_cfg.get("retry_exposure_bump_factor", 1.25))
     strict_resolution_match = bool(proj_cfg.get("strict_resolution_match", False))
+    calib_cfg = cfg_session.get("calibration", {}) or {}
+    residual_p95_board_threshold = float(calib_cfg.get("residual_p95_board_threshold", 1.2))
+    residual_gt_1rad_pct_board_max = float(calib_cfg.get("residual_gt_1rad_pct_board_max", 0.15))
 
     summary: dict[str, Any] = {
         "view_id": view_id,
         "created_at": datetime.now().isoformat(),
-        "status": "failed",
+        "status": "rejected",
+        "accept": False,
         "reason": None,
+        "reject_reasons": [],
+        "hints": [],
         "checkerboard_found": False,
         "valid_corner_ratio": 0.0,
         "valid_corners": 0,
@@ -806,9 +1146,32 @@ def capture_view(session_dir: Path, controller, cfg: dict) -> dict[str, Any]:
     (view_dir / "camera_corners.json").write_text(json.dumps(corners_payload, indent=2))
 
     if not det.found:
-        summary["reason"] = "checkerboard_not_found"
+        summary["reason"] = "Checkerboard not fully detected"
+        summary["reject_reasons"] = ["Checkerboard not fully detected"]
+        summary["hints"] = ["Ensure full checkerboard is visible and in focus."]
         (view_dir / "correspondences.json").write_text(
             json.dumps({"valid_ratio": 0.0, "error": "checkerboard_not_found"}, indent=2)
+        )
+        diag_obj, _ = evaluate_projector_view(
+            corners_found=False,
+            expected_corner_count=int(corners_x * corners_y),
+            corners_cam=np.zeros((0, 2), dtype=np.float32),
+            valid_corner_mask=np.zeros((0,), dtype=bool),
+            corner_reasons=[],
+            image_shape_hw=frame.shape[:2],
+            corners_x=corners_x,
+            corners_y=corners_y,
+            square_size_m=float(chk.get("square_size_m", 0.01)),
+            camera_matrix=None,
+            dist_coeffs=None,
+            recent_accepted_poses=recent_accepted_poses(session, 3),
+            b_median_board=0.0,
+            unwrap_residual_p95=float("inf"),
+            unwrap_residual_vertical_p95_board=float("inf"),
+            unwrap_residual_horizontal_p95_board=float("inf"),
+            unwrap_residual_gt_1rad_pct_board=1.0,
+            board_mask_area_ratio=0.0,
+            clipping_detected=False,
         )
         diag = {
             "view_id": view_id,
@@ -818,11 +1181,18 @@ def capture_view(session_dir: Path, controller, cfg: dict) -> dict[str, Any]:
             "corner_validity_breakdown": {"ok": 0, "nan_uv": 0, "mask_uv_false": 0, "oob": 0, "near_edge": 0},
             "phase_quality": {},
             "projector_resolution": {},
-            "hints": ["Checkerboard not detected. Move board, improve focus, and ensure full board is visible."],
+            "diagnostics": diag_obj.to_dict(),
+            "hints": list(diag_obj.hints),
         }
         (view_dir / "view_diag.json").write_text(json.dumps(diag, indent=2))
-        session.setdefault("views", []).append(summary)
-        _save_session(session_dir, session)
+        add_view_if_valid(
+            session_dir=session_dir,
+            view_data=summary,
+            diagnostics=diag_obj,
+            projector_points=None,
+            projector_size=proj_size0,
+            pose_entry=None,
+        )
         _set_projector_calibration_light(controller, cfg_session, enabled=True)
         return summary
 
@@ -831,6 +1201,15 @@ def capture_view(session_dir: Path, controller, cfg: dict) -> dict[str, Any]:
     current_exposure = int((pcal.get("camera", {}) or {}).get("exposure_us", 2000))
     exposure_max = int((cfg_session.get("normalise", {}) or {}).get("exposure_max_extended_us", 12000))
     base_mask_policy = _calibration_uv_policy(cfg_session)
+    cam_intr_path = _find_camera_intrinsics_latest(cfg_session)
+    camera_matrix: np.ndarray | None = None
+    dist_coeffs: np.ndarray | None = None
+    if cam_intr_path is not None:
+        try:
+            camera_matrix, dist_coeffs = _load_camera_intrinsics(cam_intr_path)
+        except Exception:
+            camera_matrix, dist_coeffs = None, None
+    pose_history = recent_accepted_poses(session, 3)
 
     best_attempt: dict[str, Any] | None = None
     exposure_retry_used = False
@@ -909,15 +1288,61 @@ def capture_view(session_dir: Path, controller, cfg: dict) -> dict[str, Any]:
         b_board_h = _sample_b_on_board(h_run_dir, f_high, board_mask)
         b_board = float(0.5 * (b_board_v + b_board_h))
 
-        phase_quality = uv_meta.get("phase_quality", {})
-        proj_res = uv_meta.get("projector_resolution", {})
+        phase_quality = uv_meta.get("phase_quality", {}) or {}
+        proj_res = uv_meta.get("projector_resolution", {}) or {}
         mismatch = bool(proj_res.get("mismatch", False))
-        hints = _build_view_hints(mismatch, uv_meta, breakdown, phase_quality)
-        if b_board < low_b_threshold:
-            hints.append(
-                "Low modulation on board. Increase projector brightness/coverage, adjust board angle, or reduce ambient light."
-            )
-        hints = sorted(set(hints))
+
+        clipped_any_v = _load_phase_artifacts(v_run_dir, f_high).get("clipped_any")
+        clipped_any_h = _load_phase_artifacts(h_run_dir, f_high).get("clipped_any")
+        clipping_detected = False
+        if clipped_any_v is not None and clipped_any_h is not None and board_mask.shape == clipped_any_v.shape == clipped_any_h.shape:
+            clipping_detected = bool(np.any(clipped_any_v[board_mask]) or np.any(clipped_any_h[board_mask]))
+        elif clipped_any_v is not None and board_mask.shape == clipped_any_v.shape:
+            clipping_detected = bool(np.any(clipped_any_v[board_mask]))
+
+        unwrap_residual_p95_global = max(
+            float((phase_quality.get("vertical", {}) or {}).get("residual_p95", 999.0)),
+            float((phase_quality.get("horizontal", {}) or {}).get("residual_p95", 999.0)),
+        )
+        board_residual_stats = _board_residual_stats(v_run_dir, h_run_dir, board_mask)
+        diag_obj, pose_entry = evaluate_projector_view(
+            corners_found=True,
+            expected_corner_count=int(corners_x * corners_y),
+            corners_cam=cam_pts.astype(np.float32),
+            valid_corner_mask=valid.astype(bool),
+            corner_reasons=reasons,
+            image_shape_hw=frame.shape[:2],
+            corners_x=corners_x,
+            corners_y=corners_y,
+            square_size_m=float(chk.get("square_size_m", 0.01)),
+            camera_matrix=camera_matrix,
+            dist_coeffs=dist_coeffs,
+            recent_accepted_poses=pose_history,
+            b_median_board=float(b_board),
+            unwrap_residual_p95=float(board_residual_stats.get("unwrap_residual_p95_board", float("nan"))),
+            unwrap_residual_vertical_p95_board=float(board_residual_stats.get("unwrap_residual_vertical_p95_board", float("nan"))),
+            unwrap_residual_horizontal_p95_board=float(board_residual_stats.get("unwrap_residual_horizontal_p95_board", float("nan"))),
+            unwrap_residual_gt_1rad_pct_board=float(board_residual_stats.get("unwrap_residual_gt_1rad_pct_board", float("nan"))),
+            board_mask_area_ratio=float(board_residual_stats.get("board_mask_area_ratio", 0.0)),
+            clipping_detected=bool(clipping_detected),
+            min_valid_corner_ratio=min_corner_valid_ratio,
+            max_unwrap_residual_p95=residual_p95_board_threshold,
+            max_unwrap_gt_1rad_pct=residual_gt_1rad_pct_board_max,
+        )
+        # Keep strict resolution mismatch as a hard reject when requested.
+        if mismatch and strict_resolution_match:
+            diag_obj.accept = False
+            if "PROJECTOR_RES_MISMATCH" not in diag_obj.reject_reasons:
+                diag_obj.reject_reasons.append("PROJECTOR_RES_MISMATCH")
+            diag_obj.hints.append("PROJECTOR_RES_MISMATCH: configured size does not match actual projector surface size.")
+        # Preserve UV gate diagnostics in reject reasons/hints.
+        if not bool(uv_meta.get("uv_gate_ok", False)):
+            diag_obj.accept = False
+            if "uv_gate_failed" not in diag_obj.reject_reasons:
+                diag_obj.reject_reasons.append("uv_gate_failed")
+            for hint in uv_meta.get("uv_gate_hints", []) or []:
+                diag_obj.hints.append(str(hint))
+        diag_obj.hints = sorted(set(diag_obj.hints))
 
         diag = {
             "view_id": view_id,
@@ -945,7 +1370,18 @@ def capture_view(session_dir: Path, controller, cfg: dict) -> dict[str, Any]:
                 "b_median_on_board_vertical": b_board_v,
                 "b_median_on_board_horizontal": b_board_h,
             },
-            "hints": hints,
+            "unwrap_residual_p95_global": float(unwrap_residual_p95_global),
+            "unwrap_residual_p95_board": float(board_residual_stats.get("unwrap_residual_p95_board", float("nan"))),
+            "unwrap_residual_vertical_p95_board": float(board_residual_stats.get("unwrap_residual_vertical_p95_board", float("nan"))),
+            "unwrap_residual_horizontal_p95_board": float(board_residual_stats.get("unwrap_residual_horizontal_p95_board", float("nan"))),
+            "unwrap_residual_gt_1rad_pct_board": float(board_residual_stats.get("unwrap_residual_gt_1rad_pct_board", float("nan"))),
+            "board_mask_area_ratio": float(board_residual_stats.get("board_mask_area_ratio", 0.0)),
+            "residual_thresholds": {
+                "residual_p95_board_threshold": residual_p95_board_threshold,
+                "residual_gt_1rad_pct_board_max": residual_gt_1rad_pct_board_max,
+            },
+            "diagnostics": diag_obj.to_dict(),
+            "hints": list(diag_obj.hints),
         }
 
         diag_name = "view_diag.json" if attempt == 0 else f"view_diag_retry_{attempt}.json"
@@ -974,34 +1410,30 @@ def capture_view(session_dir: Path, controller, cfg: dict) -> dict[str, Any]:
             "attempt": attempt,
             "valid_ratio": valid_ratio,
             "diag": diag,
+            "diag_obj": diag_obj,
+            "pose_entry": pose_entry,
             "uv_meta": uv_meta,
             "run_info": run_info,
             "corr": corr,
             "uv_dir": attempt_uv_dir,
-            "reason": None,
+            "accept": bool(diag_obj.accept),
+            "reason": "; ".join(diag_obj.reject_reasons) if diag_obj.reject_reasons else None,
         }
-        if mismatch and strict_resolution_match:
-            attempt_payload["reason"] = "PROJECTOR_RES_MISMATCH"
-        elif not bool(uv_meta.get("uv_gate_ok", False)):
-            attempt_payload["reason"] = "uv_gate_failed"
-        elif valid_ratio < min_corner_valid_ratio:
-            attempt_payload["reason"] = "insufficient_valid_uv_corners"
 
         if best_attempt is None or attempt_payload["valid_ratio"] > best_attempt["valid_ratio"]:
             best_attempt = attempt_payload
-
-        if attempt_payload["reason"] is None:
+        if bool(attempt_payload["accept"]):
             best_attempt = attempt_payload
             break
 
-        final_reason = str(attempt_payload["reason"])
-        clipped_v = float((phase_quality.get("vertical", {}) or {}).get("clipped_roi", 1.0))
-        clipped_h = float((phase_quality.get("horizontal", {}) or {}).get("clipped_roi", 1.0))
-        clipped_ok = max(clipped_v, clipped_h) <= 0.0
+        final_reason = str(attempt_payload["reason"] or "view_rejected")
+        clipped_ok = not bool(clipping_detected)
         mask_heavy = breakdown["mask_uv_false"] >= max(8, int(0.35 * len(reasons)))
         low_b = b_board < low_b_threshold
 
         if attempt >= max_retries:
+            break
+        if mismatch and strict_resolution_match:
             break
         if (low_b or mask_heavy) and clipped_ok and not exposure_retry_used:
             exposure_retry_used = True
@@ -1014,8 +1446,37 @@ def capture_view(session_dir: Path, controller, cfg: dict) -> dict[str, Any]:
 
     if best_attempt is None:
         summary["reason"] = final_reason
-        session.setdefault("views", []).append(summary)
-        _save_session(session_dir, session)
+        summary["reject_reasons"] = [final_reason]
+        summary["hints"] = []
+        diag_obj = ProjectorViewDiagnostics(
+            corners_found=True,
+            valid_corner_ratio=0.0,
+            hull_area_ratio=0.0,
+            board_tilt_deg=float("nan"),
+            board_center_norm=(0.0, 0.0),
+            board_depth_proxy=float("nan"),
+            b_median_board=0.0,
+            unwrap_residual_p95=float("inf"),
+            unwrap_residual_p95_board=float("inf"),
+            unwrap_residual_vertical_p95_board=float("inf"),
+            unwrap_residual_horizontal_p95_board=float("inf"),
+            unwrap_residual_gt_1rad_pct_board=1.0,
+            board_mask_area_ratio=0.0,
+            clipping_detected=False,
+            edge_corner_pct=0.0,
+            duplicate_pose=False,
+            accept=False,
+            reject_reasons=[final_reason],
+            hints=[],
+        )
+        add_view_if_valid(
+            session_dir=session_dir,
+            view_data=summary,
+            diagnostics=diag_obj,
+            projector_points=None,
+            projector_size=proj_size0,
+            pose_entry=None,
+        )
         _set_projector_calibration_light(controller, cfg_session, enabled=True)
         return summary
 
@@ -1037,28 +1498,41 @@ def capture_view(session_dir: Path, controller, cfg: dict) -> dict[str, Any]:
     summary["total_corners"] = int(len(selected["corr"]["valid_mask"]))
     summary["uv_meta"] = selected["uv_meta"]
     summary["uv_source_runs"] = selected["run_info"]
+    summary["accept"] = bool(selected.get("accept", False))
     summary["diag"] = {
         "corner_validity_breakdown": selected["diag"].get("corner_validity_breakdown", {}),
         "uv_gate_failed_checks": selected["uv_meta"].get("uv_gate_failed_checks", []),
         "hints": selected["diag"].get("hints", []),
+        "diagnostics": selected.get("diag_obj").to_dict() if selected.get("diag_obj") is not None else {},
+        "residual_thresholds": {
+            "residual_p95_board_threshold": residual_p95_board_threshold,
+            "residual_gt_1rad_pct_board_max": residual_gt_1rad_pct_board_max,
+        },
+        "residual_p95_board_pass": bool(
+            selected.get("diag_obj") is not None
+            and np.isfinite(float(selected.get("diag_obj").unwrap_residual_p95_board))
+            and float(selected.get("diag_obj").unwrap_residual_p95_board) <= residual_p95_board_threshold
+        ),
+        "residual_gt_1rad_pct_board_pass": bool(
+            selected.get("diag_obj") is not None
+            and np.isfinite(float(selected.get("diag_obj").unwrap_residual_gt_1rad_pct_board))
+            and float(selected.get("diag_obj").unwrap_residual_gt_1rad_pct_board) <= residual_gt_1rad_pct_board_max
+        ),
     }
     proj_res_sel = (selected["uv_meta"].get("projector_resolution", {}) or {})
     pattern_surface = proj_res_sel.get("pattern_surface")
     if isinstance(pattern_surface, (list, tuple)) and len(pattern_surface) == 2:
         summary["effective_projector_size"] = [int(pattern_surface[0]), int(pattern_surface[1])]
-    summary["status"] = "valid" if selected["reason"] is None else "invalid"
-    summary["reason"] = selected["reason"]
-    if selected["reason"] == "PROJECTOR_RES_MISMATCH":
-        summary["status"] = "failed"
-    if summary["reason"] and selected["diag"].get("hints"):
-        hint0 = str(selected["diag"]["hints"][0])
-        reason = str(summary["reason"])
-        if reason in hint0:
-            summary["reason"] = hint0
-        elif hint0 in reason:
-            summary["reason"] = reason
-        else:
-            summary["reason"] = f"{reason}: {hint0}"
+    diag_obj = selected.get("diag_obj")
+    if diag_obj is not None:
+        summary["reject_reasons"] = list(diag_obj.reject_reasons)
+        summary["hints"] = list(diag_obj.hints)
+        summary["reason"] = "; ".join(diag_obj.reject_reasons) if diag_obj.reject_reasons else None
+    else:
+        summary["reject_reasons"] = []
+        summary["hints"] = []
+        summary["reason"] = selected["reason"]
+    summary["status"] = "valid" if bool(selected.get("accept", False)) else "rejected"
 
     # Self-heal session projector resolution from actual pattern surface size.
     if not strict_resolution_match and isinstance(pattern_surface, (list, tuple)) and len(pattern_surface) == 2:
@@ -1071,6 +1545,7 @@ def capture_view(session_dir: Path, controller, cfg: dict) -> dict[str, Any]:
                 proj_cfg_s["height"] = ph
                 session_cfg["projector"] = proj_cfg_s
                 session["config"] = session_cfg
+                _save_session(session_dir, session)
                 try:
                     (session_dir / "config.json").write_text(json.dumps(session_cfg, indent=2))
                 except Exception:
@@ -1078,8 +1553,25 @@ def capture_view(session_dir: Path, controller, cfg: dict) -> dict[str, Any]:
         except Exception:
             pass
 
-    session.setdefault("views", []).append(summary)
-    _save_session(session_dir, session)
+    proj_points = np.asarray(selected["corr"]["projector_corners_px"], dtype=np.float32)
+    proj_valid = np.asarray(selected["corr"]["valid_mask"], dtype=bool)
+    proj_points_valid = proj_points[proj_valid]
+    proj_size_for_cov = proj_size0
+    if isinstance(pattern_surface, (list, tuple)) and len(pattern_surface) == 2:
+        proj_size_for_cov = (int(pattern_surface[0]), int(pattern_surface[1]))
+
+    accepted, session_after = add_view_if_valid(
+        session_dir=session_dir,
+        view_data=summary,
+        diagnostics=diag_obj,
+        projector_points=proj_points_valid,
+        projector_size=proj_size_for_cov,
+        pose_entry=selected.get("pose_entry"),
+    )
+    summary["accept"] = bool(accepted)
+    summary["status"] = "valid" if accepted else "rejected"
+    if accepted and isinstance(session_after.get("coverage_map"), dict):
+        summary["coverage_map"] = session_after.get("coverage_map")
     _set_projector_calibration_light(controller, cfg_session, enabled=True)
     return summary
 
@@ -1102,40 +1594,41 @@ def _checkerboard_object_points(corners_x: int, corners_y: int, square_size_m: f
     return obj
 
 
-def stereo_calibrate(session_dir: Path, cfg: dict, camera_intrinsics_path: Path) -> dict[str, Any]:
-    cv = _require_cv2()
-    session = _load_session(session_dir)
-    pcal = cfg.get("projector_calibration", {}) or {}
-    chk = pcal.get("checkerboard", {}) or {}
-    proj_cfg = pcal.get("projector", {}) or {}
-    cap_cfg = pcal.get("capture", {}) or {}
-    min_views = int(cap_cfg.get("min_views", 10))
-    min_corner_valid_ratio = float(cap_cfg.get("min_corner_valid_ratio", 0.90))
-
-    corners_x = int(chk.get("corners_x", 8))
-    corners_y = int(chk.get("corners_y", 6))
-    square_size_m = float(chk.get("square_size_m", 0.01))
-    proj_size_cfg = (int(proj_cfg.get("width", 1024)), int(proj_cfg.get("height", 768)))
-    proj_size: tuple[int, int] | None = None
-
-    valid_views = [v for v in session.get("views", []) if v.get("status") == "valid"]
-    if len(valid_views) < min_views:
-        raise ValueError(f"Need at least {min_views} valid projector-calibration views.")
-
+def _collect_projector_calibration_views(
+    session_dir: Path,
+    session: dict[str, Any],
+    *,
+    corners_x: int,
+    corners_y: int,
+    square_size_m: float,
+    min_corner_valid_ratio: float,
+    proj_size_cfg: tuple[int, int],
+    allowed_view_ids: set[str] | None = None,
+    use_refined_uv: bool = False,
+    min_refined_corner_ratio: float = 0.85,
+    dropped_views: list[dict[str, Any]] | None = None,
+) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], list[str], tuple[int, int]]:
     obj_template = _checkerboard_object_points(corners_x, corners_y, square_size_m)
     object_points: list[np.ndarray] = []
     cam_points: list[np.ndarray] = []
     proj_points: list[np.ndarray] = []
     view_ids: list[str] = []
+    proj_size: tuple[int, int] | None = None
 
+    valid_views = [v for v in session.get("views", []) if v.get("status") == "valid"]
     for view in valid_views:
-        view_id = str(view["view_id"])
-        corr_path = session_dir / "views" / view_id / "correspondences.json"
+        view_id = str(view.get("view_id", ""))
+        if not view_id:
+            continue
+        if allowed_view_ids is not None and view_id not in allowed_view_ids:
+            continue
+        vdir = session_dir / "views" / view_id
+        corr_path = vdir / "correspondences.json"
         if not corr_path.exists():
+            if dropped_views is not None:
+                dropped_views.append({"view_id": view_id, "reason": "missing_correspondences"})
             continue
         corr = json.loads(corr_path.read_text())
-        if float(corr.get("valid_ratio", 0.0)) < min_corner_valid_ratio:
-            continue
         corr_res = corr.get("projector_resolution", {}) or {}
         patt = corr_res.get("pattern_surface")
         if isinstance(patt, (list, tuple)) and len(patt) == 2:
@@ -1143,29 +1636,105 @@ def stereo_calibrate(session_dir: Path, cfg: dict, camera_intrinsics_path: Path)
             if proj_size is None:
                 proj_size = cand
             elif proj_size != cand:
-                # Mixed projector sizes are not calibratable together.
+                if dropped_views is not None:
+                    dropped_views.append({"view_id": view_id, "reason": "projector_size_mismatch", "size": list(cand)})
                 continue
-        cam = np.asarray(corr.get("camera_corners_px", []), dtype=np.float32).reshape(-1, 2)
-        proj = np.asarray(corr.get("projector_corners_px", []), dtype=np.float32).reshape(-1, 2)
-        valid = np.asarray(corr.get("valid_mask", []), dtype=bool).reshape(-1)
-        if cam.shape[0] != obj_template.shape[0] or proj.shape[0] != obj_template.shape[0] or valid.shape[0] != obj_template.shape[0]:
+
+        if use_refined_uv:
+            cam_corner_path = vdir / "camera_corners.json"
+            uv_ref_path = vdir / "uv_corners_refined.npy"
+            uv_valid_path = vdir / "uv_corners_valid.npy"
+            if not cam_corner_path.exists() or not uv_ref_path.exists() or not uv_valid_path.exists():
+                if dropped_views is not None:
+                    dropped_views.append({"view_id": view_id, "reason": "missing_refined_uv_files"})
+                continue
+            cam_data = json.loads(cam_corner_path.read_text())
+            cam = np.asarray(cam_data.get("corners_px", []), dtype=np.float32).reshape(-1, 2)
+            proj = np.load(uv_ref_path).astype(np.float32).reshape(-1, 2)
+            valid = np.load(uv_valid_path).astype(bool).reshape(-1)
+            min_ratio_for_view = float(min_refined_corner_ratio)
+        else:
+            if float(corr.get("valid_ratio", 0.0)) < min_corner_valid_ratio:
+                if dropped_views is not None:
+                    dropped_views.append({"view_id": view_id, "reason": "below_min_corner_ratio_raw"})
+                continue
+            cam = np.asarray(corr.get("camera_corners_px", []), dtype=np.float32).reshape(-1, 2)
+            proj = np.asarray(corr.get("projector_corners_px", []), dtype=np.float32).reshape(-1, 2)
+            valid = np.asarray(corr.get("valid_mask", []), dtype=bool).reshape(-1)
+            min_ratio_for_view = float(min_corner_valid_ratio)
+
+        if (
+            cam.shape[0] != obj_template.shape[0]
+            or proj.shape[0] != obj_template.shape[0]
+            or valid.shape[0] != obj_template.shape[0]
+        ):
+            if dropped_views is not None:
+                dropped_views.append({"view_id": view_id, "reason": "shape_mismatch"})
             continue
         idx = np.where(valid)[0]
-        if idx.size < int(np.ceil(min_corner_valid_ratio * obj_template.shape[0])):
+        min_required = int(np.ceil(min_ratio_for_view * obj_template.shape[0]))
+        if idx.size < min_required:
+            if dropped_views is not None:
+                dropped_views.append(
+                    {
+                        "view_id": view_id,
+                        "reason": "insufficient_refined_corners" if use_refined_uv else "insufficient_corners",
+                        "valid_corners": int(idx.size),
+                        "required": int(min_required),
+                    }
+                )
             continue
         object_points.append(obj_template[idx].astype(np.float32))
         cam_points.append(cam[idx].reshape(-1, 1, 2).astype(np.float32))
         proj_points.append(proj[idx].reshape(-1, 1, 2).astype(np.float32))
         view_ids.append(view_id)
 
-    if len(object_points) < min_views:
-        raise ValueError(f"Need at least {min_views} valid projector-calibration views.")
-
-    k_cam, d_cam = _load_camera_intrinsics(camera_intrinsics_path)
-
-    # Estimate projector intrinsics from board correspondences.
     if proj_size is None:
         proj_size = proj_size_cfg
+    return object_points, cam_points, proj_points, view_ids, proj_size
+
+
+def _stereo_calibrate_once(
+    session_dir: Path,
+    cfg: dict,
+    camera_intrinsics_path: Path,
+    *,
+    min_views_required: int,
+    min_corner_valid_ratio: float,
+    allowed_view_ids: set[str] | None = None,
+    save_reproj_overlays: bool = True,
+    use_refined_uv: bool = False,
+    min_refined_corner_ratio: float = 0.85,
+    dropped_views: list[dict[str, Any]] | None = None,
+) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
+    cv = _require_cv2()
+    session = _load_session(session_dir)
+    pcal = cfg.get("projector_calibration", {}) or {}
+    chk = pcal.get("checkerboard", {}) or {}
+    proj_cfg = pcal.get("projector", {}) or {}
+
+    corners_x = int(chk.get("corners_x", 8))
+    corners_y = int(chk.get("corners_y", 6))
+    square_size_m = float(chk.get("square_size_m", 0.01))
+    proj_size_cfg = (int(proj_cfg.get("width", 1024)), int(proj_cfg.get("height", 768)))
+    object_points, cam_points, proj_points, view_ids, proj_size = _collect_projector_calibration_views(
+        session_dir,
+        session,
+        corners_x=corners_x,
+        corners_y=corners_y,
+        square_size_m=square_size_m,
+        min_corner_valid_ratio=min_corner_valid_ratio,
+        proj_size_cfg=proj_size_cfg,
+        allowed_view_ids=allowed_view_ids,
+        use_refined_uv=use_refined_uv,
+        min_refined_corner_ratio=min_refined_corner_ratio,
+        dropped_views=dropped_views,
+    )
+
+    if len(object_points) < int(min_views_required):
+        raise ValueError(f"Need at least {min_views_required} valid projector-calibration views.")
+
+    k_cam, d_cam = _load_camera_intrinsics(camera_intrinsics_path)
 
     rms_proj, k_proj, d_proj, _, _ = cv.calibrateCamera(
         object_points,
@@ -1195,7 +1764,8 @@ def stereo_calibrate(session_dir: Path, cfg: dict, camera_intrinsics_path: Path)
 
     per_view: list[dict[str, Any]] = []
     reproj_dir = session_dir / "results" / "reprojection_debug"
-    reproj_dir.mkdir(parents=True, exist_ok=True)
+    if save_reproj_overlays:
+        reproj_dir.mkdir(parents=True, exist_ok=True)
     for obj, cam_obs, proj_obs, view_id in zip(object_points, cam_points, proj_points, view_ids):
         ok1, rv_cam, tv_cam = cv.solvePnP(obj, cam_obs, k1, d1)
         ok2, rv_proj, tv_proj = cv.solvePnP(obj, proj_obs, k2, d2)
@@ -1206,27 +1776,27 @@ def stereo_calibrate(session_dir: Path, cfg: dict, camera_intrinsics_path: Path)
         cam_err = float(np.linalg.norm(cam_obs.reshape(-1, 2) - cam_reproj.reshape(-1, 2), axis=1).mean())
         proj_err = float(np.linalg.norm(proj_obs.reshape(-1, 2) - proj_reproj.reshape(-1, 2), axis=1).mean())
 
-        # Save camera-side reprojection overlay.
-        camera_img_path = session_dir / "views" / view_id / "camera.png"
-        if camera_img_path.exists():
-            im = np.array(Image.open(camera_img_path))
-            if im.ndim == 2:
-                im = np.stack([im, im, im], axis=2)
-            out = im[:, :, :3].copy()
-            for p_obs, p_rep in zip(cam_obs.reshape(-1, 2), cam_reproj.reshape(-1, 2)):
-                cv.circle(out, (int(round(float(p_obs[0]))), int(round(float(p_obs[1])))), 3, (255, 64, 64), 1, cv.LINE_AA)
-                cv.circle(out, (int(round(float(p_rep[0]))), int(round(float(p_rep[1])))), 2, (64, 255, 64), 1, cv.LINE_AA)
-            cv.putText(
-                out,
-                f"cam_err={cam_err:.3f}px proj_err={proj_err:.3f}px",
-                (16, 28),
-                cv.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 64),
-                2,
-                cv.LINE_AA,
-            )
-            Image.fromarray(out.astype(np.uint8)).save(reproj_dir / f"{view_id}_overlay.png")
+        if save_reproj_overlays:
+            camera_img_path = session_dir / "views" / view_id / "camera.png"
+            if camera_img_path.exists():
+                im = np.array(Image.open(camera_img_path))
+                if im.ndim == 2:
+                    im = np.stack([im, im, im], axis=2)
+                out = im[:, :, :3].copy()
+                for p_obs, p_rep in zip(cam_obs.reshape(-1, 2), cam_reproj.reshape(-1, 2)):
+                    cv.circle(out, (int(round(float(p_obs[0]))), int(round(float(p_obs[1])))), 3, (255, 64, 64), 1, cv.LINE_AA)
+                    cv.circle(out, (int(round(float(p_rep[0]))), int(round(float(p_rep[1])))), 2, (64, 255, 64), 1, cv.LINE_AA)
+                cv.putText(
+                    out,
+                    f"cam_err={cam_err:.3f}px proj_err={proj_err:.3f}px",
+                    (16, 28),
+                    cv.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (255, 255, 64),
+                    2,
+                    cv.LINE_AA,
+                )
+                Image.fromarray(out.astype(np.uint8)).save(reproj_dir / f"{view_id}_overlay.png")
 
         per_view.append(
             {
@@ -1241,6 +1811,7 @@ def stereo_calibrate(session_dir: Path, cfg: dict, camera_intrinsics_path: Path)
         "session_id": session.get("session_id"),
         "created_at": datetime.now().isoformat(),
         "views_used": int(len(object_points)),
+        "view_ids": list(view_ids),
         "rms_projector_intrinsics": float(rms_proj),
         "rms_stereo": float(rms_stereo),
         "camera_matrix": k1.astype(float).tolist(),
@@ -1265,37 +1836,729 @@ def stereo_calibrate(session_dir: Path, cfg: dict, camera_intrinsics_path: Path)
             "square_size_m": square_size_m,
         },
         "projector": {"width": proj_size[0], "height": proj_size[1]},
+        "points_source": "refined_uv" if use_refined_uv else "raw_uv",
     }
+    mats = {
+        "camera_matrix": k1,
+        "camera_dist": d1,
+        "projector_matrix": k2,
+        "projector_dist": d2,
+        "R": r,
+        "T": t,
+        "E": e,
+        "F": f,
+        "R1": r1,
+        "R2": r2,
+        "P1": p1,
+        "P2": p2,
+        "Q": q,
+    }
+    return result, mats
 
+
+def _write_stereo_outputs(
+    session_dir: Path,
+    session: dict[str, Any],
+    result: dict[str, Any],
+    mats: dict[str, np.ndarray],
+    *,
+    json_name: str = "stereo.json",
+    npz_name: str = "stereo.npz",
+    update_latest: bool = True,
+    session_result_path: str | None = None,
+) -> None:
     res_dir = session_dir / "results"
     res_dir.mkdir(parents=True, exist_ok=True)
-    (res_dir / "stereo.json").write_text(json.dumps(result, indent=2))
+    (res_dir / json_name).write_text(json.dumps(result, indent=2))
     np.savez(
-        res_dir / "stereo.npz",
-        camera_matrix=k1,
-        camera_dist=d1,
-        projector_matrix=k2,
-        projector_dist=d2,
-        R=r,
-        T=t,
-        E=e,
-        F=f,
-        R1=r1,
-        R2=r2,
-        P1=p1,
-        P2=p2,
-        Q=q,
+        res_dir / npz_name,
+        **mats,
     )
-
-    # session_dir = .../calibration/projector/sessions/<id>; publish latest at
-    # .../calibration/projector/stereo_latest.json
-    proj_root = session_dir.parent.parent
-    (proj_root / "stereo_latest.json").write_text(json.dumps(result, indent=2))
+    if update_latest:
+        proj_root = session_dir.parent.parent
+        (proj_root / "stereo_latest.json").write_text(json.dumps(result, indent=2))
+    if session_result_path is None:
+        session_result_path = f"results/{json_name}"
     session["results"] = {
-        "rms_stereo": float(rms_stereo),
-        "views_used": int(len(object_points)),
+        "rms_stereo": float(result.get("rms_stereo", 0.0)),
+        "views_used": int(result.get("views_used", 0)),
         "updated_at": datetime.now().isoformat(),
-        "path": "results/stereo.json",
+        "path": session_result_path,
     }
     _save_session(session_dir, session)
-    return result
+
+
+def _to_json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _to_json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_to_json_safe(v) for v in value]
+    if isinstance(value, tuple):
+        return [_to_json_safe(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return _to_json_safe(value.tolist())
+    if isinstance(value, (np.floating, float)):
+        v = float(value)
+        return v if np.isfinite(v) else None
+    if isinstance(value, (np.integer, int)):
+        return int(value)
+    if isinstance(value, (np.bool_, bool)):
+        return bool(value)
+    return value
+
+
+def _result_error_summary(result: dict[str, Any]) -> dict[str, float]:
+    per = result.get("per_view_errors", []) or []
+    cam = np.asarray([float(v.get("camera_reproj_error_px", np.nan)) for v in per], dtype=np.float64)
+    proj = np.asarray([float(v.get("projector_reproj_error_px", np.nan)) for v in per], dtype=np.float64)
+    cam = cam[np.isfinite(cam)]
+    proj = proj[np.isfinite(proj)]
+    return {
+        "camera_reproj_p50": float(np.percentile(cam, 50)) if cam.size else float("nan"),
+        "camera_reproj_p95": float(np.percentile(cam, 95)) if cam.size else float("nan"),
+        "projector_reproj_p50": float(np.percentile(proj, 50)) if proj.size else float("nan"),
+        "projector_reproj_p95": float(np.percentile(proj, 95)) if proj.size else float("nan"),
+    }
+
+
+def _find_existing_stereo_result(session_dir: Path, filename: str = "stereo.json") -> dict[str, Any] | None:
+    p = session_dir / "results" / filename
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return None
+
+
+def refine_uv_corners_for_session(session_dir: Path, cfg: dict) -> dict[str, Any]:
+    """Offline refinement over existing projector-calibration views."""
+    session = _load_session(session_dir)
+    pcal = cfg.get("projector_calibration", {}) or {}
+    refine_cfg = _uv_refine_config(cfg)
+    if not refine_cfg.enabled:
+        return {
+            "enabled": False,
+            "session_id": session.get("session_id"),
+            "views_total": 0,
+            "views_processed": 0,
+            "views_failed": 0,
+            "per_view": [],
+        }
+
+    proj_cfg = (session.get("config", {}) or {}).get("projector", {}) or {}
+    fallback_proj = (int(proj_cfg.get("width", 1024)), int(proj_cfg.get("height", 768)))
+    views_dir = session_dir / "views"
+    view_dirs = sorted([p for p in views_dir.glob("view_*") if p.is_dir()])
+    per_view: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    delta_values: list[float] = []
+    invalid_corners_total = 0
+
+    for vdir in view_dirs:
+        view_id = vdir.name
+        corners_path = vdir / "camera_corners.json"
+        uv_dir = vdir / "uv"
+        u_path = uv_dir / "u.npy"
+        v_path = uv_dir / "v.npy"
+        m_path = uv_dir / "mask_uv.npy"
+        uv_meta_path = uv_dir / "uv_meta.json"
+        corr_path = vdir / "correspondences.json"
+        cam_img_path = vdir / "camera.png"
+
+        missing = [
+            str(p.name)
+            for p in (corners_path, u_path, v_path, m_path, uv_meta_path, corr_path, cam_img_path)
+            if not p.exists()
+        ]
+        if missing:
+            failed.append({"view_id": view_id, "reason": "missing_files", "missing": missing})
+            continue
+
+        try:
+            corners_data = json.loads(corners_path.read_text())
+            corners = np.asarray(corners_data.get("corners_px", []), dtype=np.float32).reshape(-1, 2)
+            corr = json.loads(corr_path.read_text())
+            uv_meta = json.loads(uv_meta_path.read_text())
+            U = np.load(u_path).astype(np.float32)
+            V = np.load(v_path).astype(np.float32)
+            mask_uv = np.load(m_path).astype(bool)
+            if corners.size == 0:
+                failed.append({"view_id": view_id, "reason": "no_corners"})
+                continue
+            raw_uv = np.asarray(corr.get("projector_corners_px", []), dtype=np.float32).reshape(-1, 2)
+            if raw_uv.shape[0] != corners.shape[0]:
+                # Fallback: recover raw samples from saved correspondences shape if possible.
+                raw_uv = np.full((corners.shape[0], 2), np.nan, dtype=np.float32)
+                vm = np.asarray(corr.get("valid_mask", []), dtype=bool).reshape(-1)
+                pv = np.asarray(corr.get("projector_corners_px", []), dtype=np.float32).reshape(-1, 2)
+                ncopy = min(raw_uv.shape[0], pv.shape[0], vm.shape[0])
+                raw_uv[:ncopy] = pv[:ncopy]
+
+            refined_uv, valid_refined, refine_diag = refine_uv_at_corners(U, V, mask_uv, corners, refine_cfg)
+            np.save(vdir / "uv_corners_raw.npy", raw_uv.astype(np.float32))
+            np.save(vdir / "uv_corners_refined.npy", refined_uv.astype(np.float32))
+            np.save(vdir / "uv_corners_valid.npy", valid_refined.astype(bool))
+
+            valid_ratio = float(np.count_nonzero(valid_refined) / max(1, valid_refined.size))
+            corr["projector_corners_px"] = refined_uv.astype(float).tolist()
+            corr["valid_mask"] = valid_refined.astype(bool).tolist()
+            corr["valid_ratio"] = valid_ratio
+            corr["uv_refinement_applied"] = True
+            corr["uv_refinement_config"] = _to_json_safe(asdict(refine_cfg))
+            corr_path.write_text(json.dumps(_to_json_safe(corr), indent=2))
+
+            breakdown = Counter(corr.get("corner_reasons", []))
+            # Rebuild reasons from valid mask when not present.
+            if sum(breakdown.values()) <= 0:
+                breakdown = Counter(["ok" if bool(v) else "nan_uv" for v in valid_refined])
+            breakdown_dict = {
+                "ok": int(np.count_nonzero(valid_refined)),
+                "nan_uv": int(valid_refined.size - np.count_nonzero(valid_refined)),
+                "mask_uv_false": int(breakdown.get("mask_uv_false", 0)),
+                "oob": int(breakdown.get("oob", 0)),
+                "near_edge": int(breakdown.get("near_edge", 0)),
+            }
+
+            diag_path = vdir / "view_diag.json"
+            diag = _load_json(diag_path)
+            diag.setdefault(
+                "checkerboard",
+                {"found": bool(corners_data.get("found", True)), "corners_total": int(corners.shape[0])},
+            )
+            diag.setdefault("uv", {})
+            for key in (
+                "uv_gate_ok",
+                "valid_ratio",
+                "u_range",
+                "v_range",
+                "u_edge_pct",
+                "v_edge_pct",
+                "u_zero_pct",
+                "v_zero_pct",
+            ):
+                if key in uv_meta:
+                    diag["uv"][key] = uv_meta[key]
+            diag["corner_sampling"] = {
+                "method": str((pcal.get("capture", {}) or {}).get("uv_sample", {}).get("method", "bilinear")),
+                "use_patch_median": bool((pcal.get("capture", {}) or {}).get("uv_sample", {}).get("use_patch_median", True)),
+                "patch_radius_px": int((pcal.get("capture", {}) or {}).get("uv_sample", {}).get("patch_radius_px", 2)),
+                "uv_refinement": _to_json_safe(refine_diag.get("summary", {})),
+            }
+            diag["corner_validity_breakdown"] = {
+                **breakdown_dict,
+                "finite_samples_median": float(np.median([pc.get("n_points", 0) for pc in refine_diag.get("per_corner", [])]))
+                if refine_diag.get("per_corner")
+                else 0.0,
+            }
+            diag_path.write_text(json.dumps(_to_json_safe(diag), indent=2))
+
+            cam_img = np.array(Image.open(cam_img_path))
+            overlay = _draw_correspondence_overlay(cam_img, corners, refined_uv, valid_refined)
+            save_image(vdir / "overlay.png", overlay)
+            validity_overlay = _draw_corner_validity_overlay(cam_img, corners, ["ok" if bool(v) else "nan_uv" for v in valid_refined], breakdown_dict)
+            save_image(vdir / "corner_validity_overlay.png", validity_overlay)
+            delta_stats = _save_uv_refine_delta_overlay(
+                image=cam_img,
+                corners_cam=corners,
+                uv_raw=raw_uv,
+                uv_refined=refined_uv,
+                valid_refined=valid_refined,
+                out_path=vdir / "uv_refine_delta.png",
+            )
+
+            refine_diag_out = {
+                "config": _to_json_safe(asdict(refine_cfg)),
+                "summary": _to_json_safe(refine_diag.get("summary", {})),
+                "per_corner": _to_json_safe(refine_diag.get("per_corner", [])),
+                "delta_stats": _to_json_safe(delta_stats),
+                "valid_ratio": valid_ratio,
+            }
+            (vdir / "uv_refine_diag.json").write_text(json.dumps(refine_diag_out, indent=2))
+
+            if np.isfinite(delta_stats.get("mean_delta_px", np.nan)):
+                delta_values.append(float(delta_stats["mean_delta_px"]))
+            invalid_corners_total += int(valid_refined.size - np.count_nonzero(valid_refined))
+            per_view.append(
+                {
+                    "view_id": view_id,
+                    "corners_total": int(valid_refined.size),
+                    "corners_valid": int(np.count_nonzero(valid_refined)),
+                    "valid_ratio": valid_ratio,
+                    "delta_stats": _to_json_safe(delta_stats),
+                }
+            )
+        except Exception as exc:
+            failed.append({"view_id": view_id, "reason": f"exception: {exc}"})
+
+    # Sync session view-level counters with refined correspondences.
+    session_changed = False
+    by_id = {str(v.get("view_id")): v for v in (session.get("views", []) or []) if isinstance(v, dict)}
+    for rec in per_view:
+        item = by_id.get(rec["view_id"])
+        if item is None:
+            continue
+        item["valid_corner_ratio"] = float(rec["valid_ratio"])
+        item["valid_corners"] = int(rec["corners_valid"])
+        item["total_corners"] = int(rec["corners_total"])
+        session_changed = True
+    if session_changed:
+        _save_session(session_dir, session)
+
+    report = {
+        "enabled": True,
+        "session_id": session.get("session_id"),
+        "views_total": int(len(view_dirs)),
+        "views_processed": int(len(per_view)),
+        "views_failed": int(len(failed)),
+        "failed_views": failed,
+        "mean_corner_delta_px": float(np.mean(delta_values)) if delta_values else float("nan"),
+        "p95_corner_delta_px": float(np.percentile(delta_values, 95)) if delta_values else float("nan"),
+        "invalidated_corners_total": int(invalid_corners_total),
+        "per_view": per_view,
+        "config": _to_json_safe(asdict(refine_cfg)),
+    }
+    (session_dir / "results").mkdir(parents=True, exist_ok=True)
+    (session_dir / "results" / "uv_refine_session_report.json").write_text(
+        json.dumps(_to_json_safe(report), indent=2)
+    )
+    return report
+
+
+def _build_refine_compare_outputs(
+    session_dir: Path,
+    before_result: dict[str, Any] | None,
+    refined_result: dict[str, Any] | None,
+    refined_pruned_result: dict[str, Any] | None,
+    refine_report: dict[str, Any],
+) -> dict[str, Any]:
+    reports_dir = session_dir / "reports" / "refine_compare"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    before_rms = float(before_result.get("rms_stereo", np.nan)) if before_result else float("nan")
+    refined_rms = float(refined_result.get("rms_stereo", np.nan)) if refined_result else float("nan")
+    pruned_rms = float(refined_pruned_result.get("rms_stereo", np.nan)) if refined_pruned_result else float("nan")
+
+    _draw_simple_bar_plot(
+        values=[before_rms, refined_rms, pruned_rms],
+        labels=["before", "refined", "ref+prune"],
+        out_path=reports_dir / "rms_before_after.png",
+        title="Stereo RMS Comparison",
+    )
+
+    before_per = {str(v.get("view_id")): float(v.get("projector_reproj_error_px", np.nan)) for v in (before_result or {}).get("per_view_errors", [])}
+    after_per = {str(v.get("view_id")): float(v.get("projector_reproj_error_px", np.nan)) for v in (refined_pruned_result or refined_result or {}).get("per_view_errors", [])}
+    cats = sorted(set(before_per.keys()) | set(after_per.keys()))
+    _draw_group_bar_plot(
+        categories=cats[:20],  # keep readable if many views
+        before_vals=[before_per.get(c, np.nan) for c in cats[:20]],
+        after_vals=[after_per.get(c, np.nan) for c in cats[:20]],
+        out_path=reports_dir / "proj_reproj_per_view_before_after.png",
+        title="Projector Reprojection Error Per View (first 20 views)",
+    )
+
+    distort = {
+        "before": (before_result or {}).get("projector_dist_coeffs"),
+        "refined": (refined_result or {}).get("projector_dist_coeffs"),
+        "refined_pruned": (refined_pruned_result or {}).get("projector_dist_coeffs"),
+    }
+    (reports_dir / "distortion_coeffs_before_after.json").write_text(
+        json.dumps(_to_json_safe(distort), indent=2)
+    )
+
+    def _warn_extreme_k3(dist: Any) -> bool:
+        if not isinstance(dist, list) or len(dist) < 5:
+            return False
+        k3 = float(dist[4])
+        return bool(np.isfinite(k3) and abs(k3) > 200.0)
+
+    warnings: list[str] = []
+    if _warn_extreme_k3(distort.get("before")):
+        warnings.append("before: extreme |k3| > 200")
+    if _warn_extreme_k3(distort.get("refined")):
+        warnings.append("refined: extreme |k3| > 200")
+    if _warn_extreme_k3(distort.get("refined_pruned")):
+        warnings.append("refined_pruned: extreme |k3| > 200")
+
+    compare_summary = {
+        "before": {
+            "rms_stereo": before_rms,
+            **(_result_error_summary(before_result or {})),
+        },
+        "refined": {
+            "rms_stereo": refined_rms,
+            **(_result_error_summary(refined_result or {})),
+        },
+        "refined_pruned": {
+            "rms_stereo": pruned_rms,
+            **(_result_error_summary(refined_pruned_result or {})),
+        },
+        "refine_report": _to_json_safe(refine_report),
+        "warnings": warnings,
+    }
+    (reports_dir / "compare_summary.json").write_text(json.dumps(_to_json_safe(compare_summary), indent=2))
+    return compare_summary
+
+
+def stereo_calibrate(session_dir: Path, cfg: dict, camera_intrinsics_path: Path, prune: bool = False) -> dict[str, Any]:
+    session = _load_session(session_dir)
+    pcal = cfg.get("projector_calibration", {}) or {}
+    cap_cfg = pcal.get("capture", {}) or {}
+    min_views_cfg = int(cap_cfg.get("min_views", 10))
+    min_corner_valid_ratio = float(cap_cfg.get("min_corner_valid_ratio", 0.90))
+
+    if not prune:
+        result, mats = _stereo_calibrate_once(
+            session_dir,
+            cfg,
+            camera_intrinsics_path,
+            min_views_required=min_views_cfg,
+            min_corner_valid_ratio=min_corner_valid_ratio,
+            allowed_view_ids=None,
+            save_reproj_overlays=True,
+        )
+        _write_stereo_outputs(
+            session_dir,
+            session,
+            result,
+            mats,
+            json_name="stereo.json",
+            npz_name="stereo.npz",
+            update_latest=True,
+            session_result_path="results/stereo.json",
+        )
+        return result
+
+    # Iterative pruning mode.
+    valid_views = [v for v in session.get("views", []) if v.get("status") == "valid" and v.get("view_id")]
+    current_view_ids = [str(v["view_id"]) for v in valid_views]
+    min_views_floor = 8
+    min_improvement = 0.05
+    if len(current_view_ids) < min_views_floor:
+        raise ValueError(f"Need at least {min_views_floor} valid views for pruning mode.")
+
+    best_result: dict[str, Any] | None = None
+    best_mats: dict[str, np.ndarray] | None = None
+    best_view_ids: list[str] = []
+    best_rms = float("inf")
+    removed_views: list[str] = []
+    history: list[dict[str, Any]] = []
+
+    while len(current_view_ids) >= min_views_floor:
+        result, mats = _stereo_calibrate_once(
+            session_dir,
+            cfg,
+            camera_intrinsics_path,
+            min_views_required=min_views_floor,
+            min_corner_valid_ratio=min_corner_valid_ratio,
+            allowed_view_ids=set(current_view_ids),
+            save_reproj_overlays=False,
+        )
+        rms = float(result.get("rms_stereo", float("inf")))
+        prev_best = best_rms
+        improved = bool(np.isfinite(rms) and (rms < best_rms))
+        if improved:
+            best_rms = rms
+            best_result = result
+            best_mats = mats
+            best_view_ids = list(current_view_ids)
+
+        entry: dict[str, Any] = {
+            "views_used": int(len(current_view_ids)),
+            "rms": rms,
+            "improved": improved,
+        }
+        if np.isfinite(prev_best):
+            entry["improvement_px"] = float(prev_best - rms)
+        history.append(entry)
+
+        if not improved:
+            entry["stop_reason"] = "rms_not_improving"
+            break
+        if np.isfinite(prev_best) and (prev_best - rms) < min_improvement:
+            entry["stop_reason"] = "improvement_below_threshold"
+            break
+
+        if len(current_view_ids) <= min_views_floor:
+            entry["stop_reason"] = "min_view_floor_reached"
+            break
+
+        removable = [
+            pv for pv in (result.get("per_view_errors", []) or [])
+            if int(pv.get("corners_used", 0)) >= 48 and str(pv.get("view_id", "")) in current_view_ids
+        ]
+        if not removable:
+            entry["stop_reason"] = "no_removable_view_with_48_corners"
+            break
+
+        worst = max(removable, key=lambda v: float(v.get("projector_reproj_error_px", -1.0)))
+        worst_id = str(worst.get("view_id", ""))
+        if not worst_id:
+            entry["stop_reason"] = "invalid_worst_view_id"
+            break
+        if len(current_view_ids) - 1 < min_views_floor:
+            entry["stop_reason"] = "would_go_below_min_view_floor"
+            break
+        current_view_ids = [vid for vid in current_view_ids if vid != worst_id]
+        removed_views.append(worst_id)
+        entry["removed_view"] = worst_id
+
+    if best_result is None or best_mats is None:
+        raise ValueError("Pruning could not produce a valid calibration result.")
+
+    # Re-run once for best subset to generate overlays and consistent output payload.
+    final_result, final_mats = _stereo_calibrate_once(
+        session_dir,
+        cfg,
+        camera_intrinsics_path,
+        min_views_required=min_views_floor,
+        min_corner_valid_ratio=min_corner_valid_ratio,
+        allowed_view_ids=set(best_view_ids),
+        save_reproj_overlays=True,
+    )
+    _write_stereo_outputs(
+        session_dir,
+        session,
+        final_result,
+        final_mats,
+        json_name="stereo.json",
+        npz_name="stereo.npz",
+        update_latest=True,
+        session_result_path="results/stereo_pruned.json",
+    )
+    # Additional prune-specific outputs.
+    res_dir = session_dir / "results"
+    (res_dir / "stereo_pruned.json").write_text(json.dumps(final_result, indent=2))
+    prune_report = {
+        "initial_rms": float(history[0]["rms"]) if history else None,
+        "final_rms": float(final_result.get("rms_stereo", 0.0)),
+        "views_removed": removed_views,
+        "history": history,
+        "min_views_floor": min_views_floor,
+        "min_improvement_px": min_improvement,
+        "best_view_ids": best_view_ids,
+    }
+    (res_dir / "prune_report.json").write_text(json.dumps(prune_report, indent=2))
+    final_result["prune_report"] = prune_report
+    return final_result
+
+
+def stereo_calibrate_refined(
+    session_dir: Path,
+    cfg: dict,
+    camera_intrinsics_path: Path,
+    *,
+    recalibrate: bool = True,
+    prune: bool = False,
+) -> dict[str, Any]:
+    """
+    Offline refined projector calibration:
+    - Refine UV corners in existing session views
+    - Recalibrate with refined correspondences
+    - Optional pruning loop
+    - Save compare reports without overwriting baseline stereo.json
+    """
+    session = _load_session(session_dir)
+    pcal = cfg.get("projector_calibration", {}) or {}
+    cap_cfg = pcal.get("capture", {}) or {}
+    min_views_cfg = int(cap_cfg.get("min_views", 10))
+    min_corner_valid_ratio = float(cap_cfg.get("min_corner_valid_ratio", 0.90))
+    refine_cfg = _uv_refine_config(cfg)
+    min_refined_corner_ratio = float((pcal.get("uv_refinement", {}) or {}).get("min_view_valid_ratio", 0.85))
+
+    refine_report = refine_uv_corners_for_session(session_dir, cfg)
+    baseline = _find_existing_stereo_result(session_dir, "stereo.json")
+    if baseline is None:
+        baseline, _ = _stereo_calibrate_once(
+            session_dir,
+            cfg,
+            camera_intrinsics_path,
+            min_views_required=min_views_cfg,
+            min_corner_valid_ratio=min_corner_valid_ratio,
+            allowed_view_ids=None,
+            save_reproj_overlays=False,
+            use_refined_uv=False,
+        )
+
+    refined_result: dict[str, Any] | None = None
+    refined_mats: dict[str, np.ndarray] | None = None
+    refined_pruned: dict[str, Any] | None = None
+
+    if recalibrate:
+        dropped_refined: list[dict[str, Any]] = []
+        refined_result, refined_mats = _stereo_calibrate_once(
+            session_dir,
+            cfg,
+            camera_intrinsics_path,
+            min_views_required=min_views_cfg,
+            min_corner_valid_ratio=min_corner_valid_ratio,
+            allowed_view_ids=None,
+            save_reproj_overlays=True,
+            use_refined_uv=True,
+            min_refined_corner_ratio=min_refined_corner_ratio,
+            dropped_views=dropped_refined,
+        )
+        refined_result["uv_refinement"] = {
+            "config": _to_json_safe(asdict(refine_cfg)),
+            "min_view_valid_ratio": float(min_refined_corner_ratio),
+            "views_auto_dropped": _to_json_safe(dropped_refined),
+            "report_path": "results/uv_refine_session_report.json",
+        }
+        (session_dir / "results" / "stereo_refined.json").write_text(
+            json.dumps(_to_json_safe(refined_result), indent=2)
+        )
+        if refined_mats is not None:
+            np.savez(session_dir / "results" / "stereo_refined.npz", **refined_mats)
+
+        if prune:
+            # Iterative pruning over refined correspondences only.
+            valid_views = [v for v in session.get("views", []) if v.get("status") == "valid" and v.get("view_id")]
+            current_view_ids = [str(v["view_id"]) for v in valid_views]
+            min_views_floor = 8
+            min_improvement = 0.05
+            best_result: dict[str, Any] | None = None
+            best_mats: dict[str, np.ndarray] | None = None
+            best_view_ids: list[str] = []
+            best_rms = float("inf")
+            removed_views: list[str] = []
+            history: list[dict[str, Any]] = []
+
+            while len(current_view_ids) >= min_views_floor:
+                result_i, mats_i = _stereo_calibrate_once(
+                    session_dir,
+                    cfg,
+                    camera_intrinsics_path,
+                    min_views_required=min_views_floor,
+                    min_corner_valid_ratio=min_corner_valid_ratio,
+                    allowed_view_ids=set(current_view_ids),
+                    save_reproj_overlays=False,
+                    use_refined_uv=True,
+                    min_refined_corner_ratio=min_refined_corner_ratio,
+                    dropped_views=None,
+                )
+                rms = float(result_i.get("rms_stereo", float("inf")))
+                prev_best = best_rms
+                improved = bool(np.isfinite(rms) and (rms < best_rms))
+                if improved:
+                    best_rms = rms
+                    best_result = result_i
+                    best_mats = mats_i
+                    best_view_ids = list(current_view_ids)
+                hist = {
+                    "views_used": int(len(current_view_ids)),
+                    "rms": rms,
+                    "improved": improved,
+                }
+                if np.isfinite(prev_best):
+                    hist["improvement_px"] = float(prev_best - rms)
+                history.append(hist)
+                if not improved:
+                    hist["stop_reason"] = "rms_not_improving"
+                    break
+                if np.isfinite(prev_best) and (prev_best - rms) < min_improvement:
+                    hist["stop_reason"] = "improvement_below_threshold"
+                    break
+                if len(current_view_ids) <= min_views_floor:
+                    hist["stop_reason"] = "min_view_floor_reached"
+                    break
+
+                removable = [
+                    pv for pv in (result_i.get("per_view_errors", []) or [])
+                    if int(pv.get("corners_used", 0)) >= 48 and str(pv.get("view_id", "")) in current_view_ids
+                ]
+                if not removable:
+                    hist["stop_reason"] = "no_removable_view_with_48_corners"
+                    break
+                worst = max(removable, key=lambda v: float(v.get("projector_reproj_error_px", -1.0)))
+                worst_id = str(worst.get("view_id", ""))
+                if not worst_id:
+                    hist["stop_reason"] = "invalid_worst_view_id"
+                    break
+                if len(current_view_ids) - 1 < min_views_floor:
+                    hist["stop_reason"] = "would_go_below_min_view_floor"
+                    break
+                hist["removed_view"] = worst_id
+                hist["removed_projector_reproj_error_px"] = float(worst.get("projector_reproj_error_px", float("nan")))
+                current_view_ids = [vid for vid in current_view_ids if vid != worst_id]
+                removed_views.append(worst_id)
+
+            if best_result is not None and best_mats is not None:
+                final_refined_pruned, final_refined_pruned_mats = _stereo_calibrate_once(
+                    session_dir,
+                    cfg,
+                    camera_intrinsics_path,
+                    min_views_required=min_views_floor,
+                    min_corner_valid_ratio=min_corner_valid_ratio,
+                    allowed_view_ids=set(best_view_ids),
+                    save_reproj_overlays=True,
+                    use_refined_uv=True,
+                    min_refined_corner_ratio=min_refined_corner_ratio,
+                    dropped_views=None,
+                )
+                prune_refined_report = {
+                    "initial_rms": float(history[0]["rms"]) if history else None,
+                    "final_rms": float(final_refined_pruned.get("rms_stereo", 0.0)),
+                    "views_removed": removed_views,
+                    "history": history,
+                    "min_views_floor": min_views_floor,
+                    "min_improvement_px": min_improvement,
+                    "final_view_ids": list(final_refined_pruned.get("view_ids", [])),
+                }
+                final_refined_pruned["uv_refinement"] = {
+                    "config": _to_json_safe(asdict(refine_cfg)),
+                    "min_view_valid_ratio": float(min_refined_corner_ratio),
+                    "report_path": "results/uv_refine_session_report.json",
+                }
+                final_refined_pruned["prune_report"] = prune_refined_report
+                (session_dir / "results" / "stereo_refined_pruned.json").write_text(
+                    json.dumps(_to_json_safe(final_refined_pruned), indent=2)
+                )
+                (session_dir / "results" / "prune_refined_report.json").write_text(
+                    json.dumps(_to_json_safe(prune_refined_report), indent=2)
+                )
+                np.savez(session_dir / "results" / "stereo_refined_pruned.npz", **final_refined_pruned_mats)
+                refined_pruned = final_refined_pruned
+
+    compare_summary = _build_refine_compare_outputs(
+        session_dir=session_dir,
+        before_result=baseline,
+        refined_result=refined_result,
+        refined_pruned_result=refined_pruned,
+        refine_report=refine_report,
+    )
+
+    session_report = {
+        "before": _to_json_safe(baseline or {}),
+        "after": _to_json_safe(refined_result or {}),
+        "after_pruned": _to_json_safe(refined_pruned or {}),
+        "refine_summary": _to_json_safe(refine_report),
+        "compare_summary_path": "reports/refine_compare/compare_summary.json",
+    }
+    (session_dir / "results" / "refine_session_report.json").write_text(
+        json.dumps(_to_json_safe(session_report), indent=2)
+    )
+
+    response = {
+        "session_id": session.get("session_id"),
+        "recalibrated": bool(recalibrate),
+        "pruned": bool(prune and refined_pruned is not None),
+        "baseline_rms": float((baseline or {}).get("rms_stereo", float("nan"))),
+        "refined_rms": float((refined_result or {}).get("rms_stereo", float("nan"))),
+        "refined_pruned_rms": float((refined_pruned or {}).get("rms_stereo", float("nan"))),
+        "best_view_ids": (refined_pruned or refined_result or baseline or {}).get("view_ids", []),
+        "reports": {
+            "uv_refine_session_report": "results/uv_refine_session_report.json",
+            "stereo_refined": "results/stereo_refined.json" if refined_result is not None else None,
+            "stereo_refined_pruned": "results/stereo_refined_pruned.json" if refined_pruned is not None else None,
+            "prune_refined_report": "results/prune_refined_report.json" if refined_pruned is not None else None,
+            "refine_session_report": "results/refine_session_report.json",
+            "compare_summary": "reports/refine_compare/compare_summary.json",
+        },
+        "compare_summary": _to_json_safe(compare_summary),
+    }
+    return response
+
+
+def _legacy_stereo_calibrate_write_back_compat(session_dir: Path, result: dict[str, Any]) -> None:
+    """No-op placeholder to keep import stability if needed."""
+    return None

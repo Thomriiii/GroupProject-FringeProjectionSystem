@@ -36,6 +36,10 @@ from fringe_app.overlays.generate import overlay_masks
 from fringe_app.unwrap.temporal import unwrap_multi_frequency, save_unwrap_outputs
 from fringe_app.cli import cmd_phase, cmd_unwrap, cmd_score
 from fringe_app.recon import load_stereo_model, reconstruct_uv_run, save_reconstruction_outputs
+from fringe_app.web.routes.projector_calibration import (
+    build_capture_response_payload,
+    build_projector_session_payload,
+)
 
 
 class FringeServer:
@@ -510,14 +514,13 @@ class FringeServer:
         @self.app.get("/api/calibration/projector/session/{session_id}")
         async def projector_calibration_get_session(session_id: str):
             root = self._calibration_root()
-            sdir = root / "projector" / "sessions" / session_id
-            if not sdir.exists():
-                return JSONResponse({"ok": False, "error": "session not found"}, status_code=404)
             try:
-                sess = json.loads((sdir / "session.json").read_text())
+                payload = build_projector_session_payload(root, session_id, list_projector_views)
             except Exception as exc:
-                return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
-            return {"ok": True, "session": sess, "views": list_projector_views(sdir)}
+                err = str(exc)
+                status = 404 if "not found" in err.lower() else 500
+                return JSONResponse({"ok": False, "error": err}, status_code=status)
+            return {"ok": True, **payload}
 
         @self.app.post("/api/calibration/projector/session/{session_id}/capture")
         async def projector_calibration_capture_view(session_id: str):
@@ -533,7 +536,7 @@ class FringeServer:
                         self.controller,
                         self.config,
                     )
-                return {"ok": True, "view": summary}
+                return {"ok": True, **build_capture_response_payload(summary)}
             except Exception as exc:
                 log.error("Projector calibration capture failed: %s", exc)
                 log.error(traceback.format_exc())
