@@ -175,6 +175,7 @@ def evaluate_projector_view(
     max_unwrap_residual_p95: float = 1.2,
     max_unwrap_gt_1rad_pct: float = 0.15,
     min_b_median_board: float = 20.0,
+    require_full_corner_count: bool = True,
 ) -> tuple[ProjectorViewDiagnostics, dict[str, Any] | None]:
     total = int(expected_corner_count)
     found_count = int(corners_cam.shape[0])
@@ -203,7 +204,7 @@ def evaluate_projector_view(
     hints: list[str] = []
 
     # 1) Checkerboard gate.
-    if (not corners_found) or (found_count != total):
+    if (not corners_found) or (bool(require_full_corner_count) and (found_count != total)):
         reasons.append("Checkerboard not fully detected")
         hints.append("Ensure full checkerboard is visible and in focus.")
 

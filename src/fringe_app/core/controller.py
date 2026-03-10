@@ -56,6 +56,7 @@ class ScanController:
         self._preview_params: Optional[ScanParams] = None
         self._preview_running = False
         self._camera_lock = threading.Lock()
+        self._display_lock = threading.Lock()
         self._camera_started = False
 
         self._state: State = "IDLE"
@@ -194,25 +195,36 @@ class ScanController:
         with self._lock:
             if self._state == "RUNNING":
                 raise RuntimeError("Cannot toggle projector calibration light while scan is running")
-        if not enabled:
-            try:
-                self.display.close()
-            except Exception:
-                pass
-            return
+        with self._display_lock:
+            if not enabled:
+                try:
+                    self.display.close()
+                except Exception:
+                    pass
+                return
 
-        scan_cfg = self.config.get("scan", {}) or {}
-        disp_cfg = self.config.get("display", {}) or {}
-        if self._preview_params is not None:
-            width, height = self._preview_params.resolution
-        else:
-            width = int(scan_cfg.get("width", 1024))
-            height = int(scan_cfg.get("height", 768))
-        screen_index = scan_cfg.get("projector_screen_index", disp_cfg.get("screen_index"))
-        frame = np.full((int(height), int(width)), int(np.clip(dn, 0, 255)), dtype=np.uint8)
-        self.display.open(fullscreen=True, screen_index=screen_index)
-        self.display.show_gray(frame)
-        self.display.pump()
+            scan_cfg = self.config.get("scan", {}) or {}
+            disp_cfg = self.config.get("display", {}) or {}
+            if self._preview_params is not None:
+                width, height = self._preview_params.resolution
+            else:
+                width = int(scan_cfg.get("width", 1024))
+                height = int(scan_cfg.get("height", 768))
+            screen_index = scan_cfg.get("projector_screen_index", disp_cfg.get("screen_index"))
+            frame = np.full((int(height), int(width)), int(np.clip(dn, 0, 255)), dtype=np.uint8)
+            current_tid = threading.get_ident()
+            owner_tid = self.display.owner_thread_id() if hasattr(self.display, "owner_thread_id") else None
+            need_rebind = owner_tid is not None and owner_tid != current_tid
+            # SDL/EGL contexts are thread-affine. Recreate only when ownership changes.
+            if need_rebind:
+                try:
+                    self.display.close()
+                except Exception:
+                    pass
+            if (not hasattr(self.display, "is_open")) or (not self.display.is_open()):
+                self.display.open(fullscreen=True, screen_index=screen_index)
+            self.display.show_gray(frame)
+            self.display.pump()
 
     def _scan_worker(self, params: ScanParams) -> None:
         run_id = None
@@ -454,6 +466,11 @@ class ScanController:
             self._ended_at = datetime.now().isoformat()
             if run_dir is not None and run_id is not None:
                 device_info["applied_controls"] = getattr(self.camera, "get_applied_controls", lambda: {})()
+                existing_meta = None
+                try:
+                    existing_meta = self.store.load_meta(run_dir)
+                except Exception:
+                    existing_meta = None
                 meta = RunMeta(
                     run_id=run_id,
                     params=params.to_dict(),
@@ -465,6 +482,13 @@ class ScanController:
                     total_frames=self._total_steps,
                     saved_frames=captured,
                     preview_enabled=True,
+                    cmdline=(existing_meta.cmdline if existing_meta is not None else None),
+                    invoked_command=(existing_meta.invoked_command if existing_meta is not None else None),
+                    force=(existing_meta.force if existing_meta is not None else None),
+                    retry_index=(existing_meta.retry_index if existing_meta is not None else None),
+                    retry_origin_run_id=(
+                        existing_meta.retry_origin_run_id if existing_meta is not None else None
+                    ),
                 )
                 self.store.save_meta(run_dir, meta)
 

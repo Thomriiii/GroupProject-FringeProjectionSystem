@@ -25,6 +25,8 @@ class CalibrationConfig:
     checkerboard_rows: int = 6
     square_size_mm: float = 25.0
     min_valid_detections: int = 10
+    board_type: str = "checkerboard"
+    charuco: dict[str, Any] | None = None
 
 
 class CalibrationManager:
@@ -116,6 +118,8 @@ class CalibrationManager:
             cols=int(self.cfg.checkerboard_cols),
             rows=int(self.cfg.checkerboard_rows),
             refine_subpix=True,
+            board_type=str(self.cfg.board_type),
+            charuco_cfg=self.cfg.charuco,
         )
 
         save_image(sdir / image_rel, image)

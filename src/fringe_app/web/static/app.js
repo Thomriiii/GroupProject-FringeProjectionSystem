@@ -2,6 +2,7 @@ const statusEl = document.getElementById('status');
 const runsList = document.getElementById('runs_list');
 const previewImg = document.getElementById('preview_img');
 const startPipelineBtn = document.getElementById('start_pipeline_btn');
+const startPipelineForceBtn = document.getElementById('start_pipeline_force_btn');
 
 async function refreshPipelineStatus() {
   const [scanRes, pipeRes] = await Promise.all([
@@ -13,7 +14,11 @@ async function refreshPipelineStatus() {
   const runId = pipe.run_id ? ` | run ${pipe.run_id}` : '';
   const step = scan.total ? ` (${scan.progress}/${scan.total})` : '';
   statusEl.textContent = `${pipe.state}${step}${runId}`;
-  startPipelineBtn.disabled = pipe.state === 'running';
+  const isRunning = pipe.state === 'running';
+  startPipelineBtn.disabled = isRunning;
+  if (startPipelineForceBtn) {
+    startPipelineForceBtn.disabled = isRunning;
+  }
 }
 
 async function refreshRuns() {
@@ -36,13 +41,25 @@ async function refreshRuns() {
   }
 }
 
-startPipelineBtn.addEventListener('click', async () => {
+async function startPipeline(force) {
   await fetch('/api/pipeline/start', {
     method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ force: !!force }),
   });
   refreshPipelineStatus();
   refreshRuns();
+}
+
+startPipelineBtn.addEventListener('click', async () => {
+  await startPipeline(false);
 });
+
+if (startPipelineForceBtn) {
+  startPipelineForceBtn.addEventListener('click', async () => {
+    await startPipeline(true);
+  });
+}
 
 function setupPreview() {
   if (!previewImg) return;

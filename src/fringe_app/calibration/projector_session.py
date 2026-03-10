@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 
+from .conditioning import ConditioningAccumulator, ConditioningConfig
 from .projector_view_gating import ProjectorViewDiagnostics
 
 
@@ -45,20 +46,19 @@ def _json_safe(value: Any) -> Any:
 
 def init_coverage_map(
     projector_size: tuple[int, int],
-    bins_x: int = 8,
-    bins_y: int = 8,
+    conditioning_cfg: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    w, h = int(projector_size[0]), int(projector_size[1])
-    grid = [[0 for _ in range(int(bins_x))] for _ in range(int(bins_y))]
-    return {
-        "projector_size": [w, h],
-        "bins_x": int(bins_x),
-        "bins_y": int(bins_y),
-        "grid": grid,
-        "covered_bins": 0,
-        "total_bins": int(bins_x * bins_y),
-        "coverage_ratio": 0.0,
-    }
+    cfg = ConditioningConfig.from_config(conditioning_cfg)
+    acc = ConditioningAccumulator(projector_size, cfg)
+    payload = acc.to_dict()
+    payload["conditioning_cfg"] = conditioning_cfg or {}
+    return payload
+
+
+def _conditioning_cfg(session: dict[str, Any]) -> dict[str, Any]:
+    session_cfg = session.get("config", {}) if isinstance(session, dict) else {}
+    cond = (session_cfg.get("conditioning", {}) or {}) if isinstance(session_cfg, dict) else {}
+    return dict(cond)
 
 
 def _ensure_session_state(
@@ -71,19 +71,69 @@ def _ensure_session_state(
         session["accepted_pose_history"] = []
     if not isinstance(session.get("capture_attempts"), int):
         session["capture_attempts"] = 0
+    cond_cfg = _conditioning_cfg(session)
     cov = session.get("coverage_map")
     if not isinstance(cov, dict):
-        session["coverage_map"] = init_coverage_map(projector_size)
+        session["coverage_map"] = init_coverage_map(projector_size, conditioning_cfg=cond_cfg)
     else:
-        cov.setdefault("projector_size", [int(projector_size[0]), int(projector_size[1])])
-        cov.setdefault("bins_x", 8)
-        cov.setdefault("bins_y", 8)
+        cov["projector_size"] = [int(projector_size[0]), int(projector_size[1])]
+        cov.setdefault("grid_size", [int(cond_cfg.get("grid_w", 64)), int(cond_cfg.get("grid_h", 36))])
+        cov.setdefault("bins_x", int(cov.get("grid_size", [64, 36])[0]))
+        cov.setdefault("bins_y", int(cov.get("grid_size", [64, 36])[1]))
         cov.setdefault("grid", [[0 for _ in range(int(cov["bins_x"]))] for _ in range(int(cov["bins_y"]))])
         cov.setdefault("covered_bins", 0)
         cov.setdefault("total_bins", int(cov["bins_x"] * cov["bins_y"]))
         cov.setdefault("coverage_ratio", 0.0)
+        cov.setdefault("guidance", [])
+        cov.setdefault("uniformity_metric", 0.0)
+        cov.setdefault("edge_coverage_ratio", 0.0)
+        cov.setdefault("sufficient", False)
+        cov["conditioning_cfg"] = cond_cfg
         session["coverage_map"] = cov
     return session
+
+
+def _coverage_size(coverage: dict[str, Any] | None) -> tuple[int, int] | None:
+    if not isinstance(coverage, dict):
+        return None
+    proj = coverage.get("projector_size")
+    if isinstance(proj, (list, tuple)) and len(proj) == 2:
+        try:
+            return (int(proj[0]), int(proj[1]))
+        except Exception:
+            return None
+    return None
+
+
+def _rebuild_coverage_from_session_views(
+    session_dir: Path,
+    session: dict[str, Any],
+    projector_size: tuple[int, int],
+    conditioning_cfg: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    cov = init_coverage_map(projector_size, conditioning_cfg=conditioning_cfg)
+    for view in (session.get("views", []) or []):
+        if not isinstance(view, dict):
+            continue
+        view_id = str(view.get("view_id", "")).strip()
+        if not view_id:
+            continue
+        corr_path = session_dir / "views" / view_id / "correspondences.json"
+        if not corr_path.exists():
+            continue
+        try:
+            corr = json.loads(corr_path.read_text())
+        except Exception:
+            continue
+        pts = np.asarray(corr.get("projector_corners_px", []), dtype=np.float64).reshape(-1, 2)
+        vm = np.asarray(corr.get("valid_mask", []), dtype=bool).reshape(-1)
+        if pts.shape[0] != vm.shape[0] or pts.size == 0:
+            continue
+        valid_pts = pts[vm]
+        if valid_pts.size == 0:
+            continue
+        cov = update_coverage_map(cov, valid_pts, conditioning_cfg=conditioning_cfg)
+    return cov
 
 
 def next_view_id(session_dir: Path, projector_size: tuple[int, int]) -> str:
@@ -120,35 +170,19 @@ def update_pose_history(session: dict[str, Any], pose_entry: dict[str, Any] | No
 def update_coverage_map(
     coverage: dict[str, Any],
     projector_points: np.ndarray,
+    conditioning_cfg: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    grid = np.asarray(coverage.get("grid", []), dtype=np.int32)
-    if grid.ndim != 2 or grid.size == 0:
-        bins_y = int(coverage.get("bins_y", 8))
-        bins_x = int(coverage.get("bins_x", 8))
-        grid = np.zeros((bins_y, bins_x), dtype=np.int32)
-    else:
-        bins_y, bins_x = int(grid.shape[0]), int(grid.shape[1])
     proj_size = coverage.get("projector_size", [0, 0])
     pw = max(1, int(proj_size[0]))
     ph = max(1, int(proj_size[1]))
-
-    pts = np.asarray(projector_points, dtype=np.float64).reshape(-1, 2)
-    finite = np.isfinite(pts).all(axis=1)
-    pts = pts[finite]
-    if pts.size > 0:
-        u = np.clip(pts[:, 0], 0.0, float(pw - 1))
-        v = np.clip(pts[:, 1], 0.0, float(ph - 1))
-        bx = np.clip((u / float(pw)) * bins_x, 0.0, bins_x - 1e-6).astype(np.int32)
-        by = np.clip((v / float(ph)) * bins_y, 0.0, bins_y - 1e-6).astype(np.int32)
-        grid[by, bx] = 1
-
-    covered = int(np.count_nonzero(grid))
-    total = int(grid.size)
-    coverage["grid"] = grid.astype(int).tolist()
-    coverage["covered_bins"] = covered
-    coverage["total_bins"] = total
-    coverage["coverage_ratio"] = float(covered / max(total, 1))
-    return coverage
+    cfg_dict = conditioning_cfg if conditioning_cfg is not None else (coverage.get("conditioning_cfg", {}) or {})
+    cfg = ConditioningConfig.from_config(cfg_dict)
+    grid = np.asarray(coverage.get("grid", []), dtype=np.int32)
+    acc = ConditioningAccumulator((pw, ph), cfg, grid=grid)
+    acc.update(np.asarray(projector_points, dtype=np.float64).reshape(-1, 2))
+    payload = acc.to_dict()
+    payload["conditioning_cfg"] = cfg_dict
+    return payload
 
 
 def add_view_if_valid(
@@ -161,6 +195,16 @@ def add_view_if_valid(
 ) -> tuple[bool, dict[str, Any]]:
     session = load_session(session_dir)
     session = _ensure_session_state(session, projector_size)
+    cond_cfg = _conditioning_cfg(session)
+    cov_size = _coverage_size(session.get("coverage_map"))
+    target_size = (int(projector_size[0]), int(projector_size[1]))
+    if cov_size is None or cov_size != target_size:
+        session["coverage_map"] = _rebuild_coverage_from_session_views(
+            session_dir,
+            session,
+            projector_size=target_size,
+            conditioning_cfg=cond_cfg,
+        )
 
     capture_result = {
         "view_id": view_data.get("view_id"),
@@ -168,6 +212,7 @@ def add_view_if_valid(
         "reject_reasons": list(diagnostics.reject_reasons),
         "hints": list(diagnostics.hints),
         "valid_corner_ratio": float(diagnostics.valid_corner_ratio),
+        "coverage_sufficient": False,
     }
     session["last_capture_result"] = capture_result
 
@@ -182,7 +227,10 @@ def add_view_if_valid(
         cov = session.get("coverage_map", init_coverage_map(projector_size))
         if projector_points is None:
             projector_points = np.empty((0, 2), dtype=np.float32)
-        session["coverage_map"] = update_coverage_map(cov, projector_points)
+        session["coverage_map"] = update_coverage_map(cov, projector_points, conditioning_cfg=cond_cfg)
+        capture_result["coverage_sufficient"] = bool((session["coverage_map"] or {}).get("sufficient", False))
+        if capture_result["coverage_sufficient"]:
+            capture_result["hints"] = sorted(set(capture_result["hints"] + ["Coverage target reached; you can run Solve."]))
         session_coverage_path(session_dir).write_text(
             json.dumps(session["coverage_map"], indent=2)
         )

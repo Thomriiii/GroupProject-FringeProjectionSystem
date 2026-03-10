@@ -4,9 +4,11 @@ from .manager import CalibrationConfig, CalibrationManager
 from .projector_stereo import (
     create_session as create_projector_session,
     list_views as list_projector_views,
-    capture_view as capture_projector_view,
+    capture_projector_view,
+    calibrate_projector_gamma,
     delete_view as delete_projector_view,
     stereo_calibrate as stereo_calibrate_projector,
+    solve_projector_session,
 )
 
 __all__ = [
@@ -15,6 +17,8 @@ __all__ = [
     "create_projector_session",
     "list_projector_views",
     "capture_projector_view",
+    "calibrate_projector_gamma",
     "delete_projector_view",
     "stereo_calibrate_projector",
+    "solve_projector_session",
 ]

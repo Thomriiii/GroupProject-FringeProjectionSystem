@@ -18,6 +18,28 @@ def _save_mask_png(mask: np.ndarray, path: Path) -> None:
     Image.fromarray(out).save(path)
 
 
+def _save_autoscale_gray_png(
+    values: np.ndarray,
+    mask: np.ndarray,
+    path: Path,
+    lo_pct: float = 1.0,
+    hi_pct: float = 99.0,
+) -> None:
+    valid = mask.astype(bool) & np.isfinite(values)
+    out = np.zeros(values.shape, dtype=np.uint8)
+    if np.any(valid):
+        vals = values[valid].astype(np.float64)
+        lo, hi = np.percentile(vals, [lo_pct, hi_pct])
+        if not np.isfinite(lo):
+            lo = float(np.min(vals))
+        if not np.isfinite(hi):
+            hi = float(np.max(vals))
+        if hi <= lo:
+            hi = lo + 1e-6
+        out[valid] = np.clip(((values[valid] - lo) / (hi - lo)) * 255.0, 0, 255).astype(np.uint8)
+    Image.fromarray(out).save(path)
+
+
 def _save_depth_debug_png(
     depth: np.ndarray,
     mask: np.ndarray,
@@ -100,6 +122,26 @@ def save_reconstruction_outputs(
         z_max=z_max,
     )
 
+    plots_dir = out_dir / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    rejected_mask = result.mask_uv.astype(bool) & (~result.mask_recon.astype(bool))
+    _save_autoscale_gray_png(result.reproj_err_cam, result.mask_uv, plots_dir / "reproj_err_cam.png")
+    _save_autoscale_gray_png(result.reproj_err_proj, result.mask_uv, plots_dir / "reproj_err_proj.png")
+    _save_mask_png(result.mask_uv, plots_dir / "mask_uv.png")
+    _save_mask_png(result.mask_recon, plots_dir / "mask_recon.png")
+    _save_mask_png(rejected_mask, plots_dir / "rejected_mask.png")
+    try:
+        base = np.array(Image.open(out_dir / "depth_debug_autoscale.png").convert("RGB"), dtype=np.uint8)
+        over = base.astype(np.float32)
+        rej = rejected_mask
+        if np.any(rej):
+            over[rej, 0] = np.clip(0.35 * over[rej, 0] + 165.0, 0, 255)
+            over[rej, 1] = np.clip(0.35 * over[rej, 1], 0, 255)
+            over[rej, 2] = np.clip(0.35 * over[rej, 2], 0, 255)
+        Image.fromarray(over.astype(np.uint8)).save(plots_dir / "rejected_overlay.png")
+    except Exception:
+        pass
+
     ys, xs = np.where(result.mask_recon)
     if ys.size == 0:
         raise ValueError("No valid 3D points after reconstruction filtering")
@@ -150,6 +192,14 @@ def save_reconstruction_outputs(
                 },
                 "reproj_err_cam": "reproj_err_cam.npy",
                 "reproj_err_proj": "reproj_err_proj.npy",
+                "plots": {
+                    "reproj_err_cam": "plots/reproj_err_cam.png",
+                    "reproj_err_proj": "plots/reproj_err_proj.png",
+                    "mask_uv": "plots/mask_uv.png",
+                    "mask_recon": "plots/mask_recon.png",
+                    "rejected_mask": "plots/rejected_mask.png",
+                    "rejected_overlay": "plots/rejected_overlay.png",
+                },
             },
             "exported_points": int(pts.shape[0]),
             "downsample": ds_cfg,

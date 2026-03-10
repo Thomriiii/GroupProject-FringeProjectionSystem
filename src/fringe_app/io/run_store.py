@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import zipfile
-from dataclasses import asdict
+from dataclasses import asdict, fields
 import re
 from datetime import datetime
 from pathlib import Path
@@ -101,7 +101,9 @@ class RunStore:
 
     def load_meta(self, run_dir: Path) -> RunMeta:
         data = json.loads((run_dir / "meta.json").read_text())
-        return RunMeta(**data)
+        allowed = {f.name for f in fields(RunMeta)}
+        filtered = {k: v for k, v in data.items() if k in allowed}
+        return RunMeta(**filtered)
 
     def list_runs(self) -> List[RunMeta]:
         if not self.root.exists():
@@ -114,7 +116,10 @@ class RunStore:
             if not meta_path.exists():
                 continue
             try:
-                metas.append(RunMeta(**json.loads(meta_path.read_text())))
+                data = json.loads(meta_path.read_text())
+                allowed = {f.name for f in fields(RunMeta)}
+                filtered = {k: v for k, v in data.items() if k in allowed}
+                metas.append(RunMeta(**filtered))
             except Exception:
                 continue
         return metas
@@ -246,19 +251,36 @@ class RunStore:
         roi_meta: dict,
         roi_raw: np.ndarray | None = None,
         roi_post: np.ndarray | None = None,
+        roi_core: np.ndarray | None = None,
+        roi_dilated: np.ndarray | None = None,
+        bbox_core=None,
+        bbox_dilated=None,
     ) -> None:
         run_dir = self.root / run_id
         roi_dir = run_dir / "roi"
         roi_dir.mkdir(exist_ok=True)
+        core = roi_core.astype(bool) if roi_core is not None else roi_mask.astype(bool)
+        dilated = roi_dilated.astype(bool) if roi_dilated is not None else roi_mask.astype(bool)
+        # Keep historical alias roi_mask.* mapped to the dilated/safety ROI.
+        np.save(roi_dir / "roi_mask_core.npy", core)
+        np.save(roi_dir / "roi_mask_dilated.npy", dilated)
+        np.save(roi_dir / "roi_mask.npy", dilated)
         try:
-            visualize.save_mask_png(roi_mask, str(roi_dir / "roi_mask.png"))
+            visualize.save_mask_png(core, str(roi_dir / "roi_mask_core.png"))
+            visualize.save_mask_png(dilated, str(roi_dir / "roi_mask_dilated.png"))
+            visualize.save_mask_png(dilated, str(roi_dir / "roi_mask.png"))
             if roi_raw is not None:
                 visualize.save_mask_png(roi_raw, str(roi_dir / "roi_raw.png"))
             if roi_post is not None:
                 visualize.save_mask_png(roi_post, str(roi_dir / "roi_post.png"))
         except Exception:
             pass
-        meta = {"bbox": bbox, **roi_meta}
+        meta = {
+            "bbox": bbox_dilated if bbox_dilated is not None else bbox,
+            "bbox_core": bbox_core,
+            "bbox_dilated": bbox_dilated if bbox_dilated is not None else bbox,
+            **roi_meta,
+        }
         (roi_dir / "roi_meta.json").write_text(json.dumps(meta, indent=2))
 
     def load_reference_image(self, run_id: str, ref_method: str = "median_over_frames") -> np.ndarray:

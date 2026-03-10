@@ -7,6 +7,7 @@ import json
 import shutil
 from dataclasses import asdict, dataclass
 import time
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List
@@ -15,7 +16,10 @@ import numpy as np
 
 from fringe_app.core.models import ScanParams
 from fringe_app.patterns.generator import FringePatternGenerator
-from fringe_app.display.pygame_display import PygameProjectorDisplay
+from fringe_app.display.pygame_display import (
+    PygameProjectorDisplay,
+    generate_projector_geometry_sanity_pattern,
+)
 from fringe_app.camera.picamera2_impl import Picamera2Camera
 from fringe_app.camera.mock import MockCamera
 from fringe_app.io.run_store import RunStore
@@ -26,7 +30,6 @@ from fringe_app.core.quality_gate import (
     QualityReport,
     build_phase_quality_report,
     apply_unwrap_quality_report,
-    save_quality_report,
     load_quality_state,
     reset_quality_state,
     update_quality_state,
@@ -44,6 +47,7 @@ from fringe_app.overlays.generate import overlay_masks, overlay_clipping
 from fringe_app.unwrap.temporal import unwrap_multi_frequency, save_unwrap_outputs
 from fringe_app.uv import phase_to_uv, save_uv_outputs
 from fringe_app.recon import load_stereo_model, reconstruct_uv_run, save_reconstruction_outputs
+from fringe_app.reconstruction import save_recon_qa_outputs
 
 
 @dataclass(slots=True)
@@ -283,10 +287,15 @@ def cmd_phase(args) -> int:
     roi_res = detect_object_roi(ref, roi_cfg)
     store.save_roi(
         args.run,
-        roi_res.roi_mask,
-        roi_res.bbox,
+        roi_res.roi_dilated_mask,
+        roi_res.bbox_dilated,
         {
             "cfg": asdict(roi_cfg),
+            "bbox_core": roi_res.bbox_core,
+            "bbox_dilated": roi_res.bbox_dilated,
+            "area_ratio_core": float(np.count_nonzero(roi_res.roi_core_mask) / roi_res.roi_core_mask.size),
+            "area_ratio_dilated": float(np.count_nonzero(roi_res.roi_dilated_mask) / roi_res.roi_dilated_mask.size),
+            "roi_gate_mask": "core",
             "debug": {
                 **roi_res.debug,
                 "ref_method": roi_cfg.ref_method,
@@ -295,12 +304,22 @@ def cmd_phase(args) -> int:
                     "mean": float(np.mean(ref)),
                     "max": int(np.max(ref)),
                 },
+                "bbox_core": roi_res.bbox_core,
+                "bbox_dilated": roi_res.bbox_dilated,
+                "area_ratio_core": float(np.count_nonzero(roi_res.roi_core_mask) / roi_res.roi_core_mask.size),
+                "area_ratio_dilated": float(np.count_nonzero(roi_res.roi_dilated_mask) / roi_res.roi_dilated_mask.size),
+                "roi_gate_mask": "core",
             },
         },
         roi_raw=roi_res.raw_mask,
         roi_post=roi_res.post_mask,
+        roi_core=roi_res.roi_core_mask,
+        roi_dilated=roi_res.roi_dilated_mask,
+        bbox_core=roi_res.bbox_core,
+        bbox_dilated=roi_res.bbox_dilated,
     )
-    roi_mask_for_score = None if roi_res.debug.get("roi_fallback") else roi_res.roi_mask
+    roi_mask_for_score = None if roi_res.debug.get("roi_fallback") else roi_res.roi_core_mask
+    roi_mask_for_clip = None if roi_res.debug.get("roi_fallback") else roi_res.roi_dilated_mask
 
     freqs = params.get_frequencies()
     processor = PhaseShiftProcessor()
@@ -315,7 +334,7 @@ def cmd_phase(args) -> int:
     max_hole_area = int(post_cfg.get("max_hole_area", 200))
     for freq in freqs:
         images = store.iter_captures(args.run, freq=freq) if len(freqs) > 1 else store.iter_captures(args.run)
-        result = processor.compute_phase(images, params, thresholds, roi_mask=roi_mask_for_score)
+        result = processor.compute_phase(images, params, thresholds, roi_mask=roi_mask_for_clip)
         raw_mask = result.mask_raw.copy()
         if post_enabled:
             cleaned = cleanup_mask(
@@ -342,16 +361,30 @@ def cmd_phase(args) -> int:
             result.mask = raw_mask
             result.debug["postmask_cleanup"] = {"enabled": False}
 
-        # Dedicated conservative mask for temporal unwrapping.
+        # Dedicated mask for temporal unwrapping (slightly more permissive than defect mask).
+        roi_for_unwrap = roi_mask_for_score if roi_mask_for_score is not None else np.ones_like(raw_mask, dtype=bool)
+        roi_vals = result.B[raw_mask & roi_for_unwrap]
+        roi_b_med_raw = float(np.median(roi_vals)) if roi_vals.size else 0.0
+        configured_b_unwrap = float(unwrap_post_cfg.get("b_thresh_unwrap", 0.0))
+        if configured_b_unwrap > 0:
+            b_thresh_unwrap = configured_b_unwrap
+            b_thresh_unwrap_source = "config"
+        else:
+            b_thresh_unwrap = float(min(thresholds.B_thresh, 0.05 * roi_b_med_raw)) if roi_b_med_raw > 0 else float(thresholds.B_thresh)
+            b_thresh_unwrap_source = "adaptive"
+        unwrap_seed = (~result.clipped_any_map) & (result.A >= thresholds.A_min) & (result.B >= b_thresh_unwrap)
+        if roi_mask_for_score is not None:
+            unwrap_seed &= roi_mask_for_score
+
         if bool(unwrap_post_cfg.get("enabled", True)):
             unwrap_mask = build_unwrap_mask(
-                result.mask_clean,
+                unwrap_seed,
                 roi_mask_for_score,
                 result.clipped_any_map,
                 unwrap_post_cfg,
             )
         else:
-            unwrap_mask = result.mask_clean & (~result.clipped_any_map)
+            unwrap_mask = unwrap_seed.copy()
             if roi_mask_for_score is not None:
                 unwrap_mask &= roi_mask_for_score
         result.mask_for_unwrap = unwrap_mask
@@ -377,6 +410,8 @@ def cmd_phase(args) -> int:
             "closing_radius_px": int(unwrap_post_cfg.get("closing_radius_px", 0)),
             "erosion_radius_px": int(unwrap_post_cfg.get("erosion_radius_px", 0)),
             "min_area_px": int(unwrap_post_cfg.get("min_area_px", 5000)),
+            "b_thresh_unwrap": float(b_thresh_unwrap),
+            "b_thresh_unwrap_source": b_thresh_unwrap_source,
             "unwrap_valid_ratio": float(np.count_nonzero(unwrap_mask) / unwrap_mask.size),
         }
         result.debug["mask_for_defects_policy"] = {
@@ -394,16 +429,24 @@ def cmd_phase(args) -> int:
             "b_thresh_display": float(display_cfg.get("b_thresh_display", 5)),
             "display_valid_ratio": float(np.count_nonzero(display_mask) / display_mask.size),
         }
+        result.debug["valid_ratio_raw"] = float(np.count_nonzero(raw_mask) / raw_mask.size)
+        result.debug["valid_ratio_clean"] = float(np.count_nonzero(result.mask_clean) / result.mask_clean.size)
+        result.debug["valid_ratio_for_unwrap"] = float(np.count_nonzero(unwrap_mask) / unwrap_mask.size)
+        result.debug["valid_ratio_for_defects"] = float(np.count_nonzero(defects_mask) / defects_mask.size)
 
         # Phase gate metrics should reflect stable/inclusive defect mask, not conservative unwrap mask.
         score = score_mask(result.mask_for_defects, result.B, roi_mask=roi_mask_for_score)
+        score_dilated = score_mask(result.mask_for_defects, result.B, roi_mask=roi_mask_for_clip) if roi_mask_for_clip is not None else score
         result.debug.update({
             "roi_valid_ratio": score.roi_valid_ratio,
+            "roi_valid_ratio_core": score.roi_valid_ratio,
+            "roi_valid_ratio_dilated": score_dilated.roi_valid_ratio,
             "roi_largest_component_ratio": score.roi_largest_component_ratio,
             "roi_edge_noise_ratio": score.roi_edge_noise_ratio,
             "roi_b_median": score.roi_b_median,
             "roi_score": score.roi_score,
             "roi_fallback": roi_res.debug.get("roi_fallback", False),
+            "roi_gate_mask": "core",
         })
         store.save_phase_outputs(args.run, result, freq=freq if len(freqs) > 1 else None)
         phase_dir = Path(store.root) / args.run / "phase"
@@ -472,15 +515,22 @@ def cmd_score(args) -> int:
         mask = np.array(Image.open(mask_png)) > 0
     run_dir = Path(store.root) / args.run
     roi_mask = None
+    roi_core_npy = run_dir / "roi" / "roi_mask_core.npy"
+    roi_core_png = run_dir / "roi" / "roi_mask_core.png"
     roi_path = run_dir / "roi" / "roi_mask.png"
-    if roi_path.exists():
+    if roi_core_npy.exists():
+        roi_mask = np.load(roi_core_npy).astype(bool)
+    elif roi_core_png.exists():
+        from PIL import Image
+        roi_mask = np.array(Image.open(roi_core_png)) > 0
+    elif roi_path.exists():
         from PIL import Image
         roi_mask = np.array(Image.open(roi_path)) > 0
-        roi_meta_path = run_dir / "roi" / "roi_meta.json"
-        if roi_meta_path.exists():
-            roi_meta = json.loads(roi_meta_path.read_text())
-            if roi_meta.get("debug", {}).get("roi_fallback"):
-                roi_mask = None
+    roi_meta_path = run_dir / "roi" / "roi_meta.json"
+    if roi_mask is not None and roi_meta_path.exists():
+        roi_meta = json.loads(roi_meta_path.read_text())
+        if roi_meta.get("debug", {}).get("roi_fallback"):
+            roi_mask = None
     B = np.load(phase_dir / "B.npy")
     score = score_mask(mask, B, roi_mask=roi_mask)
     print(json.dumps(asdict(score), indent=2))
@@ -657,6 +707,18 @@ def cmd_pipeline_run_safe(args) -> int:
     params.auto_normalise = bool(getattr(args, "auto_normalise", True))
     params.expert_mode = bool(getattr(args, "expert", False))
     params.quality_retry_count = 0
+    invoked_command = str(getattr(args, "invoked_command", "pipeline-run-safe"))
+    force_flag = bool(getattr(args, "force", False))
+    cmdline = "python -m fringe_app " + " ".join(sys.argv[1:])
+    retry_cfg = ((cfg.get("quality_gate", {}) or {}).get("retry", {}) or {})
+    retry_enabled = bool(retry_cfg.get("enabled", True)) and not bool(getattr(args, "no_retry", False))
+    retry_max = int(
+        getattr(args, "retry_max", None)
+        if getattr(args, "retry_max", None) is not None
+        else retry_cfg.get("max", 1)
+    )
+    retry_max = max(0, retry_max)
+
     ok_env, env_warnings = _enforce_safe_envelope(params, force=bool(args.force), expert=params.expert_mode)
     if env_warnings:
         print("Warning: value out of safe envelope; use --expert to override.")
@@ -672,25 +734,79 @@ def cmd_pipeline_run_safe(args) -> int:
     preview = PreviewBroadcaster()
     controller = ScanController(display=display, camera=camera, generator=generator, store=store, preview=preview, config=cfg)
 
-    def _run_scan_once(local_params: ScanParams) -> tuple[str, dict]:
+    def _annotate_meta(
+        run_id_local: str,
+        *,
+        retry_index: int,
+        origin_run_id: str | None = None,
+    ) -> None:
+        meta_path = Path(store.root) / run_id_local / "meta.json"
+        if not meta_path.exists():
+            return
+        meta_data = json.loads(meta_path.read_text())
+        meta_data["cmdline"] = cmdline
+        meta_data["invoked_command"] = invoked_command
+        meta_data["force"] = force_flag
+        meta_data["retry_index"] = int(retry_index)
+        if origin_run_id is not None:
+            meta_data["retry_origin_run_id"] = origin_run_id
+        meta_path.write_text(json.dumps(meta_data, indent=2))
+
+    def _save_quality_report_with_runtime(run_dir_local: Path, report_obj: QualityReport, **extra: Any) -> None:
+        payload = report_obj.to_dict()
+        payload.setdefault("ran_phase", True)
+        payload.setdefault("ran_unwrap", False)
+        payload.setdefault("ran_recon", False)
+        payload.setdefault("stopped_due_to_retry", False)
+        payload.setdefault("retry_run_id", None)
+        payload.setdefault("unwrap_skipped_reason", None)
+        payload.update(extra)
+        (run_dir_local / "quality_report.json").write_text(json.dumps(payload, indent=2))
+
+    def _run_scan_once(
+        local_params: ScanParams,
+        *,
+        retry_index: int = 0,
+        origin_run_id: str | None = None,
+    ) -> tuple[str, dict]:
         run_id_local = controller.start_scan(local_params)
+        _annotate_meta(run_id_local, retry_index=retry_index, origin_run_id=origin_run_id)
         print(f"run_id={run_id_local}")
         while True:
             status_local = controller.get_status()
             if status_local["state"] in ("IDLE", "ERROR"):
                 break
             time.sleep(0.2)
+        # Re-annotate after worker completion so provenance survives final metadata write.
+        _annotate_meta(run_id_local, retry_index=retry_index, origin_run_id=origin_run_id)
         return run_id_local, status_local
 
-    def _write_retry_info(base_run_id: str, new_run_id: str, reason: str, adjustments: dict[str, float]) -> None:
+    def _write_retry_info(
+        base_run_id: str,
+        new_run_id: str,
+        reason: str,
+        adjustments: dict[str, float],
+        retry_index: int,
+    ) -> None:
         payload = {
             "base_run_id": base_run_id,
             "retry_run_id": new_run_id,
+            "retry_index": int(retry_index),
             "reason": reason,
             "adjustments": adjustments,
+            "invoked_command": invoked_command,
+            "force": force_flag,
         }
         (Path(store.root) / base_run_id / "quality_retry.json").write_text(json.dumps(payload, indent=2))
-        (Path(store.root) / new_run_id / "quality_retry.json").write_text(json.dumps(payload, indent=2))
+        origin = {
+            "origin_run_id": base_run_id,
+            "retry_index": int(retry_index),
+            "reason": reason,
+            "adjustments": adjustments,
+            "invoked_command": invoked_command,
+            "force": force_flag,
+        }
+        (Path(store.root) / new_run_id / "quality_origin.json").write_text(json.dumps(origin, indent=2))
 
     run_id, status = _run_scan_once(params)
     if status["state"] == "ERROR":
@@ -716,100 +832,119 @@ def cmd_pipeline_run_safe(args) -> int:
     phase_meta, high_freq = _load_phase_meta_high_freq(run_id, cfg)
     report = build_phase_quality_report(phase_meta, th)
     run_dir = Path(store.root) / run_id
-    save_quality_report(run_dir, report)
+    _save_quality_report_with_runtime(run_dir, report, ran_phase=True, ran_unwrap=False, ran_recon=False)
     print(
         f"phase_gate high_freq={high_freq}: clip_any_roi={report.metrics.get('clipped_any_pct_roi', 0):.4f} "
         f"clip_step_max_roi={report.metrics.get('clipped_step_max_pct_roi', 0):.4f} "
         f"roi_valid={report.metrics.get('roi_valid_ratio_high_freq', 0):.3f} ok={report.ok}"
     )
-    if not report.ok:
-        retry_enabled = not bool(getattr(args, "no_retry", False))
-        if retry_enabled and "CLIPPING" in report.reasons and params.quality_retry_count < 1:
-            params.quality_retry_count += 1
+    while not report.ok and retry_enabled and params.quality_retry_count < retry_max:
+        retry_reason: str | None = None
+        adjustments: dict[str, float] = {}
+        if "CLIPPING" in report.reasons:
+            retry_reason = "CLIPPING"
             params.exposure_us = int(max(500, int((params.exposure_us or 2000) * 0.8)))
             params.contrast = float(max(0.4, params.contrast - 0.1))
-            print(
-                f"Retrying once due to clipping: exposure_us={params.exposure_us}, contrast={params.contrast:.2f}"
-            )
-            base_run = run_id
-            run_id, status = _run_scan_once(params)
-            _write_retry_info(
-                base_run,
-                run_id,
-                "CLIPPING",
-                {"exposure_us": float(params.exposure_us or 0), "contrast": float(params.contrast)},
-            )
-            if status["state"] == "ERROR":
-                print(json.dumps(status, indent=2))
-                return 1
-            sanity_ok, sanity_reasons = _check_step_sanity_reports(run_id, cfg)
-            if not sanity_ok:
-                print("CAPTURE INVALID after retry.")
-                for r in sanity_reasons:
-                    print(f"- {r}")
-                if not args.force:
-                    return 4
-            phase_rc = cmd_phase(argparse.Namespace(run=run_id))
-            if phase_rc != 0:
-                return phase_rc
-            phase_meta, high_freq = _load_phase_meta_high_freq(run_id, cfg)
-            report = build_phase_quality_report(phase_meta, th)
-            run_dir = Path(store.root) / run_id
-            save_quality_report(run_dir, report)
-        elif retry_enabled and "LOW_ROI_VALID" in report.reasons and params.quality_retry_count < 1:
+            adjustments = {
+                "exposure_us": float(params.exposure_us or 0),
+                "contrast": float(params.contrast),
+            }
+        elif "LOW_ROI_VALID" in report.reasons:
             clip_any = float(report.metrics.get("clipped_any_pct_roi", 1.0))
             if clip_any <= th.max_clipped_any_pct_roi:
-                params.quality_retry_count += 1
-                adjustments: dict[str, float] = {}
+                retry_reason = "LOW_ROI_VALID"
                 exp_max = int(cfg.get("normalise", {}).get("exposure_max_extended_us", 12000))
                 current_exp = int(params.exposure_us or 2000)
                 bumped_exp = int(min(exp_max, max(current_exp + 1, round(current_exp * 1.25))))
                 if bumped_exp > current_exp:
                     params.exposure_us = bumped_exp
-                    adjustments["exposure_us"] = float(params.exposure_us)
-                else:
-                    # Exposure already at ceiling: keep conservative behavior and skip pattern changes.
-                    adjustments["exposure_us"] = float(current_exp)
-                print(f"Retrying once due to LOW_ROI_VALID with low clipping: {adjustments}")
-                base_run = run_id
-                run_id, status = _run_scan_once(params)
-                _write_retry_info(base_run, run_id, "LOW_ROI_VALID", adjustments)
-                if status["state"] == "ERROR":
-                    print(json.dumps(status, indent=2))
-                    return 1
-                sanity_ok, sanity_reasons = _check_step_sanity_reports(run_id, cfg)
-                if not sanity_ok:
-                    print("CAPTURE INVALID after retry.")
-                    for r in sanity_reasons:
-                        print(f"- {r}")
-                    if not args.force:
-                        return 4
-                phase_rc = cmd_phase(argparse.Namespace(run=run_id))
-                if phase_rc != 0:
-                    return phase_rc
-                phase_meta, high_freq = _load_phase_meta_high_freq(run_id, cfg)
-                report = build_phase_quality_report(phase_meta, th)
-                run_dir = Path(store.root) / run_id
-                save_quality_report(run_dir, report)
-        if not report.ok:
-            print(f"FAIL: PHASE {';'.join(report.reasons)}")
-            normalise_path = run_dir / "normalise.json"
-            if normalise_path.exists():
-                nd = json.loads(normalise_path.read_text())
-                print(
-                    "normalise: "
-                    f"exp={nd.get('exposure_us')} gain={nd.get('analogue_gain')} "
-                    f"roi_mean={nd.get('measured_roi_mean')} clip_roi={nd.get('measured_clip_roi')}"
-                )
-            if args.print_hints:
-                for h in report.hints:
-                    print(f"hint: {h}")
+                adjustments["exposure_us"] = float(params.exposure_us or current_exp)
+
+        if retry_reason is None:
+            break
+
+        params.quality_retry_count += 1
+        base_run = run_id
+        run_id, status = _run_scan_once(
+            params,
+            retry_index=params.quality_retry_count,
+            origin_run_id=base_run,
+        )
+        print(
+            f"{retry_reason} triggered retry: base={base_run} retry={run_id} "
+            f"adjustments={json.dumps(adjustments)}"
+        )
+        _write_retry_info(
+            base_run,
+            run_id,
+            retry_reason,
+            adjustments,
+            retry_index=params.quality_retry_count,
+        )
+        base_run_dir = Path(store.root) / base_run
+        _save_quality_report_with_runtime(
+            base_run_dir,
+            report,
+            ran_phase=True,
+            ran_unwrap=False,
+            ran_recon=False,
+            stopped_due_to_retry=True,
+            retry_run_id=run_id,
+            unwrap_skipped_reason="retry_triggered",
+        )
+        if status["state"] == "ERROR":
+            print(json.dumps(status, indent=2))
+            return 1
+        sanity_ok, sanity_reasons = _check_step_sanity_reports(run_id, cfg)
+        if not sanity_ok:
+            print("CAPTURE INVALID after retry.")
+            for r in sanity_reasons:
+                print(f"- {r}")
             if not args.force:
-                update_quality_state(cfg, passed=False)
-                return 2
+                return 4
+        phase_rc = cmd_phase(argparse.Namespace(run=run_id))
+        if phase_rc != 0:
+            return phase_rc
+        phase_meta, high_freq = _load_phase_meta_high_freq(run_id, cfg)
+        report = build_phase_quality_report(phase_meta, th)
+        run_dir = Path(store.root) / run_id
+        _save_quality_report_with_runtime(run_dir, report, ran_phase=True, ran_unwrap=False, ran_recon=False)
+
+    if not report.ok:
+        print(f"FAIL: PHASE {';'.join(report.reasons)}")
+        normalise_path = run_dir / "normalise.json"
+        if normalise_path.exists():
+            nd = json.loads(normalise_path.read_text())
+            print(
+                "normalise: "
+                f"exp={nd.get('exposure_us')} gain={nd.get('analogue_gain')} "
+                f"roi_mean={nd.get('measured_roi_mean')} clip_roi={nd.get('measured_clip_roi')}"
+            )
+        if args.print_hints:
+            for h in report.hints:
+                print(f"hint: {h}")
+        if not args.force:
+            _save_quality_report_with_runtime(
+                run_dir,
+                report,
+                ran_phase=True,
+                ran_unwrap=False,
+                ran_recon=False,
+                unwrap_skipped_reason=";".join(report.reasons),
+            )
+            update_quality_state(cfg, passed=False)
+            return 2
 
     unwrap_rc = cmd_unwrap(argparse.Namespace(run=run_id, use_roi="auto"))
     if unwrap_rc != 0:
+        _save_quality_report_with_runtime(
+            run_dir,
+            report,
+            ran_phase=True,
+            ran_unwrap=False,
+            ran_recon=False,
+            unwrap_skipped_reason="unwrap_failed",
+        )
         return unwrap_rc
     unwrap_meta = _load_unwrap_meta(run_id, cfg)
     report = apply_unwrap_quality_report(report, unwrap_meta, th)
@@ -817,7 +952,13 @@ def cmd_pipeline_run_safe(args) -> int:
     unwrap_meta["effective_residual_p95_threshold"] = float(th.max_residual_p95)
     unwrap_meta_path = Path(store.root) / run_id / "unwrap" / "unwrap_meta.json"
     unwrap_meta_path.write_text(json.dumps(unwrap_meta, indent=2))
-    save_quality_report(run_dir, report)
+    _save_quality_report_with_runtime(
+        run_dir,
+        report,
+        ran_phase=True,
+        ran_unwrap=True,
+        ran_recon=False,
+    )
     print(
         f"unwrap_gate residual_p95={report.metrics.get('residual_p95', 0):.4f} ok={report.ok}"
     )
@@ -953,46 +1094,13 @@ def cmd_pipeline_run_uv(args) -> int:
     root = Path(cfg.get("storage", {}).get("run_root", "data/runs"))
     root.mkdir(parents=True, exist_ok=True)
 
-    exp_max = int(cfg.get("normalise", {}).get("exposure_max_extended_us", 12000))
-
     def _run_orientation_with_low_roi_nudge(orientation: str, ns: argparse.Namespace) -> tuple[int, str | None]:
         attempt_args = argparse.Namespace(**vars(ns))
         attempt_args.orientation = orientation
+        attempt_args.invoked_command = "pipeline-run-uv"
         t_start = time.time()
         rc = cmd_pipeline_run_safe(attempt_args)
         run_id = _latest_run_after(root, t_start)
-        if rc == 0:
-            return rc, run_id
-        if run_id is None:
-            return rc, None
-        q_path = root / run_id / "quality_report.json"
-        if not q_path.exists():
-            return rc, run_id
-        q = json.loads(q_path.read_text())
-        reasons = q.get("reasons", [])
-        clip_any = float(q.get("metrics", {}).get("clipped_any_pct_roi", 1.0))
-        if "LOW_ROI_VALID" in reasons and clip_any <= 0.0:
-            bumped = argparse.Namespace(**vars(attempt_args))
-            current_exp = int(getattr(bumped, "exposure_us", None) or 2000)
-            bumped_exp = int(min(exp_max, max(current_exp + 1, round(current_exp * 1.25))))
-            bumped.exposure_us = bumped_exp
-            print(
-                f"{orientation}: retrying once after LOW_ROI_VALID with exposure bump "
-                f"{current_exp}->{bumped_exp}"
-            )
-            t_retry = time.time()
-            rc_retry = cmd_pipeline_run_safe(bumped)
-            run_id_retry = _latest_run_after(root, t_retry)
-            if run_id_retry is not None:
-                retry_payload = {
-                    "base_run_id": run_id,
-                    "retry_run_id": run_id_retry,
-                    "reason": "LOW_ROI_VALID",
-                    "adjustments": {"exposure_us": float(bumped_exp)},
-                }
-                (root / run_id / "quality_retry.json").write_text(json.dumps(retry_payload, indent=2))
-                (root / run_id_retry / "quality_retry.json").write_text(json.dumps(retry_payload, indent=2))
-            return rc_retry, run_id_retry or run_id
         return rc, run_id
 
     base = argparse.Namespace(**vars(args))
@@ -1047,15 +1155,42 @@ def cmd_pipeline_run_uv(args) -> int:
     v_quality = json.loads((v_run / "quality_report.json").read_text()) if (v_run / "quality_report.json").exists() else {}
     h_quality = json.loads((h_run / "quality_report.json").read_text()) if (h_run / "quality_report.json").exists() else {}
     uv_ok = bool(uv_meta.get("uv_gate_ok", False))
-    combined_ok = bool(v_quality.get("ok", False) and h_quality.get("ok", False) and uv_ok)
+    vertical_ok = bool(v_quality.get("ok", False))
+    horizontal_ok = bool(h_quality.get("ok", False))
+    combined_reasons: list[str] = []
+    if not vertical_ok:
+        for r in v_quality.get("reasons", []):
+            combined_reasons.append(f"VERTICAL_{str(r)}")
+    if not horizontal_ok:
+        for r in h_quality.get("reasons", []):
+            combined_reasons.append(f"HORIZONTAL_{str(r)}")
+    if not uv_ok:
+        for r in uv_meta.get("uv_gate_failed_checks", []):
+            combined_reasons.append(f"UV_{str(r)}")
+    combined_ok = bool(uv_ok and vertical_ok and horizontal_ok)
+    if bool(getattr(args, "force", False)):
+        combined_ok = True
     report = {
         "ok": combined_ok,
         "vertical_run_id": v_run_id,
         "horizontal_run_id": h_run_id,
         "uv_gate_ok": uv_ok,
+        "vertical_ok": vertical_ok,
+        "horizontal_ok": horizontal_ok,
+        "combined_reasons": sorted(set(combined_reasons)),
         "uv_gate_failed_checks": uv_meta.get("uv_gate_failed_checks", []),
         "uv_gate_hints": uv_meta.get("uv_gate_hints", []),
         "uv_gate_thresholds": uv_meta.get("uv_gate_thresholds", {}),
+        "vertical_quality": {
+            "ok": vertical_ok,
+            "reasons": v_quality.get("reasons", []),
+            "metrics": v_quality.get("metrics", {}),
+        },
+        "horizontal_quality": {
+            "ok": horizontal_ok,
+            "reasons": h_quality.get("reasons", []),
+            "metrics": h_quality.get("metrics", {}),
+        },
         "metrics": {
             "uv_valid_ratio": float(uv_meta.get("valid_ratio", 0.0)),
             "u_range": float(uv_meta.get("u_range", 0.0)),
@@ -1078,6 +1213,10 @@ def cmd_pipeline_run_uv(args) -> int:
             **params.to_dict(),
             "orientation": "both",
         },
+        "cmdline": "python -m fringe_app " + " ".join(sys.argv[1:]),
+        "invoked_command": "pipeline-run-uv",
+        "force": bool(getattr(args, "force", False)),
+        "retry_index": 0,
         "started_at": datetime.now().isoformat(),
         "finished_at": datetime.now().isoformat(),
         "error": None if combined_ok else "UV gate failed or orientation gate failed",
@@ -1129,6 +1268,129 @@ def cmd_reconstruct(args) -> int:
     return 0
 
 
+def cmd_audit_recon(args) -> int:
+    cfg = _load_config()
+    run_root = Path(cfg.get("storage", {}).get("run_root", "data/runs"))
+    run_dir = run_root / str(args.run)
+    recon_dir = run_dir / "reconstruction"
+    if not recon_dir.exists():
+        raise SystemExit(f"Reconstruction folder not found: {recon_dir}")
+
+    required = [
+        recon_dir / "reconstruction_meta.json",
+        recon_dir / "reproj_err_cam.npy",
+        recon_dir / "reproj_err_proj.npy",
+        recon_dir / "masks" / "mask_uv.npy",
+        recon_dir / "masks" / "mask_recon.npy",
+    ]
+    missing = [str(p) for p in required if not p.exists()]
+    if missing:
+        raise SystemExit("Missing reconstruction audit inputs:\n- " + "\n- ".join(missing))
+
+    meta = json.loads((recon_dir / "reconstruction_meta.json").read_text())
+    err_cam = np.load(recon_dir / "reproj_err_cam.npy").astype(np.float32)
+    err_proj = np.load(recon_dir / "reproj_err_proj.npy").astype(np.float32)
+    mask_uv = np.load(recon_dir / "masks" / "mask_uv.npy").astype(bool)
+    mask_recon = np.load(recon_dir / "masks" / "mask_recon.npy").astype(bool)
+
+    if err_cam.shape != mask_uv.shape or err_proj.shape != mask_uv.shape or mask_recon.shape != mask_uv.shape:
+        raise SystemExit("Shape mismatch among reprojection errors and masks")
+
+    thr = float(meta.get("max_reproj_err_px", cfg.get("reconstruction", {}).get("max_reproj_err_px", 3.0)))
+    uv_mask_finite = mask_uv & np.isfinite(err_cam) & np.isfinite(err_proj)
+    recon_mask_finite = mask_recon & np.isfinite(err_cam) & np.isfinite(err_proj)
+    rejected_mask = mask_uv & (~mask_recon)
+
+    def _stats(arr: np.ndarray, mask: np.ndarray) -> dict[str, float | None]:
+        vals = arr[mask]
+        vals = vals[np.isfinite(vals)]
+        if vals.size == 0:
+            return {"p50": None, "p95": None}
+        return {
+            "p50": float(np.percentile(vals, 50)),
+            "p95": float(np.percentile(vals, 95)),
+        }
+
+    cam_uv = _stats(err_cam, uv_mask_finite)
+    proj_uv = _stats(err_proj, uv_mask_finite)
+    cam_recon = _stats(err_cam, recon_mask_finite)
+    proj_recon = _stats(err_proj, recon_mask_finite)
+
+    cam_over = float(np.count_nonzero((err_cam > thr) & uv_mask_finite) / max(1, int(np.count_nonzero(uv_mask_finite))))
+    proj_over = float(np.count_nonzero((err_proj > thr) & uv_mask_finite) / max(1, int(np.count_nonzero(uv_mask_finite))))
+
+    rejected_total = int(meta.get("rejected_total_px", int(np.count_nonzero(rejected_mask))))
+    rejected_by_cam = int(meta.get("rejected_by_cam_reproj_px", 0))
+    rejected_by_proj = int(meta.get("rejected_by_proj_reproj_px", 0))
+    rejected_by_depth = int(meta.get("rejected_by_depth_range_px", 0))
+    if rejected_total > 0 and (rejected_by_cam + rejected_by_proj + rejected_by_depth) == 0:
+        cam_fail_mask = uv_mask_finite & (err_cam > thr)
+        proj_fail_mask = uv_mask_finite & (~cam_fail_mask) & (err_proj > thr)
+        rejected_by_cam = int(np.count_nonzero(cam_fail_mask))
+        rejected_by_proj = int(np.count_nonzero(proj_fail_mask))
+        rejected_by_depth = max(0, rejected_total - rejected_by_cam - rejected_by_proj)
+    reason_counts = {
+        "CAM_REPROJ": rejected_by_cam,
+        "PROJ_REPROJ": rejected_by_proj,
+        "DEPTH_RANGE": rejected_by_depth,
+    }
+    dominant_reason = max(reason_counts.items(), key=lambda kv: kv[1])[0] if any(v > 0 for v in reason_counts.values()) else "NONE"
+
+    residual_diag: dict[str, Any] = {}
+    v_unwrap = run_dir / "vertical" / "unwrap"
+    h_unwrap = run_dir / "horizontal" / "unwrap"
+    v_res_path = v_unwrap / "residual.npy"
+    h_res_path = h_unwrap / "residual.npy"
+    if v_res_path.exists() and h_res_path.exists():
+        try:
+            rv = np.load(v_res_path).astype(np.float32)
+            rh = np.load(h_res_path).astype(np.float32)
+            if rv.shape == rejected_mask.shape and rh.shape == rejected_mask.shape:
+                finite = rejected_mask & np.isfinite(rv) & np.isfinite(rh)
+                if np.any(finite):
+                    high = (np.abs(rv) > 1.0) | (np.abs(rh) > 1.0)
+                    residual_diag = {
+                        "rejected_with_residual_gt_1rad_pct": float(
+                            np.count_nonzero(high & finite) / np.count_nonzero(finite)
+                        ),
+                        "residual_source": "residual_maps",
+                    }
+        except Exception:
+            residual_diag = {}
+    if not residual_diag:
+        v_meta = json.loads((v_unwrap / "unwrap_meta.json").read_text()) if (v_unwrap / "unwrap_meta.json").exists() else {}
+        h_meta = json.loads((h_unwrap / "unwrap_meta.json").read_text()) if (h_unwrap / "unwrap_meta.json").exists() else {}
+        residual_diag = {
+            "vertical_residual_gt_1rad_pct": v_meta.get("residual_gt_1rad_pct"),
+            "horizontal_residual_gt_1rad_pct": h_meta.get("residual_gt_1rad_pct"),
+            "residual_source": "unwrap_meta",
+        }
+
+    summary = {
+        "run_id": str(args.run),
+        "uv_valid_points": int(np.count_nonzero(mask_uv)),
+        "recon_valid_points": int(np.count_nonzero(mask_recon)),
+        "rejected_total": rejected_total,
+        "max_reproj_err_px": thr,
+        "reproj_err_cam_uv": cam_uv,
+        "reproj_err_proj_uv": proj_uv,
+        "reproj_err_cam_recon": cam_recon,
+        "reproj_err_proj_recon": proj_recon,
+        "cam_reproj_over_threshold_pct_uv": cam_over,
+        "proj_reproj_over_threshold_pct_uv": proj_over,
+        "rejection_breakdown_px": {
+            "cam_reproj": rejected_by_cam,
+            "proj_reproj": rejected_by_proj,
+            "depth_range": rejected_by_depth,
+        },
+        "rejection_dominant": dominant_reason,
+        "residual_correlation": residual_diag,
+    }
+
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
 def cmd_pipeline_run_3d(args) -> int:
     cfg = _load_config()
     run_root = Path(cfg.get("storage", {}).get("run_root", "data/runs"))
@@ -1141,6 +1403,187 @@ def cmd_pipeline_run_3d(args) -> int:
         print("Could not determine combined UV run id for reconstruction")
         return rc_uv if rc_uv != 0 else 13
     return cmd_reconstruct(argparse.Namespace(run=run_id, out=None))
+
+
+def cmd_projector_selfcheck(args) -> int:
+    cfg = _load_config()
+    run_root = Path((cfg.get("storage", {}) or {}).get("run_root", "data/runs"))
+    run_root.mkdir(parents=True, exist_ok=True)
+
+    pcal_proj = ((cfg.get("projector_calibration", {}) or {}).get("projector", {}) or {})
+    scan_cfg = cfg.get("scan", {}) or {}
+    width = int(getattr(args, "width", None) or pcal_proj.get("width", scan_cfg.get("width", 1024)))
+    height = int(getattr(args, "height", None) or pcal_proj.get("height", scan_cfg.get("height", 768)))
+    fullscreen = bool(getattr(args, "fullscreen", True))
+    hold_seconds = float(getattr(args, "show_seconds", 3.0))
+    vsync = bool(getattr(args, "vsync", True))
+
+    run_id_raw = getattr(args, "run_id", None)
+    run_id = str(run_id_raw).strip() if run_id_raw is not None else ""
+    if (not run_id) or run_id.lower() == "none":
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S_projector_test")
+    run_root_dir = run_root / run_id
+    if (run_root_dir / "meta.json").exists() and not bool(getattr(args, "allow_existing_run", False)):
+        print(
+            "Refusing to write projector self-check into an existing scan run. "
+            "Use --allow-existing-run to override."
+        )
+        return 2
+    run_dir = run_root_dir / "projector_test"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    pattern = generate_projector_geometry_sanity_pattern(width=width, height=height)
+    pattern_path = run_dir / "projector_test_pattern.png"
+    if bool(getattr(args, "save_pattern", False)):
+        from PIL import Image
+
+        Image.fromarray(pattern).save(pattern_path)
+
+    display = PygameProjectorDisplay()
+    screen_index = (cfg.get("display", {}) or {}).get("screen_index")
+    try:
+        display.open(
+            fullscreen=fullscreen,
+            screen_index=screen_index,
+            requested_mode=(width, height),
+            vsync=vsync,
+        )
+        display.show_rgb(pattern)
+        display.pump()
+        info = display.get_actual_display_surface_info() or {}
+        requested_surface = [int(width), int(height)]
+        actual_surface = info.get("surface_w_h", info.get("created_surface_w_h", requested_surface))
+        meta = {
+            "schema_version": 1,
+            "artifact_kind": "projector_test",
+            "run_id": run_id,
+            "timestamp": datetime.now().isoformat(),
+            "requested_surface": requested_surface,
+            "actual_surface": actual_surface,
+            "display_mode_w_h": info.get("display_mode_w_h"),
+            "window_w_h": info.get("window_w_h"),
+            "fullscreen": bool(fullscreen),
+            "vsync": info.get("vsync", vsync),
+            "sdl_scaling_hints": info.get("sdl_scaling_hints", {}),
+            "pattern_path": str(pattern_path.relative_to(run_root / run_id)) if pattern_path.exists() else None,
+        }
+        (run_dir / "projector_test.json").write_text(json.dumps(meta, indent=2))
+        print(
+            "projector-selfcheck: "
+            f"requested_surface={requested_surface} actual_surface={actual_surface} "
+            f"display_mode={info.get('display_mode_w_h')} window={info.get('window_w_h')} "
+            f"fullscreen={fullscreen} run_id={run_id}"
+        )
+        print(f"projector_test_json={run_dir / 'projector_test.json'}")
+        if pattern_path.exists():
+            print(f"projector_test_pattern={pattern_path}")
+        if hold_seconds > 0:
+            time.sleep(hold_seconds)
+    finally:
+        try:
+            display.close()
+        except Exception:
+            pass
+    return 0
+
+
+def _freq_tag_to_float(name: str) -> float:
+    val = name.replace("f_", "").replace("p", ".")
+    try:
+        return float(val)
+    except Exception:
+        return 0.0
+
+
+def _load_b_from_phase_dir(phase_root: Path) -> np.ndarray | None:
+    if not phase_root.exists():
+        return None
+    direct = phase_root / "B.npy"
+    if direct.exists():
+        return np.load(direct).astype(np.float32)
+    freq_dirs = sorted(
+        [p for p in phase_root.iterdir() if p.is_dir() and p.name.startswith("f_")],
+        key=lambda p: _freq_tag_to_float(p.name),
+    )
+    for d in reversed(freq_dirs):
+        b_path = d / "B.npy"
+        if b_path.exists():
+            return np.load(b_path).astype(np.float32)
+    return None
+
+
+def _load_b_map_for_recon(run_dir: Path, shape_hw: tuple[int, int]) -> np.ndarray | None:
+    candidates = [
+        _load_b_from_phase_dir(run_dir / "phase"),
+        _load_b_from_phase_dir(run_dir / "vertical" / "phase"),
+        _load_b_from_phase_dir(run_dir / "horizontal" / "phase"),
+    ]
+    valid_maps = [m for m in candidates if m is not None and m.shape == shape_hw]
+    if not valid_maps:
+        return None
+    if len(valid_maps) == 1:
+        return valid_maps[0]
+    stack = np.stack(valid_maps, axis=0).astype(np.float32)
+    return np.nanmean(stack, axis=0).astype(np.float32)
+
+
+def cmd_recon_qa(args) -> int:
+    cfg = _load_config()
+    run_root = Path((cfg.get("storage", {}) or {}).get("run_root", "data/runs"))
+    run_dir = run_root / str(args.run)
+    recon_dir = run_dir / "reconstruction"
+    if not recon_dir.exists():
+        print(f"reconstruction folder not found: {recon_dir}")
+        return 2
+
+    depth_path = recon_dir / "depth.npy"
+    mask_path = recon_dir / "masks" / "mask_recon.npy"
+    if not depth_path.exists():
+        print(f"required input missing: {depth_path}")
+        return 2
+    if not mask_path.exists():
+        print(f"required input missing: {mask_path}")
+        return 2
+
+    depth = np.load(depth_path).astype(np.float32)
+    mask = np.load(mask_path).astype(bool)
+    b_map = _load_b_map_for_recon(run_dir, depth.shape)
+    depth_units = "unknown"
+    recon_meta_path = recon_dir / "reconstruction_meta.json"
+    if recon_meta_path.exists():
+        try:
+            recon_meta = json.loads(recon_meta_path.read_text())
+            if (
+                recon_meta.get("depth_median_m") is not None
+                or recon_meta.get("z_min_m") is not None
+                or recon_meta.get("z_max_m") is not None
+            ):
+                depth_units = "meters"
+        except Exception:
+            depth_units = "unknown"
+
+    report = save_recon_qa_outputs(
+        out_dir=recon_dir,
+        depth_map=depth,
+        mask=mask,
+        B_map=b_map,
+        depth_units=depth_units,
+    )
+    print(
+        json.dumps(
+            {
+                "run_id": str(args.run),
+                "qa_report": str(recon_dir / "qa_report.json"),
+                "qa_plots_dir": str(recon_dir / "qa_plots"),
+                "b_map_used": bool(b_map is not None),
+                "depth_units": report.get("depth_units"),
+                "plane_fit_rms": report.get("plane_fit", {}).get("plane_fit_rms"),
+                "fft_peak_energy_ratio": report.get("stripe_diagnostics", {}).get("depth_fft_peak_energy_ratio"),
+            },
+            indent=2,
+        )
+    )
+    return 0
 
 
 def cmd_experiment(args) -> int:
@@ -1165,6 +1608,182 @@ def cmd_quality_state(args) -> int:
     state = load_quality_state(cfg)
     print(json.dumps(state, indent=2))
     return 0
+
+
+def cmd_audit_run(args) -> int:
+    cfg = _load_config()
+    store = RunStore(root=cfg.get("storage", {}).get("run_root", "data/runs"))
+    run_id = str(args.run)
+    run_dir = Path(store.root) / run_id
+    if not run_dir.exists():
+        raise SystemExit(f"Run not found: {run_dir}")
+
+    def _read_json(path: Path) -> dict | None:
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text())
+        except Exception:
+            return None
+
+    meta = _read_json(run_dir / "meta.json") or {}
+    quality = _read_json(run_dir / "quality_report.json") or {}
+    unwrap_meta = _read_json(run_dir / "unwrap" / "unwrap_meta.json") or {}
+    roi_meta = _read_json(run_dir / "roi" / "roi_meta.json") or {}
+    phase_meta, high_freq = ({}, None)
+    try:
+        phase_meta, high_freq = _load_phase_meta_high_freq(run_id, cfg)
+    except Exception:
+        pass
+
+    retry_info = _read_json(run_dir / "quality_retry.json")
+    origin_info = _read_json(run_dir / "quality_origin.json")
+    checks: list[dict[str, Any]] = []
+
+    if retry_info is not None:
+        retry_run_id = str(retry_info.get("retry_run_id", ""))
+        retry_run_dir = Path(store.root) / retry_run_id
+        has_origin = (retry_run_dir / "quality_origin.json").exists()
+        has_retry_dup = (retry_run_dir / "quality_retry.json").exists()
+        checks.append({
+            "name": "retry_file_placement",
+            "ok": bool(has_origin and not has_retry_dup),
+            "details": {
+                "base_has_quality_retry": True,
+                "retry_has_quality_origin": has_origin,
+                "retry_has_quality_retry": has_retry_dup,
+            },
+        })
+    elif origin_info is not None:
+        base_run_id = str(origin_info.get("origin_run_id", ""))
+        base_has_retry = (Path(store.root) / base_run_id / "quality_retry.json").exists()
+        checks.append({
+            "name": "retry_origin_backlink",
+            "ok": bool(base_has_retry),
+            "details": {
+                "retry_has_quality_origin": True,
+                "base_has_quality_retry": base_has_retry,
+            },
+        })
+    else:
+        checks.append({
+            "name": "retry_file_placement",
+            "ok": True,
+            "details": {"note": "no retry provenance files in this run"},
+        })
+
+    # Recompute ROI-valid ratio with ROI core where available.
+    roi_core = None
+    for candidate in (
+        run_dir / "roi" / "roi_mask_core.npy",
+        run_dir / "roi" / "roi_raw.npy",
+    ):
+        if candidate.exists():
+            roi_core = np.load(candidate).astype(bool)
+            break
+    if roi_core is None:
+        for candidate in (
+            run_dir / "roi" / "roi_mask_core.png",
+            run_dir / "roi" / "roi_raw.png",
+            run_dir / "roi" / "roi_mask.png",
+        ):
+            if candidate.exists():
+                from PIL import Image
+                roi_core = np.array(Image.open(candidate)) > 0
+                break
+
+    recomputed_roi_valid = None
+    roi_threshold = float(((cfg.get("quality_gate", {}) or {}).get("min_roi_valid_ratio_high_freq", 0.85)))
+    roi_gate_ok = None
+    if high_freq is not None and roi_core is not None:
+        phase_dir = run_dir / "phase"
+        params = _params_from_meta(run_id, store)
+        if len(params.get_frequencies()) > 1:
+            phase_dir = phase_dir / store._freq_tag(float(high_freq))
+        b_path = phase_dir / "B.npy"
+        mask_path = phase_dir / "mask_for_defects.npy"
+        if not mask_path.exists():
+            mask_path = phase_dir / "mask_clean.npy"
+        if not mask_path.exists():
+            mask_path = phase_dir / "mask.npy"
+        if b_path.exists() and mask_path.exists():
+            B = np.load(b_path)
+            m = np.load(mask_path).astype(bool)
+            sc = score_mask(m, B, roi_mask=roi_core)
+            recomputed_roi_valid = float(sc.roi_valid_ratio)
+            roi_gate_ok = bool(recomputed_roi_valid >= roi_threshold)
+    checks.append({
+        "name": "roi_core_gate_recompute",
+        "ok": bool(roi_gate_ok) if roi_gate_ok is not None else False,
+        "details": {
+            "roi_valid_ratio_recomputed_core": recomputed_roi_valid,
+            "threshold": roi_threshold,
+            "phase_meta_roi_valid_ratio": phase_meta.get("roi_valid_ratio"),
+            "phase_meta_roi_valid_ratio_core": phase_meta.get("roi_valid_ratio_core"),
+        },
+    })
+
+    combined_ok = True
+    combined_details: dict[str, Any] = {}
+    is_combined_uv_run = bool((run_dir / "projector_uv").exists() and (run_dir / "vertical").exists() and (run_dir / "horizontal").exists())
+    if quality:
+        vertical_q = quality.get("vertical_quality")
+        horizontal_q = quality.get("horizontal_quality")
+        if isinstance(vertical_q, dict) or isinstance(horizontal_q, dict):
+            combined_reasons = set(quality.get("combined_reasons", []))
+            missing = []
+            if isinstance(vertical_q, dict) and not bool(vertical_q.get("ok", False)):
+                for r in vertical_q.get("reasons", []):
+                    tag = f"VERTICAL_{r}"
+                    if tag not in combined_reasons:
+                        missing.append(tag)
+            if isinstance(horizontal_q, dict) and not bool(horizontal_q.get("ok", False)):
+                for r in horizontal_q.get("reasons", []):
+                    tag = f"HORIZONTAL_{r}"
+                    if tag not in combined_reasons:
+                        missing.append(tag)
+            combined_ok = len(missing) == 0
+            combined_details = {"combined_reasons_missing": missing, "combined_reasons": sorted(combined_reasons)}
+        elif is_combined_uv_run:
+            combined_ok = False
+            combined_details = {"error": "combined UV report missing vertical_quality/horizontal_quality"}
+    checks.append({"name": "combined_uv_reasons", "ok": combined_ok, "details": combined_details})
+
+    timeline = {
+        "run_id": run_id,
+        "scan": {"ran": (run_dir / "meta.json").exists()},
+        "phase": {"ran": bool(quality.get("ran_phase", (run_dir / "phase").exists()))},
+        "gate": {"ok": quality.get("ok"), "reasons": quality.get("reasons", [])},
+        "retry": {
+            "base_retry_file": retry_info,
+            "origin_retry_file": origin_info,
+            "stopped_due_to_retry": bool(quality.get("stopped_due_to_retry", False)),
+            "retry_run_id": quality.get("retry_run_id"),
+        },
+        "unwrap": {
+            "ran": bool(quality.get("ran_unwrap", (run_dir / "unwrap" / "unwrap_meta.json").exists())),
+            "skipped_reason": quality.get("unwrap_skipped_reason"),
+            "residual_p95": unwrap_meta.get("residual_p95"),
+        },
+    }
+    summary = {
+        "timeline": timeline,
+        "checks": checks,
+        "all_checks_ok": bool(all(bool(c.get("ok", False)) for c in checks)),
+        "meta_provenance": {
+            "invoked_command": meta.get("invoked_command"),
+            "force": meta.get("force"),
+            "retry_index": meta.get("retry_index"),
+            "cmdline": meta.get("cmdline"),
+        },
+        "roi_meta": {
+            "roi_gate_mask": (roi_meta.get("debug", {}) or {}).get("roi_gate_mask"),
+            "area_ratio_core": (roi_meta.get("debug", {}) or {}).get("area_ratio_core"),
+            "area_ratio_dilated": (roi_meta.get("debug", {}) or {}).get("area_ratio_dilated"),
+        },
+    }
+    print(json.dumps(summary, indent=2))
+    return 0 if summary["all_checks_ok"] else 5
 
 
 def cmd_projector_calib_diagnose(args) -> int:
@@ -1256,9 +1875,26 @@ def cmd_projector_calibrate(args) -> int:
     if not session_dir.exists():
         raise SystemExit(f"Projector calibration session not found: {session_dir}")
 
-    intr_path = _camera_intrinsics_latest_path(cfg)
     # Local import avoids circular import at module load.
-    from fringe_app.calibration.projector_stereo import stereo_calibrate, stereo_calibrate_refined
+    from fringe_app.calibration.projector_stereo import (
+        stereo_calibrate,
+        stereo_calibrate_refined,
+        finalize_session_reports,
+    )
+
+    if bool(getattr(args, "report_only", False)):
+        reports = finalize_session_reports(session_dir=session_dir, cfg=cfg)
+        coverage = reports.get("coverage", {}) or {}
+        print(f"session={args.session}")
+        print(f"coverage_ratio={float(coverage.get('coverage_ratio', 0.0)):.4f}")
+        print(f"bins_covered_count={int(coverage.get('bins_covered_count', 0))}")
+        print(f"bins_total={int(coverage.get('bins_total', 0))}")
+        print(f"coverage_json={session_dir / 'results' / 'coverage.json'}")
+        print(f"coverage_png={session_dir / 'results' / 'coverage.png'}")
+        print(f"session_report={session_dir / 'results' / 'session_report.json'}")
+        return 0
+
+    intr_path = _camera_intrinsics_latest_path(cfg)
 
     use_refine = bool(getattr(args, "refine_uv", False))
     if use_refine:
@@ -1319,10 +1955,46 @@ def cmd_projector_calibrate(args) -> int:
             print(f"Final RMS: {float(final_rms):.4f}")
         print("Removed views: " + (", ".join(str(v) for v in removed) if removed else "(none)"))
         print(f"prune_report={session_dir / 'results' / 'prune_report.json'}")
-        print(f"stereo_pruned={session_dir / 'results' / 'stereo_pruned.json'}")
+        points_source = str(result.get("points_source", "raw_uv"))
+        if points_source == "dense_plane":
+            print(f"stereo_dense_pruned={session_dir / 'results' / 'stereo_dense_pruned.json'}")
+            print(f"prune_dense_report={session_dir / 'results' / 'prune_dense_report.json'}")
+        elif points_source == "refined_uv":
+            print(f"stereo_refined_pruned={session_dir / 'results' / 'stereo_refined_pruned.json'}")
+        else:
+            print(f"stereo_pruned={session_dir / 'results' / 'stereo_pruned.json'}")
     else:
-        print(f"stereo={session_dir / 'results' / 'stereo.json'}")
+        points_source = str(result.get("points_source", "raw_uv"))
+        if points_source == "dense_plane":
+            print(f"stereo_dense={session_dir / 'results' / 'stereo_dense.json'}")
+        elif points_source == "refined_uv":
+            print(f"stereo_refined={session_dir / 'results' / 'stereo_refined.json'}")
+        else:
+            print(f"stereo={session_dir / 'results' / 'stereo.json'}")
 
+    return 0
+
+
+def cmd_projector_calibrate_v2(args) -> int:
+    cfg = _load_config()
+    session_dir = _calibration_root(cfg) / "projector_v2" / str(args.session)
+    if not session_dir.exists():
+        raise SystemExit(f"Projector calibration v2 session not found: {session_dir}")
+
+    # Local import avoids loading v2 dependencies for unrelated commands.
+    from fringe_app.calibration_v2 import solve_projector_v2_session
+
+    payload = solve_projector_v2_session(cfg, str(args.session))
+    solve = payload.get("solve_result", {}) or {}
+    print(f"session={args.session}")
+    print(f"raw_rms_stereo={float(solve.get('raw_rms_stereo', float('nan'))):.4f}")
+    print(f"pruned_rms_stereo={float(solve.get('pruned_rms_stereo', float('nan'))):.4f}")
+    print(f"selected_model={solve.get('selected_model')}")
+    print(f"views_used={int(solve.get('views_used', 0))}")
+    print(f"export_stereo_path={solve.get('export_stereo_path')}")
+    print(f"solve_report_path={solve.get('solve_report_path')}")
+    print(f"inputs_summary_path={solve.get('inputs_summary_path')}")
+    print("mode=solve_only" if bool(getattr(args, "solve_only", False)) else "mode=solve")
     return 0
 
 
@@ -1870,6 +2542,11 @@ def _compute_score_for_run(run_id: str, cfg: dict):
     roi_res = detect_object_roi(ref, roi_cfg)
     roi_meta = {
         "cfg": asdict(roi_cfg),
+        "bbox_core": roi_res.bbox_core,
+        "bbox_dilated": roi_res.bbox_dilated,
+        "area_ratio_core": float(np.count_nonzero(roi_res.roi_core_mask) / roi_res.roi_core_mask.size),
+        "area_ratio_dilated": float(np.count_nonzero(roi_res.roi_dilated_mask) / roi_res.roi_dilated_mask.size),
+        "roi_gate_mask": "core",
         "debug": {
             **roi_res.debug,
             "ref_method": roi_cfg.ref_method,
@@ -1878,11 +2555,36 @@ def _compute_score_for_run(run_id: str, cfg: dict):
                 "mean": float(np.mean(ref)),
                 "max": int(np.max(ref)),
             },
+            "bbox_core": roi_res.bbox_core,
+            "bbox_dilated": roi_res.bbox_dilated,
+            "area_ratio_core": float(np.count_nonzero(roi_res.roi_core_mask) / roi_res.roi_core_mask.size),
+            "area_ratio_dilated": float(np.count_nonzero(roi_res.roi_dilated_mask) / roi_res.roi_dilated_mask.size),
+            "roi_gate_mask": "core",
         },
-        "bbox": roi_res.bbox,
+        "bbox": roi_res.bbox_dilated,
     }
-    store.save_roi(run_id, roi_res.roi_mask, roi_res.bbox, {"cfg": asdict(roi_cfg), "debug": roi_meta["debug"]})
-    roi_mask_for_score = None if roi_res.debug.get("roi_fallback") else roi_res.roi_mask
+    store.save_roi(
+        run_id,
+        roi_res.roi_dilated_mask,
+        roi_res.bbox_dilated,
+        {
+            "cfg": asdict(roi_cfg),
+            "bbox_core": roi_res.bbox_core,
+            "bbox_dilated": roi_res.bbox_dilated,
+            "area_ratio_core": float(np.count_nonzero(roi_res.roi_core_mask) / roi_res.roi_core_mask.size),
+            "area_ratio_dilated": float(np.count_nonzero(roi_res.roi_dilated_mask) / roi_res.roi_dilated_mask.size),
+            "roi_gate_mask": "core",
+            "debug": roi_meta["debug"],
+        },
+        roi_raw=roi_res.raw_mask,
+        roi_post=roi_res.post_mask,
+        roi_core=roi_res.roi_core_mask,
+        roi_dilated=roi_res.roi_dilated_mask,
+        bbox_core=roi_res.bbox_core,
+        bbox_dilated=roi_res.bbox_dilated,
+    )
+    roi_mask_for_score = None if roi_res.debug.get("roi_fallback") else roi_res.roi_core_mask
+    roi_mask_for_clip = None if roi_res.debug.get("roi_fallback") else roi_res.roi_dilated_mask
     freqs = params.get_frequencies()
     post_cfg = _postmask_config(cfg)
     post_enabled = bool(post_cfg.get("enabled", True))
@@ -1893,7 +2595,7 @@ def _compute_score_for_run(run_id: str, cfg: dict):
     per_freq: Dict[str, Any] = {}
     for freq in freqs:
         images = store.load_captures(run_id, freq=freq) if len(freqs) > 1 else store.load_captures(run_id)
-        res = proc.compute_phase(images, params, thresholds, roi_mask=roi_mask_for_score)
+        res = proc.compute_phase(images, params, thresholds, roi_mask=roi_mask_for_clip)
         raw_mask = res.mask_raw.copy()
         if post_enabled:
             cleaned = cleanup_mask(
@@ -2106,6 +2808,7 @@ def build_parser() -> argparse.ArgumentParser:
     pipeline.add_argument("--expert", action="store_true")
     pipeline.add_argument("--force", action="store_true")
     pipeline.add_argument("--no-retry", action="store_true")
+    pipeline.add_argument("--retry-max", type=int, default=None)
     pipeline.add_argument("--print-hints", action="store_true")
 
     pipeline_uv = sub.add_parser("pipeline-run-uv")
@@ -2125,6 +2828,7 @@ def build_parser() -> argparse.ArgumentParser:
     pipeline_uv.add_argument("--expert", action="store_true")
     pipeline_uv.add_argument("--force", action="store_true")
     pipeline_uv.add_argument("--no-retry", action="store_true")
+    pipeline_uv.add_argument("--retry-max", type=int, default=None)
     pipeline_uv.add_argument("--print-hints", action="store_true")
 
     pipeline_3d = sub.add_parser("pipeline-run-3d")
@@ -2144,15 +2848,37 @@ def build_parser() -> argparse.ArgumentParser:
     pipeline_3d.add_argument("--expert", action="store_true")
     pipeline_3d.add_argument("--force", action="store_true")
     pipeline_3d.add_argument("--no-retry", action="store_true")
+    pipeline_3d.add_argument("--retry-max", type=int, default=None)
     pipeline_3d.add_argument("--print-hints", action="store_true")
 
     reconstruct = sub.add_parser("reconstruct")
     reconstruct.add_argument("--run", required=True, help="UV run id containing projector_uv/")
     reconstruct.add_argument("--out", default=None, help="Optional output directory (defaults to run/reconstruction)")
 
+    audit_recon = sub.add_parser("audit-recon")
+    audit_recon.add_argument("--run", required=True, help="Run id with reconstruction outputs")
+
+    recon_qa = sub.add_parser("recon-qa")
+    recon_qa.add_argument("--run", required=True, help="Run id with existing reconstruction outputs")
+
+    proj_selfcheck = sub.add_parser("projector-selfcheck")
+    proj_selfcheck.add_argument("--run-id", default=None, help="Optional output run id")
+    proj_selfcheck.add_argument("--width", type=int, default=None, help="Requested projector width")
+    proj_selfcheck.add_argument("--height", type=int, default=None, help="Requested projector height")
+    proj_selfcheck.add_argument("--save-pattern", action="store_true", help="Save sanity pattern PNG")
+    proj_selfcheck.add_argument("--show-seconds", type=float, default=3.0, help="Display hold duration")
+    proj_selfcheck.add_argument("--fullscreen", dest="fullscreen", action="store_true", default=True)
+    proj_selfcheck.add_argument("--windowed", dest="fullscreen", action="store_false")
+    proj_selfcheck.add_argument("--vsync", dest="vsync", action="store_true", default=True)
+    proj_selfcheck.add_argument("--no-vsync", dest="vsync", action="store_false")
+    proj_selfcheck.add_argument("--allow-existing-run", action="store_true", help="Allow writing under an existing run id")
+
     qstate = sub.add_parser("quality-state")
     qstate.add_argument("--reset", action="store_true")
     qstate.add_argument("--show", action="store_true")
+
+    audit = sub.add_parser("audit-run")
+    audit.add_argument("--run", required=True)
 
     pdiag = sub.add_parser("projector-calib-diagnose")
     pdiag.add_argument("--session", required=True)
@@ -2162,6 +2888,11 @@ def build_parser() -> argparse.ArgumentParser:
     pcal.add_argument("--prune", action="store_true")
     pcal.add_argument("--refine-uv", action="store_true")
     pcal.add_argument("--recalibrate", action="store_true")
+    pcal.add_argument("--report-only", action="store_true")
+
+    pcal_v2 = sub.add_parser("projector-calibrate-v2")
+    pcal_v2.add_argument("--session", required=True)
+    pcal_v2.add_argument("--solve-only", action="store_true")
 
     return p
 
@@ -2195,11 +2926,21 @@ def main(argv: List[str] | None = None) -> int:
         return cmd_pipeline_run_3d(args)
     if args.cmd == "reconstruct":
         return cmd_reconstruct(args)
+    if args.cmd == "audit-recon":
+        return cmd_audit_recon(args)
+    if args.cmd == "recon-qa":
+        return cmd_recon_qa(args)
+    if args.cmd == "projector-selfcheck":
+        return cmd_projector_selfcheck(args)
     if args.cmd == "quality-state":
         return cmd_quality_state(args)
+    if args.cmd == "audit-run":
+        return cmd_audit_run(args)
     if args.cmd == "projector-calib-diagnose":
         return cmd_projector_calib_diagnose(args)
     if args.cmd == "projector-calibrate":
         return cmd_projector_calibrate(args)
+    if args.cmd == "projector-calibrate-v2":
+        return cmd_projector_calibrate_v2(args)
     parser.print_help()
     return 0

@@ -89,7 +89,12 @@ def build_phase_quality_report(phase_meta: dict[str, Any], th: QualityThresholds
     hints: list[str] = []
     clipped_any = float(phase_meta.get("clipped_any_pct_roi", 1.0))
     clipped_step_max = float(max(phase_meta.get("clipped_per_step_pct_roi", [1.0])))
-    roi_valid = float(phase_meta.get("roi_valid_ratio", 0.0))
+    roi_valid = float(
+        phase_meta.get(
+            "roi_valid_ratio_core",
+            phase_meta.get("roi_valid_ratio", 0.0),
+        )
+    )
     metrics = {
         "clipped_any_pct_roi": clipped_any,
         "clipped_step_max_pct_roi": clipped_step_max,

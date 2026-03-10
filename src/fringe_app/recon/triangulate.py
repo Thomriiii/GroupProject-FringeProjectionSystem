@@ -49,6 +49,27 @@ class ReconstructionResult:
     meta: dict[str, Any]
 
 
+def _stats_from_values(values: np.ndarray) -> dict[str, float | None]:
+    vals = values[np.isfinite(values)]
+    if vals.size == 0:
+        return {
+            "p50": None,
+            "p90": None,
+            "p95": None,
+            "p99": None,
+            "max": None,
+            "mean": None,
+        }
+    return {
+        "p50": float(np.percentile(vals, 50)),
+        "p90": float(np.percentile(vals, 90)),
+        "p95": float(np.percentile(vals, 95)),
+        "p99": float(np.percentile(vals, 99)),
+        "max": float(np.max(vals)),
+        "mean": float(np.mean(vals)),
+    }
+
+
 def load_stereo_model(camera_intrinsics_path: Path, stereo_path: Path) -> StereoModel:
     if not camera_intrinsics_path.exists():
         raise FileNotFoundError(f"Camera intrinsics not found: {camera_intrinsics_path}")
@@ -233,11 +254,19 @@ def reconstruct_uv_run(
     z = X[:, 2]
     z_min = float(recon_cfg.get("z_min_m", 0.05))
     z_max = float(recon_cfg.get("z_max_m", 5.0))
-    max_reproj = float(recon_cfg.get("max_reproj_err_px", 2.0))
+    max_reproj = float(recon_cfg.get("max_reproj_err_px", 3.0))
 
-    ok = finite_xyz & np.isfinite(z) & (z > z_min) & (z < z_max)
+    depth_ok = finite_xyz & np.isfinite(z) & (z > z_min) & (z < z_max)
     if max_reproj > 0:
-        ok &= (reproj_cam <= max_reproj) & (reproj_proj <= max_reproj)
+        cam_ok = np.isfinite(reproj_cam) & (reproj_cam <= max_reproj)
+        proj_ok = np.isfinite(reproj_proj) & (reproj_proj <= max_reproj)
+    else:
+        cam_ok = np.isfinite(reproj_cam)
+        proj_ok = np.isfinite(reproj_proj)
+    ok = depth_ok & cam_ok & proj_ok
+    rejected_by_depth = (~depth_ok)
+    rejected_by_cam = depth_ok & (~cam_ok)
+    rejected_by_proj = depth_ok & cam_ok & (~proj_ok)
 
     h, w = u.shape
     xyz = np.full((h, w, 3), np.nan, dtype=np.float32)
@@ -258,8 +287,27 @@ def reconstruct_uv_run(
     rgb = _load_rgb_reference(run_dir, (h, w))
     valid_count = int(np.count_nonzero(mask_recon))
     uv_count = int(np.count_nonzero(valid))
-    reject_reproj = int(np.count_nonzero(finite_xyz & (~ok)))
+    rejected_total = int(np.count_nonzero(~ok))
+    rejected_by_depth_count = int(np.count_nonzero(rejected_by_depth))
+    rejected_by_cam_count = int(np.count_nonzero(rejected_by_cam))
+    rejected_by_proj_count = int(np.count_nonzero(rejected_by_proj))
     dvals = depth[mask_recon]
+
+    cam_uv_vals = reproj_cam[np.isfinite(reproj_cam)]
+    proj_uv_vals = reproj_proj[np.isfinite(reproj_proj)]
+    cam_recon_vals = reproj_cam[ok & np.isfinite(reproj_cam)]
+    proj_recon_vals = reproj_proj[ok & np.isfinite(reproj_proj)]
+
+    cam_over_thresh_pct_uv = (
+        float(np.count_nonzero(cam_uv_vals > max_reproj) / cam_uv_vals.size)
+        if max_reproj > 0 and cam_uv_vals.size > 0
+        else 0.0
+    )
+    proj_over_thresh_pct_uv = (
+        float(np.count_nonzero(proj_uv_vals > max_reproj) / proj_uv_vals.size)
+        if max_reproj > 0 and proj_uv_vals.size > 0
+        else 0.0
+    )
 
     meta: dict[str, Any] = {
         "run_id": run_dir.name,
@@ -267,7 +315,7 @@ def reconstruct_uv_run(
         "projector_size": [int(model.proj_size[0]), int(model.proj_size[1])],
         "valid_uv_points": uv_count,
         "valid_recon_points": valid_count,
-        "rejected_reprojection_or_depth": reject_reproj,
+        "rejected_reprojection_or_depth": rejected_total,
         "valid_ratio_uv": float(uv_count / float(h * w)),
         "valid_ratio_recon": float(valid_count / float(h * w)),
         "max_reproj_err_px": max_reproj,
@@ -278,6 +326,17 @@ def reconstruct_uv_run(
         "depth_median_m": float(np.nanmedian(dvals)) if dvals.size else None,
         "reproj_err_cam_median": float(np.nanmedian(reproj_err_cam_map[mask_recon])) if valid_count else None,
         "reproj_err_proj_median": float(np.nanmedian(reproj_err_proj_map[mask_recon])) if valid_count else None,
+        "reproj_err_cam_uv": _stats_from_values(cam_uv_vals),
+        "reproj_err_proj_uv": _stats_from_values(proj_uv_vals),
+        "reproj_err_cam_recon": _stats_from_values(cam_recon_vals),
+        "reproj_err_proj_recon": _stats_from_values(proj_recon_vals),
+        "cam_reproj_over_threshold_pct_uv": cam_over_thresh_pct_uv,
+        "proj_reproj_over_threshold_pct_uv": proj_over_thresh_pct_uv,
+        "rejected_by_cam_reproj_px": rejected_by_cam_count,
+        "rejected_by_proj_reproj_px": rejected_by_proj_count,
+        "rejected_by_depth_range_px": rejected_by_depth_count,
+        "rejected_total_px": rejected_total,
+        "accepted_px": valid_count,
         "uv_meta": uv_meta,
     }
 

@@ -12,6 +12,24 @@ class FringePatternGenerator:
     Generate N-step phase-shifted sinusoidal fringe patterns.
     """
 
+    def __init__(self) -> None:
+        self._gamma_lut: np.ndarray | None = None
+        self._gamma_enabled: bool = True
+
+    def set_gamma_lut(self, lut: np.ndarray | None, enabled: bool = True) -> None:
+        if lut is None:
+            self._gamma_lut = None
+            self._gamma_enabled = bool(enabled)
+            return
+        arr = np.asarray(lut, dtype=np.uint8).reshape(-1)
+        if arr.shape[0] != 256:
+            raise ValueError("Gamma LUT must contain 256 entries")
+        self._gamma_lut = arr.copy()
+        self._gamma_enabled = bool(enabled)
+
+    def clear_gamma_lut(self) -> None:
+        self._gamma_lut = None
+
     def generate_sequence(self, params: ScanParams, frequency: float | None = None) -> list[np.ndarray]:
         width, height = params.resolution
         n = max(1, int(params.n_steps))
@@ -40,6 +58,8 @@ class FringePatternGenerator:
             # Apply brightness offset as a final add then clamp.
             img = np.clip(img + (brightness_offset - 0.5), min_intensity, 1.0)
             img_u8 = np.clip(img * 255.0, 0, 255).astype(np.uint8)
+            if self._gamma_lut is not None and self._gamma_enabled:
+                img_u8 = self._gamma_lut[img_u8]
             patterns.append(img_u8)
 
         return patterns

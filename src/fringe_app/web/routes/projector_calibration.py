@@ -42,10 +42,26 @@ def build_projector_session_payload(
             coverage = None
     if coverage is None:
         coverage = session.get("coverage_map")
+    coverage_final = None
+    coverage_final_path = session_dir / "results" / "coverage.json"
+    if coverage_final_path.exists():
+        try:
+            coverage_final = json.loads(coverage_final_path.read_text())
+        except Exception:
+            coverage_final = None
+    session_report = None
+    session_report_path = session_dir / "results" / "session_report.json"
+    if session_report_path.exists():
+        try:
+            session_report = json.loads(session_report_path.read_text())
+        except Exception:
+            session_report = None
     payload = {
         "session": session,
         "views": list_views_fn(session_dir),
         "coverage": coverage or {},
+        "coverage_final": coverage_final or {},
+        "session_report": session_report or {},
         "last_capture_result": session.get("last_capture_result"),
     }
     return _json_safe(payload)

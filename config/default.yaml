@@ -85,6 +85,8 @@ unwrap:
     closing_radius_px: 3
     erosion_radius_px: 2
     min_area_px: 5000
+    # Optional unwrap-only threshold relaxation; 0 disables override.
+    b_thresh_unwrap: 0
 
 roi:
   ref_method: "median_over_frames"
@@ -112,8 +114,35 @@ calibration:
   camera_root: data/calibration/camera
   min_valid_detections: 10
   capture_flush_frames: 1
+  auto_reject: true
+  min_uv_valid_ratio: 0.85
+  min_u_span_px: 120
+  min_v_span_px: 80
+  min_board_area_ratio: 0.02
+  min_tilt_deg: 8
+  max_tilt_deg: 75
+  min_projector_coverage_ratio: 0.6
+  board_type: charuco  # charuco or checkerboard
+  projector_mode: corner  # corner|dense_plane
   residual_p95_board_threshold: 1.2
   residual_gt_1rad_pct_board_max: 0.15
+  gamma:
+    enabled: true
+    samples: 33
+    settle_ms: 120
+    flush_frames: 1
+    board_roi_only: false
+  charuco:
+    squares_x: 9
+    squares_y: 7
+    square_length_m: 0.015
+    marker_length_m: 0.011
+    dictionary: DICT_4X4_50
+  dense_plane:
+    enabled: false
+    pixel_stride: 4
+    max_points_per_view: 8000
+    min_points_per_view: 1200
   camera:
     # Calibration page uses brighter manual controls than scan defaults.
     exposure_us: 12000
@@ -125,6 +154,16 @@ calibration:
     cols: 8
     rows: 6
     square_size_mm: 10.0
+  # Camera calibration-only board settings.
+  # 9x7 squares => 8x6 inner corners for OpenCV checkerboard detection.
+  camera_calibration:
+    board_type: checkerboard
+    checkerboard:
+      squares_x: 9
+      squares_y: 7
+      cols: 8
+      rows: 6
+      square_size_mm: 10.0
 
 projector_calibration:
   checkerboard:
@@ -169,6 +208,16 @@ projector_calibration:
       min_area_px: 2000
       b_thresh_unwrap: 5.0
       a_min_unwrap: 10.0
+  uv_sampling:
+    method: median_patch
+    patch_radius: 2
+    min_valid_points: 8
+  coverage:
+    grid_size_x: 64
+    grid_size_y: 36
+    min_uniformity_metric: 0.40
+    min_edge_coverage_ratio: 0.25
+    stop_when_sufficient: true
   uv_refinement:
     enabled: true
     patch_radius: 4
@@ -184,6 +233,35 @@ projector_calibration:
     max_edge_pct: 0.15
     max_zero_pct: 0.02
     min_valid_ratio: 0.01
+
+calibration_v2:
+  charuco:
+    dict: DICT_4X4_50
+    squares_x: 9
+    squares_y: 7
+    square_length_m: 0.015
+    marker_length_m: 0.011
+  gating:
+    min_corners: 16
+    min_markers: 8
+    border_margin_px: 20
+    min_area_ratio: 0.05
+    max_area_ratio: 0.60
+  coverage:
+    grid_x: 3
+    grid_y: 3
+    min_bins_filled: 5
+    tilt_buckets_deg: [0, 10, 20, 35]
+    min_bucket_counts: [2, 2, 2]
+  solve:
+    min_views: 8
+    min_improvement_px: 0.05
+    max_prune_steps: 6
+  uv_refine:
+    enabled: true
+    patch_radius_px: 12
+    plane_fit: true
+    max_delta_px: 3.0
 
 polish:
   target_roi_valid_ratio: 0.95
@@ -202,6 +280,9 @@ quality_gate:
   max_residual_p95: 0.8
   min_roi_valid_ratio_high_freq: 0.83
   min_unwrap_pixels: 3000
+  retry:
+    enabled: true
+    max: 1
 
 uv_gate:
   enabled: true
@@ -214,7 +295,7 @@ uv_gate:
 reconstruction:
   enabled: true
   max_points: 800000
-  max_reproj_err_px: 2.0
+  max_reproj_err_px: 15.0
   z_min_m: 0.05
   z_max_m: 5.0
   downsample:

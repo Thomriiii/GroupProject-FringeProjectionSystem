@@ -82,6 +82,11 @@ class RunMeta:
     total_frames: int
     saved_frames: int
     preview_enabled: bool
+    cmdline: str | None = None
+    invoked_command: str | None = None
+    force: bool | None = None
+    retry_index: int | None = None
+    retry_origin_run_id: str | None = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

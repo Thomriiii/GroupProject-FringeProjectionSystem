@@ -19,7 +19,11 @@ class PreviewBroadcaster:
         self._latest_meta: Optional[Dict[str, Any]] = None
 
     def update(self, frame: np.ndarray, run_id: str, step: int, total: int) -> None:
-        img = Image.fromarray(frame)
+        # Decouple preview encoding from camera-owned buffers.
+        # Some camera backends recycle buffers aggressively; keeping a private
+        # contiguous copy prevents use-after-recycle during JPEG encode.
+        frame_local = np.ascontiguousarray(frame).copy()
+        img = Image.fromarray(frame_local)
         if img.width > 640:
             scale = 640 / float(img.width)
             new_size = (640, int(img.height * scale))

@@ -31,6 +31,10 @@ class ObjectRoiConfig:
 class ObjectRoiResult:
     roi_mask: np.ndarray
     bbox: Optional[Tuple[int, int, int, int]]
+    roi_core_mask: np.ndarray
+    roi_dilated_mask: np.ndarray
+    bbox_core: Optional[Tuple[int, int, int, int]]
+    bbox_dilated: Optional[Tuple[int, int, int, int]]
     raw_mask: np.ndarray
     post_mask: np.ndarray
     debug: Dict[str, Any]
@@ -93,13 +97,18 @@ def detect_object_roi(image: np.ndarray, cfg: ObjectRoiConfig) -> ObjectRoiResul
     if area_ratio < cfg.min_area_ratio or area_ratio > cfg.max_area_ratio or cc_mask is None:
         roi_fallback = True
         roi_mask = np.ones_like(gray, dtype=bool)
+        roi_core_mask = roi_mask.copy()
+        roi_dilated_mask = roi_mask.copy()
         raw_mask_full = roi_mask.copy()
         post_mask_full = roi_mask.copy()
         bbox_full = None
+        bbox_core = None
+        bbox_dilated = None
     else:
         if cfg.fill_holes:
             cc_mask = _fill_holes(cc_mask)
         raw_ds = cc_mask.astype(bool).copy()
+        core_ds = raw_ds.copy()
         if cfg.post_enabled:
             post_ds = raw_ds.copy()
             if cfg.post_keep_largest_component:
@@ -117,8 +126,11 @@ def detect_object_roi(image: np.ndarray, cfg: ObjectRoiConfig) -> ObjectRoiResul
         else:
             post_ds = raw_ds
         raw_mask_full = _resize_nearest(raw_ds.astype(np.uint8), w, h).astype(bool)
+        core_mask_full = _resize_nearest(core_ds.astype(np.uint8), w, h).astype(bool)
         post_mask_full = _resize_nearest(post_ds.astype(np.uint8), w, h).astype(bool)
         roi_mask = post_mask_full
+        roi_core_mask = core_mask_full
+        roi_dilated_mask = post_mask_full
         if bbox is not None:
             x, y, bw, bh = bbox
             if scale != 1.0:
@@ -126,9 +138,11 @@ def detect_object_roi(image: np.ndarray, cfg: ObjectRoiConfig) -> ObjectRoiResul
                 y = int(y / scale)
                 bw = int(bw / scale)
                 bh = int(bh / scale)
-            bbox_full = (x, y, bw, bh)
+            bbox_core = (x, y, bw, bh)
         else:
-            bbox_full = None
+            bbox_core = None
+        bbox_dilated = _bbox_from_mask(post_mask_full)
+        bbox_full = bbox_dilated
 
     debug = {
         "bg_percentile": cfg.black_bg_percentile,
@@ -149,10 +163,25 @@ def detect_object_roi(image: np.ndarray, cfg: ObjectRoiConfig) -> ObjectRoiResul
     return ObjectRoiResult(
         roi_mask=roi_mask,
         bbox=bbox_full,
+        roi_core_mask=roi_core_mask,
+        roi_dilated_mask=roi_dilated_mask,
+        bbox_core=bbox_core,
+        bbox_dilated=bbox_dilated,
         raw_mask=raw_mask_full,
         post_mask=post_mask_full,
         debug=debug,
     )
+
+
+def _bbox_from_mask(mask: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+    ys, xs = np.where(mask.astype(bool))
+    if ys.size == 0:
+        return None
+    x0 = int(xs.min())
+    x1 = int(xs.max())
+    y0 = int(ys.min())
+    y1 = int(ys.max())
+    return (x0, y0, x1 - x0 + 1, y1 - y0 + 1)
 
 
 def _to_gray(image: np.ndarray) -> np.ndarray:

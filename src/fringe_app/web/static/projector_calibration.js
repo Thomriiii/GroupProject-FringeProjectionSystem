@@ -1,139 +1,67 @@
 const previewImg = document.getElementById('preview_img');
 const statusEl = document.getElementById('status');
 const errorEl = document.getElementById('error');
-let captureFeedbackEl = document.getElementById('capture_feedback');
+const captureFeedbackEl = document.getElementById('capture_feedback');
+const solveFeedbackEl = document.getElementById('solve_feedback');
 const summaryEl = document.getElementById('summary');
 const viewsGrid = document.getElementById('views_grid');
 const resultsEl = document.getElementById('results_json');
-let coverageSummaryEl = document.getElementById('coverage_summary');
-let coverageHeatmapEl = document.getElementById('coverage_heatmap');
-const newSessionBtn = document.getElementById('new_session_btn');
-const actionsEl = document.querySelector('section.actions');
-let sessionSelect = document.getElementById('session_select');
-let continueSessionBtn = document.getElementById('continue_session_btn');
-const captureBtn = document.getElementById('capture_view_btn');
-const calibrateBtn = document.getElementById('calibrate_btn');
+const coverageSummaryEl = document.getElementById('coverage_summary');
+const coverageHeatmapEl = document.getElementById('coverage_heatmap');
+const coverageImageEl = document.getElementById('coverage_image');
 
-if (!sessionSelect && actionsEl) {
-  sessionSelect = document.createElement('select');
-  sessionSelect.id = 'session_select';
-  if (newSessionBtn && newSessionBtn.nextSibling) {
-    actionsEl.insertBefore(sessionSelect, newSessionBtn.nextSibling);
-  } else {
-    actionsEl.appendChild(sessionSelect);
-  }
-}
-if (!continueSessionBtn && actionsEl) {
-  continueSessionBtn = document.createElement('button');
-  continueSessionBtn.id = 'continue_session_btn';
-  continueSessionBtn.textContent = 'Continue Session';
-  if (sessionSelect && sessionSelect.nextSibling) {
-    actionsEl.insertBefore(continueSessionBtn, sessionSelect.nextSibling);
-  } else {
-    actionsEl.appendChild(continueSessionBtn);
-  }
-}
+const newSessionBtn = document.getElementById('new_session_btn');
+const sessionSelect = document.getElementById('session_select');
+const continueSessionBtn = document.getElementById('continue_session_btn');
+const captureBtn = document.getElementById('capture_view_btn');
+const gammaBtn = document.getElementById('gamma_btn');
+const solveBtn = document.getElementById('solve_btn');
 
 let currentSessionId = null;
-
-function ensureUiScaffolding() {
-  if (!captureFeedbackEl) {
-    captureFeedbackEl = document.createElement('div');
-    captureFeedbackEl.id = 'capture_feedback';
-    captureFeedbackEl.className = 'status';
-    const anchor = summaryEl || errorEl || statusEl;
-    if (anchor && anchor.parentElement) {
-      anchor.parentElement.insertBefore(captureFeedbackEl, anchor.nextSibling);
-    }
-  }
-  if (!coverageSummaryEl || !coverageHeatmapEl) {
-    const container = document.querySelector('.container');
-    if (container) {
-      const section = document.createElement('section');
-      const h2 = document.createElement('h2');
-      h2.textContent = 'Coverage';
-      coverageSummaryEl = document.createElement('div');
-      coverageSummaryEl.id = 'coverage_summary';
-      coverageHeatmapEl = document.createElement('div');
-      coverageHeatmapEl.id = 'coverage_heatmap';
-      section.appendChild(h2);
-      section.appendChild(coverageSummaryEl);
-      section.appendChild(coverageHeatmapEl);
-      container.appendChild(section);
-    }
-  }
-}
+let pollTimer = null;
+let latestSolveState = 'idle';
+let lastViewsSignature = '';
+let lastCoverageSignature = '';
+let lastResultsSignature = '';
+let imageRevision = 0;
 
 function setError(msg) {
   errorEl.textContent = msg || '';
 }
 
 function setCaptureFeedback(msg) {
-  if (!captureFeedbackEl) return;
   captureFeedbackEl.textContent = msg || '';
 }
 
-function updateButtons(viewCount = 0) {
-  const hasSession = Boolean(currentSessionId);
-  captureBtn.disabled = !hasSession;
-  calibrateBtn.disabled = !hasSession || viewCount < 10;
-  if (continueSessionBtn && sessionSelect) {
-    continueSessionBtn.disabled = !sessionSelect.value;
-  }
+function setSolveFeedback(msg) {
+  solveFeedbackEl.textContent = msg || '';
 }
 
-function viewCardHtml(v) {
-  const ok = v.status === 'valid';
-  const ratio = Number(v.valid_corner_ratio || 0).toFixed(3);
-  const diag = v.diag || {};
-  const d = diag.diagnostics || {};
-  const bd = diag.corner_validity_breakdown || {};
-  const hint = (diag.hints && diag.hints.length) ? diag.hints[0] : '';
-  const breakdown = `ok:${bd.ok ?? 0} nan:${bd.nan_uv ?? 0} mask:${bd.mask_uv_false ?? 0} edge:${(bd.near_edge ?? 0) + (bd.oob ?? 0)}`;
-  const rt = diag.residual_thresholds || {};
-  const rBoard = Number(d.unwrap_residual_p95_board ?? NaN);
-  const rGt1 = Number(d.unwrap_residual_gt_1rad_pct_board ?? NaN);
-  const rThr = Number(rt.residual_p95_board_threshold ?? NaN);
-  const gtThr = Number(rt.residual_gt_1rad_pct_board_max ?? NaN);
-  const residualLine = Number.isFinite(rBoard)
-    ? `residual_p95_board=${rBoard.toFixed(3)} (thr=${Number.isFinite(rThr) ? rThr.toFixed(3) : '-'})`
-    : 'residual_p95_board=n/a';
-  const unstableLine = Number.isFinite(rGt1)
-    ? `residual_gt_1rad_pct_board=${rGt1.toFixed(3)} (thr=${Number.isFinite(gtThr) ? gtThr.toFixed(3) : '-'})`
-    : 'residual_gt_1rad_pct_board=n/a';
-  const boardMaskLine = Number.isFinite(Number(d.board_mask_area_ratio))
-    ? `board_mask_area_ratio=${Number(d.board_mask_area_ratio).toFixed(3)}`
-    : '';
-  return `
-    <div class="capture-card">
-      <div class="capture-title">
-        ${v.view_id} - ${ok ? 'valid' : 'invalid'} (ratio=${ratio})
-      </div>
-      <img src="/api/calibration/projector/session/${currentSessionId}/view/${v.view_id}/overlay?ts=${Date.now()}" alt="${v.view_id}" />
-      <div style="margin-top:6px;display:flex;gap:8px;align-items:center;">
-        <a href="/api/calibration/projector/session/${currentSessionId}/view/${v.view_id}/uv_preview?ts=${Date.now()}" target="_blank">UV preview</a>
-        <button data-view="${v.view_id}" class="delete-view-btn">Delete</button>
-      </div>
-      <div style="font-size:12px;color:#444;margin-top:6px;">${breakdown}</div>
-      <div style="font-size:12px;color:#333;">${residualLine}</div>
-      <div style="font-size:12px;color:#333;">${unstableLine}</div>
-      ${boardMaskLine ? `<div style="font-size:12px;color:#333;">${boardMaskLine}</div>` : ''}
-      ${v.reason ? `<div class="error">${v.reason}</div>` : ''}
-      ${hint ? `<div style="font-size:12px;color:#333;">${hint}</div>` : ''}
-    </div>
-  `;
+async function fetchJson(url, opts = undefined) {
+  const res = await fetch(url, opts);
+  const data = await res.json();
+  if (!res.ok || data.ok === false) {
+    throw new Error(data.error || `HTTP ${res.status}`);
+  }
+  return data;
 }
 
 function renderCoverage(coverage) {
-  if (!coverageHeatmapEl || !coverageSummaryEl) return;
-  const binsX = Number(coverage?.bins_x || 8);
-  const binsY = Number(coverage?.bins_y || 8);
+  const gridSize = Array.isArray(coverage?.grid_size) ? coverage.grid_size : [];
+  const binsX = Number(coverage?.bins_x || gridSize[0] || 8);
+  const binsY = Number(coverage?.bins_y || gridSize[1] || 8);
   const grid = Array.isArray(coverage?.grid) ? coverage.grid : [];
-  const covered = Number(coverage?.covered_bins || 0);
-  const total = Number(coverage?.total_bins || binsX * binsY);
+  const covered = Number(coverage?.covered_bins || coverage?.bins_covered_count || 0);
+  const total = Number(coverage?.total_bins || coverage?.bins_total || binsX * binsY);
   const ratio = Number(coverage?.coverage_ratio || 0);
+  const edgeRatio = Number(coverage?.edge_coverage_ratio || 0);
+  const uniformity = Number(coverage?.uniformity_metric || 0);
+  const sufficient = Boolean(coverage?.sufficient);
+  const guidance = Array.isArray(coverage?.guidance) ? coverage.guidance : [];
+  const guidanceText = guidance.length ? ` | Guidance: ${guidance.join(', ')}` : '';
+  const suffText = sufficient ? ' | Coverage target reached' : '';
+  coverageSummaryEl.textContent = `Coverage: ${covered}/${total} bins (${(100 * ratio).toFixed(1)}%) | edge ${(100 * edgeRatio).toFixed(1)}% | uniformity ${uniformity.toFixed(3)}${suffText}${guidanceText}`;
 
-  coverageSummaryEl.textContent = `Coverage: ${covered}/${total} bins (${(ratio * 100).toFixed(1)}%)`;
   coverageHeatmapEl.style.gridTemplateColumns = `repeat(${binsX}, 20px)`;
   const cells = [];
   for (let y = 0; y < binsY; y += 1) {
@@ -145,64 +73,58 @@ function renderCoverage(coverage) {
   coverageHeatmapEl.innerHTML = cells.join('');
 }
 
-async function refreshSession() {
-  if (!currentSessionId) return;
-  const res = await fetch(`/api/calibration/projector/session/${currentSessionId}`);
-  const data = await res.json();
-  if (!data.ok) {
-    setError(data.error || 'Failed to load session');
+function renderCoverageImage(revisionTag = '0') {
+  if (!currentSessionId) {
+    coverageImageEl.innerHTML = '';
     return;
   }
-  const views = data.views || [];
-  const coverage = data.coverage || data.session?.coverage_map || {};
-  renderCoverage(coverage);
-  statusEl.textContent = `Session ${currentSessionId}`;
-  const validViews = views.filter(v => v.status === 'valid').length;
-  summaryEl.textContent = `Accepted views: ${validViews}`;
-  updateButtons(validViews);
-  if (data.last_capture_result) {
-    const last = data.last_capture_result;
-    if (last.accept) {
-      setCaptureFeedback(`View accepted. Valid corners: ${(Number(last.valid_corner_ratio || 0) * 100).toFixed(1)}%`);
-    } else {
-      const reason = (last.reject_reasons && last.reject_reasons.length) ? last.reject_reasons[0] : 'View rejected';
-      const hint = (last.hints && last.hints.length) ? last.hints[0] : '';
-      setCaptureFeedback(`View rejected. Reason: ${reason}${hint ? ` | Hint: ${hint}` : ''}`);
-    }
-  }
-
-  viewsGrid.innerHTML = views.map(viewCardHtml).join('');
-  document.querySelectorAll('.delete-view-btn').forEach((btn) => {
-    btn.addEventListener('click', async () => {
-      const vid = btn.getAttribute('data-view');
-      await fetch(`/api/calibration/projector/session/${currentSessionId}/view/${vid}`, { method: 'DELETE' });
-      await refreshSession();
-    });
-  });
-
-  const result = data.session?.results;
-  resultsEl.textContent = result ? JSON.stringify(result, null, 2) : '';
+  coverageImageEl.innerHTML = `
+    <a href="/api/calibration/projector/session/${currentSessionId}/coverage.png?rev=${encodeURIComponent(revisionTag)}" target="_blank">Open coverage heatmap</a>
+    <img src="/api/calibration/projector/session/${currentSessionId}/coverage.png?rev=${encodeURIComponent(revisionTag)}" alt="coverage heatmap"
+         style="margin-top:8px;max-width:420px;border:1px solid #ccc;" onerror="this.style.display='none';" />
+  `;
 }
 
-async function setProjectorIllumination(enabled) {
-  try {
-    await fetch('/api/calibration/projector/illumination', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ enabled: Boolean(enabled) }),
-    });
-  } catch (_) {
-    // Keep UI responsive; endpoint failures are surfaced elsewhere.
-  }
+function viewCardHtml(view) {
+  const diag = view.diag || {};
+  const viewQuality = diag.view_quality || {};
+  const measured = diag.measured || {};
+  const bd = diag.corner_validity_breakdown || {};
+  const ok = view.status === 'valid';
+  const ratio = Number(view.valid_corner_ratio || measured.valid_corner_ratio || 0);
+  const reasons = Array.isArray(diag.reject_reasons) ? diag.reject_reasons : (view.reject_reasons || []);
+  const hints = Array.isArray(diag.hints) ? diag.hints : (view.hints || []);
+  return `
+    <div class="capture-card">
+      <div class="capture-title">${view.view_id} - ${ok ? 'PASS' : 'FAIL'} (ratio=${ratio.toFixed(3)})</div>
+      <img src="/api/calibration/projector/session/${currentSessionId}/view/${view.view_id}/overlay?rev=${imageRevision}" alt="${view.view_id}"
+           onerror="this.onerror=null;this.src='/api/calibration/projector/session/${currentSessionId}/view/${view.view_id}/image?rev=${imageRevision}';" />
+      <div style="margin-top:6px;display:flex;gap:8px;align-items:center;">
+        <a href="/api/calibration/projector/session/${currentSessionId}/view/${view.view_id}/uv_preview?rev=${imageRevision}" target="_blank">UV preview</a>
+        <button data-view="${view.view_id}" class="delete-view-btn">Delete</button>
+      </div>
+      <div style="font-size:12px;color:#444;margin-top:6px;">ok:${bd.ok ?? 0} nan:${bd.nan_uv ?? 0} mask:${bd.mask_uv_false ?? 0} edge:${(bd.near_edge ?? 0) + (bd.oob ?? 0)}</div>
+      <div style="font-size:12px;color:#333;">residual_p95_board=${Number(measured.residual_p95_board ?? NaN).toFixed(3)}</div>
+      <div style="font-size:12px;color:#333;">B_median_board=${Number(measured.B_median_board ?? NaN).toFixed(3)}</div>
+      <div style="font-size:12px;color:#333;">conditioning=${Number(viewQuality.conditioning_score ?? NaN).toFixed(3)} tilt=${Number(viewQuality.tilt_angle_deg ?? NaN).toFixed(1)}°</div>
+      ${reasons.length ? `<div class="error">${reasons.join('; ')}</div>` : ''}
+      ${hints.length ? `<div style="font-size:12px;color:#333;">${hints[0]}</div>` : ''}
+    </div>
+  `;
+}
+
+function updateButtons(viewCountValid = 0, coverageSufficient = false) {
+  const hasSession = Boolean(currentSessionId);
+  const busy = (latestSolveState === 'solving') || (latestSolveState === 'capturing');
+  captureBtn.disabled = !hasSession || busy || coverageSufficient;
+  gammaBtn.disabled = !hasSession || busy;
+  solveBtn.disabled = !hasSession || busy || viewCountValid < 10;
+  continueSessionBtn.disabled = !sessionSelect.value || busy;
+  newSessionBtn.disabled = busy;
 }
 
 async function loadSessionsList() {
-  if (!sessionSelect) return;
-  const res = await fetch('/api/calibration/projector/sessions');
-  const data = await res.json();
-  if (!data.ok) {
-    return;
-  }
+  const data = await fetchJson('/api/calibration/projector/sessions');
   const sessions = data.sessions || [];
   sessionSelect.innerHTML = '';
   if (!sessions.length) {
@@ -218,80 +140,222 @@ async function loadSessionsList() {
       sessionSelect.appendChild(opt);
     }
   }
-  updateButtons();
 }
 
-async function continueSession(sessionId) {
-  if (!sessionId) return;
-  currentSessionId = sessionId;
-  await setProjectorIllumination(true);
-  await refreshSession();
+async function refreshSession() {
+  if (!currentSessionId) return;
+  try {
+    const [statusData, viewsData, resultsData, sessionData] = await Promise.all([
+      fetchJson(`/api/calibration/projector/session/${currentSessionId}/status`),
+      fetchJson(`/api/calibration/projector/session/${currentSessionId}/views`),
+      fetchJson(`/api/calibration/projector/session/${currentSessionId}/results`),
+      fetchJson(`/api/calibration/projector/session/${currentSessionId}`),
+    ]);
+    latestSolveState = (statusData.status || {}).state || 'idle';
+    statusEl.textContent = `Session ${currentSessionId} | state=${latestSolveState}`;
+
+    const views = viewsData.views || [];
+    const validCount = Number(viewsData.views_valid || 0);
+    summaryEl.textContent = `Views: ${views.length} | Valid: ${validCount}`;
+    const viewsSignature = JSON.stringify(views.map((v) => ({
+      id: v.view_id,
+      status: v.status,
+      accept: !!v.accept,
+      ratio: Number(v.valid_corner_ratio || 0),
+      reasons: (v.diag?.reject_reasons || v.reject_reasons || []),
+      hints: (v.diag?.hints || v.hints || []),
+      measured: v.diag?.measured || {},
+      breakdown: v.diag?.corner_validity_breakdown || {},
+    })));
+    if (viewsSignature !== lastViewsSignature) {
+      lastViewsSignature = viewsSignature;
+      viewsGrid.innerHTML = views.map(viewCardHtml).join('');
+      document.querySelectorAll('.delete-view-btn').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const viewId = btn.getAttribute('data-view');
+          await fetchJson(`/api/calibration/projector/session/${currentSessionId}/view/${viewId}`, { method: 'DELETE' });
+          imageRevision += 1;
+          await refreshSession();
+        });
+      });
+    }
+
+    const coverage = (resultsData.coverage && Object.keys(resultsData.coverage).length)
+      ? resultsData.coverage
+      : (sessionData.coverage || {});
+    const coverageSufficient = Boolean(coverage?.sufficient);
+    const coverageSignature = JSON.stringify({
+      coverage,
+      has_results: !!resultsData.has_results,
+      solve_state: latestSolveState,
+      solve_ended: statusData.status?.ended_at || null,
+    });
+    if (coverageSignature !== lastCoverageSignature) {
+      lastCoverageSignature = coverageSignature;
+      renderCoverage(coverage);
+      renderCoverageImage(coverageSignature.slice(0, 48));
+    }
+
+    if (resultsData.has_results && resultsData.stereo) {
+      const st = resultsData.stereo;
+      setSolveFeedback(`Solve done. RMS projector=${Number(st.rms_projector_intrinsics || NaN).toFixed(3)} | RMS stereo=${Number(st.rms_stereo || NaN).toFixed(3)} | views=${st.views_used ?? '-'}`);
+      const resultsSignature = JSON.stringify(resultsData.stereo);
+      if (resultsSignature !== lastResultsSignature) {
+        lastResultsSignature = resultsSignature;
+        resultsEl.textContent = JSON.stringify(resultsData.stereo, null, 2);
+      }
+    } else {
+      if (lastResultsSignature !== '') {
+        lastResultsSignature = '';
+        resultsEl.textContent = '';
+      }
+      if (latestSolveState === 'idle') {
+        setSolveFeedback('No solve results yet.');
+      }
+    }
+
+    const last = sessionData.last_capture_result;
+    if (last) {
+      if (last.accept) {
+        const done = last.coverage_sufficient ? ' Coverage sufficient; run Solve when ready.' : '';
+        setCaptureFeedback(`View accepted. Valid corners: ${(100 * Number(last.valid_corner_ratio || 0)).toFixed(1)}%.${done}`);
+      } else {
+        const reason = (last.reject_reasons && last.reject_reasons.length) ? last.reject_reasons[0] : 'View rejected';
+        const hint = (last.hints && last.hints.length) ? last.hints[0] : '';
+        setCaptureFeedback(`View rejected. Reason: ${reason}${hint ? ` | Hint: ${hint}` : ''}`);
+      }
+    }
+
+    if (latestSolveState === 'solving') {
+      setSolveFeedback('Solving session (batch mode)...');
+    } else if (latestSolveState === 'capturing') {
+      setCaptureFeedback('Capturing and processing UV for current pose...');
+    } else if (latestSolveState === 'error') {
+      setError((statusData.status || {}).error || 'Solve/capture error');
+    }
+
+    updateButtons(validCount, coverageSufficient);
+  } catch (err) {
+    setError(err.message || 'Failed to refresh projector session');
+  }
+}
+
+async function setProjectorIllumination(enabled) {
+  try {
+    await fetchJson('/api/calibration/projector/illumination', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: Boolean(enabled) }),
+    });
+  } catch (err) {
+    setError(err.message || 'Failed to set projector illumination');
+  }
+}
+
+function ensurePolling() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(() => {
+    if (currentSessionId) {
+      refreshSession();
+    }
+  }, 2500);
 }
 
 newSessionBtn.addEventListener('click', async () => {
   setError('');
-  const res = await fetch('/api/calibration/projector/session/new', { method: 'POST' });
-  const data = await res.json();
-  if (!data.ok) {
-    setError(data.error || 'Failed to create session');
-    return;
-  }
-  currentSessionId = data.session_id;
-  await setProjectorIllumination(true);
-  resultsEl.textContent = '';
-  await loadSessionsList();
-  if (sessionSelect) {
+  try {
+    const data = await fetchJson('/api/calibration/projector/session/start', { method: 'POST' });
+    currentSessionId = data.session_id;
+    imageRevision += 1;
+    lastViewsSignature = '';
+    lastCoverageSignature = '';
+    lastResultsSignature = '';
+    await setProjectorIllumination(true);
+    await loadSessionsList();
     sessionSelect.value = currentSessionId;
+    await refreshSession();
+  } catch (err) {
+    setError(err.message || 'Failed to create session');
   }
+});
+
+continueSessionBtn.addEventListener('click', async () => {
+  setError('');
+  if (!sessionSelect.value) return;
+  currentSessionId = sessionSelect.value;
+  imageRevision += 1;
+  lastViewsSignature = '';
+  lastCoverageSignature = '';
+  lastResultsSignature = '';
+  await setProjectorIllumination(true);
   await refreshSession();
 });
 
-if (continueSessionBtn) {
-  continueSessionBtn.addEventListener('click', async () => {
-    setError('');
-    await continueSession(sessionSelect ? sessionSelect.value : '');
-  });
-}
-
-if (sessionSelect) {
-  sessionSelect.addEventListener('change', () => updateButtons());
-}
+sessionSelect.addEventListener('change', () => {
+  updateButtons(0, false);
+});
 
 captureBtn.addEventListener('click', async () => {
   if (!currentSessionId) return;
   setError('');
-  captureBtn.disabled = true;
+  setCaptureFeedback('Capturing pose...');
+  latestSolveState = 'capturing';
+  updateButtons(0);
   try {
-    statusEl.textContent = `Session ${currentSessionId} | Capturing pose...`;
-    const res = await fetch(`/api/calibration/projector/session/${currentSessionId}/capture`, { method: 'POST' });
-    const data = await res.json();
-    if (!data.ok) {
-      setError(data.error || 'Capture failed');
-      setCaptureFeedback('');
-    } else if (data.message) {
-      setCaptureFeedback(data.message);
-    }
+    const data = await fetchJson(`/api/calibration/projector/session/${currentSessionId}/capture`, { method: 'POST' });
+    setCaptureFeedback(data.message || 'Capture complete');
+    imageRevision += 1;
+    lastViewsSignature = '';
   } catch (err) {
-    setError('Capture failed');
-    setCaptureFeedback('');
+    setError(err.message || 'Capture failed');
   } finally {
     await refreshSession();
   }
 });
 
-calibrateBtn.addEventListener('click', async () => {
+solveBtn.addEventListener('click', async () => {
   if (!currentSessionId) return;
   setError('');
-  statusEl.textContent = `Session ${currentSessionId} | Calibrating...`;
-  const res = await fetch(`/api/calibration/projector/session/${currentSessionId}/calibrate`, { method: 'POST' });
-  const data = await res.json();
-  if (!data.ok) {
-    setError(data.error || 'Calibration failed');
+  setSolveFeedback('Starting solve...');
+  try {
+    await fetchJson(`/api/calibration/projector/session/${currentSessionId}/solve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ background: true }),
+    });
+    latestSolveState = 'solving';
+    lastCoverageSignature = '';
+    lastResultsSignature = '';
+  } catch (err) {
+    setError(err.message || 'Solve failed to start');
+  } finally {
     await refreshSession();
-    return;
   }
-  resultsEl.textContent = JSON.stringify(data.result, null, 2);
-  await refreshSession();
+});
+
+gammaBtn.addEventListener('click', async () => {
+  if (!currentSessionId) return;
+  setError('');
+  setSolveFeedback('Running gamma calibration...');
+  try {
+    const data = await fetchJson(`/api/calibration/projector/session/${currentSessionId}/gamma`, {
+      method: 'POST',
+    });
+    const gamma = data.result || {};
+    const g = Number(gamma.gamma ?? NaN);
+    if (Number.isFinite(g)) {
+      const suffix = gamma.enabled === false ? ' (runtime apply disabled in config)' : '';
+      setSolveFeedback(`Gamma calibration done. gamma=${g.toFixed(3)}${suffix}`);
+    } else if (gamma.enabled === false) {
+      setSolveFeedback('Gamma calibration completed, but runtime apply is disabled in config.');
+    } else {
+      setSolveFeedback('Gamma calibration done.');
+    }
+  } catch (err) {
+    setError(err.message || 'Gamma calibration failed');
+  } finally {
+    await refreshSession();
+  }
 });
 
 function setupPreview() {
@@ -308,26 +372,17 @@ function setupPreview() {
 }
 
 async function init() {
-  ensureUiScaffolding();
-  setCaptureFeedback('No capture yet');
   setupPreview();
+  ensurePolling();
+  setCaptureFeedback('No capture yet');
+  setSolveFeedback('No solve results yet.');
   await loadSessionsList();
-  if (sessionSelect && sessionSelect.value) {
-    await continueSession(sessionSelect.value);
+  if (sessionSelect.value) {
+    currentSessionId = sessionSelect.value;
+    await setProjectorIllumination(true);
+    await refreshSession();
   } else {
-    const r = await fetch('/api/calibration/projector/session/new', { method: 'POST' });
-    const d = await r.json();
-    if (d.ok) {
-      currentSessionId = d.session_id;
-      await setProjectorIllumination(true);
-      await loadSessionsList();
-      if (sessionSelect) {
-        sessionSelect.value = currentSessionId;
-      }
-      await refreshSession();
-    } else {
-      setError(d.error || 'Failed to init session');
-    }
+    updateButtons(0);
   }
 }
 

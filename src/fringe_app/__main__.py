@@ -4,26 +4,15 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-
-import uvicorn
-import yaml
 import sys
-
-from fringe_app.core.logging import setup_logging
-from fringe_app.core.models import ScanParams
-from fringe_app.web.preview import PreviewBroadcaster
-from fringe_app.cli import main as cli_main
-from fringe_app.patterns.generator import FringePatternGenerator
-from fringe_app.display.pygame_display import PygameProjectorDisplay
-from fringe_app.io.run_store import RunStore
-from fringe_app.core.controller import ScanController
-from fringe_app.web.server import FringeServer
 
 
 def _load_config() -> dict:
     cfg_path = Path("config/default.yaml")
     if not cfg_path.exists():
         return {}
+    import yaml
+
     return yaml.safe_load(cfg_path.read_text()) or {}
 
 
@@ -32,16 +21,21 @@ def _create_camera(cfg: dict):
     cam_type = cam_cfg.get("type", "picamera2")
     if cam_type == "picamera2":
         from fringe_app.camera.picamera2_impl import Picamera2Camera
+
         return Picamera2Camera(
             lores_yuv_format=str(cam_cfg.get("lores_yuv_format", "nv12")),
             lores_uv_swap=bool(cam_cfg.get("lores_uv_swap", False)),
         )
     if cam_type == "mock":
         from fringe_app.camera.mock import MockCamera
+
         return MockCamera(data_dir=cam_cfg.get("mock_data", "mock_data"))
     raise RuntimeError("camera.type must be picamera2 or mock")
 
-def _default_scan_params(cfg: dict) -> ScanParams:
+
+def _default_scan_params(cfg: dict):
+    from fringe_app.core.models import ScanParams
+
     scan_cfg = cfg.get("scan", {})
     pat_cfg = cfg.get("patterns", {})
     calib_cam_cfg = (cfg.get("calibration", {}) or {}).get("camera", {}) or {}
@@ -75,9 +69,28 @@ def _default_scan_params(cfg: dict) -> ScanParams:
         auto_normalise=bool(scan_cfg.get("auto_normalise", True)),
         expert_mode=False,
     )
+
+
 def main() -> None:
     if len(sys.argv) > 1:
+        if sys.argv[1] == "tools.validate_projector_calib_v2":
+            from fringe_app.tools.validate_projector_calib_v2 import main as validate_projector_v2_main
+
+            raise SystemExit(validate_projector_v2_main(sys.argv[2:]))
+        from fringe_app.cli import main as cli_main
+
         raise SystemExit(cli_main())
+
+    import uvicorn
+
+    from fringe_app.core.logging import setup_logging
+    from fringe_app.web.preview import PreviewBroadcaster
+    from fringe_app.patterns.generator import FringePatternGenerator
+    from fringe_app.display.pygame_display import PygameProjectorDisplay
+    from fringe_app.io.run_store import RunStore
+    from fringe_app.core.controller import ScanController
+    from fringe_app.web.server import FringeServer
+
     cfg = _load_config()
     log = setup_logging()
 
