@@ -8,7 +8,9 @@ import concurrent.futures
 import functools
 import json
 import math
+import shutil
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, Any
 
@@ -51,6 +53,22 @@ from fringe_app.overlays.generate import overlay_masks
 from fringe_app.unwrap.temporal import unwrap_multi_frequency, save_unwrap_outputs
 from fringe_app.cli import cmd_phase, cmd_unwrap, cmd_score, cmd_pipeline_run_3d
 from fringe_app.recon import load_stereo_model, reconstruct_uv_run, save_reconstruction_outputs
+from fringe_app.inspection import run_known_object_inspection
+from fringe_app.inspection.defect2d import (
+    DEFECT_2D_MODE,
+    analyse_image as analyse_defect2d_image,
+    config_from_dict as defect2d_config_from_dict,
+    save_analysis_outputs as save_defect2d_outputs,
+)
+from fringe_app.scanning.reconstruction_quality import (
+    ReconstructionQualityParams,
+    filter_points_by_confidence,
+    load_modulation_maps,
+    save_quality_diagnostics,
+    smooth_depth_bilateral,
+    summarize_quality_metrics,
+    sweep_reconstruction_quality,
+)
 from fringe_app.web.routes.projector_calibration import (
     build_capture_response_payload,
     build_projector_session_payload,
@@ -186,6 +204,95 @@ class FringeServer:
             if not qpath.exists():
                 return {"exists": False}
             return {"exists": True, "report": json.loads(qpath.read_text())}
+
+        @self.app.post("/api/runs/{run_id}/2d-defect/compute")
+        async def compute_2d_defect(run_id: str, payload: Dict[str, Any] | None = None):
+            try:
+                payload = payload or {}
+                run_dir = Path(self.run_store.root) / run_id
+                if not run_dir.exists():
+                    return JSONResponse({"ok": False, "error": "run not found"}, status_code=404)
+                d2_cfg = ((self.config.get("defect2d", {}) or {}).get("processing", {}) or {})
+                defect_cfg = defect2d_config_from_dict(d2_cfg)
+                if "threshold_auto" in payload:
+                    defect_cfg.threshold_auto = bool(payload.get("threshold_auto"))
+                if "save_heatmap" in payload:
+                    defect_cfg.save_heatmap = bool(payload.get("save_heatmap"))
+                roi_cfg = self._build_roi_config()
+                ref_method = str(payload.get("ref_method", roi_cfg.ref_method))
+                ref = self.run_store.load_reference_image(run_id, ref_method=ref_method)
+                analysis = analyse_defect2d_image(ref, defect_cfg, roi_cfg)
+
+                bbox_core = self._bbox_from_mask(analysis.roi_core_mask)
+                self.run_store.save_roi(
+                    run_id,
+                    analysis.roi_mask,
+                    analysis.bbox,
+                    {
+                        "cfg": asdict(roi_cfg),
+                        "mode": DEFECT_2D_MODE,
+                        "bbox_core": bbox_core,
+                        "bbox_dilated": analysis.bbox,
+                        "area_ratio_core": float(np.count_nonzero(analysis.roi_core_mask) / analysis.roi_core_mask.size),
+                        "area_ratio_dilated": float(np.count_nonzero(analysis.roi_mask) / analysis.roi_mask.size),
+                        "roi_gate_mask": "core_eroded",
+                        "debug": analysis.metrics.get("roi_debug", {}),
+                    },
+                    roi_core=analysis.roi_core_mask,
+                    roi_dilated=analysis.roi_mask,
+                    bbox_core=bbox_core,
+                    bbox_dilated=analysis.bbox,
+                )
+
+                out_dir = run_dir / "2d_defect"
+                metrics = save_defect2d_outputs(
+                    out_dir,
+                    analysis,
+                    defect_cfg,
+                    save_debug=bool(payload.get("save_debug", False)),
+                )
+                return {
+                    "ok": True,
+                    "mode": DEFECT_2D_MODE,
+                    "run_id": run_id,
+                    "output_dir": str(out_dir),
+                    "defect_area_percent": metrics.get("defect_area_percent"),
+                    "defect_region_count": metrics.get("defect_region_count"),
+                    "average_defect_size_px": metrics.get("average_defect_size_px"),
+                    "outputs": metrics.get("outputs"),
+                }
+            except Exception as exc:
+                log.error("2D defect compute failed for %s: %s", run_id, exc)
+                log.error(traceback.format_exc())
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+        @self.app.get("/api/runs/{run_id}/2d-defect/status")
+        async def defect_2d_status(run_id: str):
+            metrics_path = Path(self.run_store.root) / run_id / "2d_defect" / "metrics.json"
+            if not metrics_path.exists():
+                return {"exists": False}
+            return {"exists": True, "metrics": json.loads(metrics_path.read_text())}
+
+        @self.app.get("/api/runs/{run_id}/2d-defect/{artifact}")
+        async def defect_2d_artifact(run_id: str, artifact: str):
+            allowed = {
+                "raw": "raw.png",
+                "roi": "roi.png",
+                "mask": "defect_mask.png",
+                "defect_mask": "defect_mask.png",
+                "overlay": "overlay.png",
+                "heatmap": "heatmap.png",
+                "metrics": "metrics.json",
+            }
+            name = allowed.get(str(artifact))
+            if name is None:
+                return JSONResponse({"ok": False, "error": "unknown artifact"}, status_code=404)
+            path = Path(self.run_store.root) / run_id / "2d_defect" / name
+            if not path.exists():
+                return JSONResponse({"ok": False, "error": "artifact not found"}, status_code=404)
+            if name.endswith(".json"):
+                return JSONResponse(json.loads(path.read_text()))
+            return FileResponse(path)
 
         @self.app.post("/api/runs/{run_id}/phase/compute")
         async def compute_phase(run_id: str):
@@ -1059,10 +1166,15 @@ class FringeServer:
             allowed = {"reproj_cam.png", "reproj_proj.png", "coverage.png", "residual_hist.png"}
             if plot_name not in allowed:
                 return JSONResponse({"ok": False, "error": "invalid plot name"}, status_code=400)
-            p = self._calibration_root() / "projector_v2" / session_id / "solve" / "plots" / plot_name
-            if not p.exists():
-                return JSONResponse({"ok": False, "error": "plot not found"}, status_code=404)
-            return FileResponse(p)
+            solve_dir = self._calibration_root() / "projector_v2" / session_id / "solve"
+            candidates = [
+                solve_dir / plot_name,
+                solve_dir / "plots" / plot_name,
+            ]
+            for p in candidates:
+                if p.exists():
+                    return FileResponse(p)
+            return JSONResponse({"ok": False, "error": "plot not found"}, status_code=404)
 
         @self.app.get("/api/reconstruction/runs")
         async def reconstruction_runs():
@@ -1078,6 +1190,7 @@ class FringeServer:
                         "status": meta.status,
                         "started_at": meta.started_at,
                         "has_reconstruction": (run_dir / "reconstruction" / "reconstruction_meta.json").exists(),
+                        "has_reconstruction_quality": (run_dir / "reconstruction_quality" / "reconstruction_meta.json").exists(),
                     }
                 )
             return {"ok": True, "runs": runs}
@@ -1101,6 +1214,42 @@ class FringeServer:
                 return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
             except Exception as exc:
                 log.error("Reconstruction failed for %s: %s", run_id, exc)
+                log.error(traceback.format_exc())
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+        @self.app.post("/api/reconstruction/quality")
+        async def reconstruction_quality(payload: Dict[str, Any]):
+            body = payload or {}
+            run_id = str(body.get("run_id", "")).strip()
+            if not run_id:
+                latest = self._latest_uv_run_id()
+                if not latest:
+                    return JSONResponse(
+                        {"ok": False, "error": "run_id is required and no UV-ready run was found"},
+                        status_code=400,
+                    )
+                run_id = latest
+            run_dir = Path(self.run_store.root) / run_id
+            if not run_dir.exists():
+                return JSONResponse({"ok": False, "error": f"run not found: {run_id}"}, status_code=404)
+            if not (run_dir / "projector_uv" / "u.npy").exists():
+                return JSONResponse({"ok": False, "error": "run does not contain projector_uv outputs"}, status_code=400)
+            try:
+                summary = await asyncio.to_thread(self._run_reconstruction_quality, run_id, body)
+                return {
+                    "ok": True,
+                    "run_id": run_id,
+                    "point_count": int(summary.get("point_count", 0)),
+                    "quality_metrics": summary.get("quality_metrics", {}),
+                    "output_file": summary.get("output_file"),
+                    "summary": summary,
+                }
+            except FileNotFoundError as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
+            except ValueError as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+            except Exception as exc:
+                log.error("Reconstruction quality mode failed for %s: %s", run_id, exc)
                 log.error(traceback.format_exc())
                 return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
@@ -1143,6 +1292,161 @@ class FringeServer:
             target = (rec_dir / file_path).resolve()
             try:
                 target.relative_to(rec_dir)
+            except ValueError:
+                return JSONResponse({"ok": False, "error": "invalid path"}, status_code=400)
+            if not target.exists() or not target.is_file():
+                return JSONResponse({"ok": False, "error": "file not found"}, status_code=404)
+            return FileResponse(target)
+
+        @self.app.get("/api/reconstruction/quality/outputs")
+        async def reconstruction_quality_outputs(run_id: str):
+            run_dir = Path(self.run_store.root) / run_id
+            rec_dir = run_dir / "reconstruction_quality"
+            if not rec_dir.exists():
+                return {"ok": True, "exists": False, "files": []}
+            files = []
+            for p in sorted(rec_dir.rglob("*")):
+                if not p.is_file():
+                    continue
+                rel = p.relative_to(rec_dir).as_posix()
+                files.append(
+                    {
+                        "name": rel,
+                        "size_bytes": int(p.stat().st_size),
+                        "url": f"/api/reconstruction/quality/file/{run_id}/{rel}",
+                    }
+                )
+            meta = {}
+            meta_path = rec_dir / "reconstruction_meta.json"
+            if meta_path.exists():
+                meta = json.loads(meta_path.read_text())
+            return {"ok": True, "exists": True, "files": files, "meta": meta}
+
+        @self.app.get("/api/reconstruction/quality/file/{run_id}/{file_path:path}")
+        async def reconstruction_quality_file(run_id: str, file_path: str):
+            run_dir = Path(self.run_store.root) / run_id
+            rec_dir = (run_dir / "reconstruction_quality").resolve()
+            target = (rec_dir / file_path).resolve()
+            try:
+                target.relative_to(rec_dir)
+            except ValueError:
+                return JSONResponse({"ok": False, "error": "invalid path"}, status_code=400)
+            if not target.exists() or not target.is_file():
+                return JSONResponse({"ok": False, "error": "file not found"}, status_code=404)
+            return FileResponse(target)
+
+        @self.app.get("/api/inspection/runs")
+        async def inspection_runs():
+            runs: list[dict[str, Any]] = []
+            for meta in self.run_store.list_runs():
+                run_id = meta.run_id
+                run_dir = Path(self.run_store.root) / run_id
+                recon_meta = run_dir / "reconstruction" / "reconstruction_meta.json"
+                if not recon_meta.exists():
+                    continue
+                runs.append(
+                    {
+                        "run_id": run_id,
+                        "status": meta.status,
+                        "started_at": meta.started_at,
+                        "has_inspection": (run_dir / "inspection" / "defect_report.json").exists(),
+                    }
+                )
+            return {"ok": True, "runs": runs}
+
+        @self.app.get("/api/inspection/references")
+        async def inspection_references():
+            refs = self._list_reference_models()
+            return {"ok": True, "references": refs}
+
+        @self.app.post("/api/inspection/run")
+        async def inspection_run(payload: Dict[str, Any]):
+            body = payload or {}
+            reference_model = str(body.get("reference_model", "")).strip()
+            if not reference_model:
+                return JSONResponse({"ok": False, "error": "reference_model is required"}, status_code=400)
+
+            run_id = str(body.get("run_id", "")).strip()
+            if not run_id:
+                latest = self._latest_reconstruction_run_id()
+                if not latest:
+                    return JSONResponse(
+                        {"ok": False, "error": "run_id is required and no run with reconstruction outputs was found"},
+                        status_code=400,
+                    )
+                run_id = latest
+
+            run_dir = Path(self.run_store.root) / run_id
+            if not run_dir.exists():
+                return JSONResponse({"ok": False, "error": f"run not found: {run_id}"}, status_code=404)
+            if not (run_dir / "reconstruction" / "reconstruction_meta.json").exists():
+                return JSONResponse(
+                    {"ok": False, "error": f"run has no reconstruction outputs: {run_id}"},
+                    status_code=400,
+                )
+
+            tolerance_mm = body.get("tolerance_mm")
+            if tolerance_mm is None:
+                tolerance_mm = (self.config.get("inspection", {}) or {}).get("tolerance_mm", 0.5)
+
+            recompute = bool(body.get("recompute", False))
+            try:
+                summary = await asyncio.to_thread(
+                    self._run_known_object_inspection,
+                    run_id,
+                    reference_model,
+                    float(tolerance_mm),
+                    recompute,
+                )
+                return {
+                    "ok": True,
+                    "run_id": run_id,
+                    "pass": bool(summary.get("pass", False)),
+                    "defects_detected": int(summary.get("defects_detected", 0)),
+                    "defect_report": summary.get("defect_report"),
+                    "overlay_visualization": summary.get("overlay_visualization"),
+                    "summary": summary,
+                }
+            except FileNotFoundError as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
+            except ValueError as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+            except Exception as exc:
+                log.error("Inspection run failed for %s: %s", run_id, exc)
+                log.error(traceback.format_exc())
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+        @self.app.get("/api/inspection/outputs")
+        async def inspection_outputs(run_id: str):
+            run_dir = Path(self.run_store.root) / run_id
+            ins_dir = run_dir / "inspection"
+            if not ins_dir.exists():
+                return {"ok": True, "exists": False, "files": []}
+            files = []
+            for p in sorted(ins_dir.rglob("*")):
+                if not p.is_file():
+                    continue
+                rel = p.relative_to(ins_dir).as_posix()
+                files.append(
+                    {
+                        "name": rel,
+                        "size_bytes": int(p.stat().st_size),
+                        "url": f"/api/inspection/file/{run_id}/{rel}",
+                    }
+                )
+            report = {}
+            report_path = ins_dir / "defect_report.json"
+            if report_path.exists():
+                report = json.loads(report_path.read_text())
+            return {"ok": True, "exists": True, "files": files, "report": report}
+
+        @self.app.get("/api/inspection/file/{run_id}/{file_path:path}")
+        async def inspection_file(run_id: str, file_path: str):
+            run_dir = Path(self.run_store.root) / run_id
+            ins_dir = (run_dir / "inspection").resolve()
+            target = (ins_dir / file_path).resolve()
+            try:
+                target.relative_to(ins_dir)
             except ValueError:
                 return JSONResponse({"ok": False, "error": "invalid path"}, status_code=400)
             if not target.exists() or not target.is_file():
@@ -1213,6 +1517,17 @@ class FringeServer:
                 },
             )
 
+        @self.app.get("/inspection")
+        async def inspection_page():
+            page = (static_dir / "inspection.html").read_text()
+            return HTMLResponse(
+                page,
+                headers={
+                    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                    "Pragma": "no-cache",
+                },
+            )
+
         self.app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
     async def _run_pipeline(self, force: bool = False) -> None:
@@ -1259,6 +1574,17 @@ class FringeServer:
                         self.controller.start_preview_loop(preview_params)
                     except Exception:
                         pass
+
+    @staticmethod
+    def _bbox_from_mask(mask: np.ndarray) -> tuple[int, int, int, int] | None:
+        ys, xs = np.where(mask.astype(bool))
+        if ys.size == 0:
+            return None
+        x0 = int(xs.min())
+        x1 = int(xs.max())
+        y0 = int(ys.min())
+        y1 = int(ys.max())
+        return (x0, y0, x1 - x0 + 1, y1 - y0 + 1)
 
     def _build_params(self, payload: Dict[str, Any]) -> ScanParams:
         defaults = self.config.get("scan", {})
@@ -1455,6 +1781,221 @@ class FringeServer:
             "depth_median_m": meta.get("depth_median_m"),
             "reproj_err_cam_median": meta.get("reproj_err_cam_median"),
             "reproj_err_proj_median": meta.get("reproj_err_proj_median"),
+        }
+
+    def _latest_uv_run_id(self) -> str | None:
+        latest: str | None = None
+        latest_key: tuple[str, str] | None = None
+        for meta in self.run_store.list_runs():
+            run_id = meta.run_id
+            run_dir = Path(self.run_store.root) / run_id
+            if not (run_dir / "projector_uv" / "u.npy").exists():
+                continue
+            key = (str(meta.started_at or ""), run_id)
+            if latest_key is None or key > latest_key:
+                latest_key = key
+                latest = run_id
+        return latest
+
+    def _latest_reconstruction_run_id(self) -> str | None:
+        latest: str | None = None
+        latest_key: tuple[str, str] | None = None
+        for meta in self.run_store.list_runs():
+            run_id = meta.run_id
+            run_dir = Path(self.run_store.root) / run_id
+            if not (run_dir / "reconstruction" / "reconstruction_meta.json").exists():
+                continue
+            key = (str(meta.started_at or ""), run_id)
+            if latest_key is None or key > latest_key:
+                latest_key = key
+                latest = run_id
+        return latest
+
+    def _list_reference_models(self) -> list[dict[str, str]]:
+        refs: list[dict[str, str]] = []
+        seen: set[str] = set()
+
+        insp_cfg = self.config.get("inspection", {}) or {}
+        ref_root = Path(str(insp_cfg.get("reference_root", "data/reference_models"))).expanduser()
+        if ref_root.exists():
+            for ext in ("*.ply", "*.stl", "*.obj"):
+                for p in sorted(ref_root.rglob(ext)):
+                    rp = str(p.resolve())
+                    if rp in seen:
+                        continue
+                    seen.add(rp)
+                    refs.append({"label": p.relative_to(ref_root).as_posix(), "path": rp, "kind": "reference_model"})
+
+        # Also expose existing reconstructed scans as quick reference point-clouds.
+        for meta in self.run_store.list_runs():
+            run_id = meta.run_id
+            p = Path(self.run_store.root) / run_id / "reconstruction" / "pointcloud.ply"
+            if not p.exists():
+                continue
+            rp = str(p.resolve())
+            if rp in seen:
+                continue
+            seen.add(rp)
+            refs.append({"label": f"{run_id}/reconstruction/pointcloud.ply", "path": rp, "kind": "reference_scan"})
+
+        refs.sort(key=lambda x: (x.get("kind", ""), x.get("label", "")))
+        return refs
+
+    def _run_known_object_inspection(
+        self,
+        run_id: str,
+        reference_model: str,
+        tolerance_mm: float,
+        recompute: bool,
+    ) -> dict[str, Any]:
+        return run_known_object_inspection(
+            run_root=Path(self.run_store.root),
+            run_id=run_id,
+            reference_model=reference_model,
+            tolerance_mm=tolerance_mm,
+            cfg=self.config.get("inspection", {}) or {},
+            recompute=bool(recompute),
+        )
+
+    def _run_reconstruction_quality(self, run_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        run_dir = Path(self.run_store.root) / run_id
+        payload = payload or {}
+
+        camera_intr = self._find_camera_intrinsics_latest()
+        stereo = self._find_projector_stereo_latest()
+        model = load_stereo_model(camera_intr, stereo)
+        recon_cfg = self.config.get("reconstruction", {}) or {}
+
+        # Always refresh standard reconstruction first for side-by-side comparison.
+        standard_result = reconstruct_uv_run(
+            run_dir,
+            model,
+            recon_cfg=recon_cfg,
+        )
+        standard_dir = run_dir / "reconstruction"
+        standard_meta = save_reconstruction_outputs(
+            standard_dir,
+            standard_result,
+            recon_cfg=recon_cfg,
+        )
+
+        rq_cfg = dict((self.config.get("reconstruction_quality", {}) or {}))
+        rq_cfg.update(
+            {
+                "enable_confidence_filter": bool(
+                    payload.get(
+                        "enable_confidence_filter",
+                        payload.get("enable_high_quality_mode", rq_cfg.get("enabled", False)),
+                    )
+                ),
+                "max_reproj_error_px": float(
+                    payload.get("max_reproj_error_px", rq_cfg.get("max_reproj_error_px", 1.5))
+                ),
+                "min_modulation_B": float(
+                    payload.get("min_modulation_B", rq_cfg.get("min_modulation_B", 25))
+                ),
+                "enable_smoothing": bool(
+                    payload.get("enable_smoothing", rq_cfg.get("enable_smoothing", False))
+                ),
+                "enable_sweep": bool(payload.get("enable_sweep", rq_cfg.get("enable_sweep", False))),
+            }
+        )
+        params = ReconstructionQualityParams.from_dict(rq_cfg)
+
+        B_vertical, B_horizontal = load_modulation_maps(run_dir)
+        quality_mask = filter_points_by_confidence(
+            uv=(standard_result.u_map, standard_result.v_map),
+            B_vertical=B_vertical,
+            B_horizontal=B_horizontal,
+            reproj_err_cam=standard_result.reproj_err_cam,
+            reproj_err_proj=standard_result.reproj_err_proj,
+            params=params,
+        )
+        if int(np.count_nonzero(quality_mask)) <= 0:
+            raise ValueError("Quality mask rejected all pixels. Relax thresholds and retry.")
+
+        quality_result = reconstruct_uv_run(
+            run_dir,
+            model,
+            recon_cfg=recon_cfg,
+            extra_valid_mask=quality_mask,
+        )
+        depth_before = np.asarray(quality_result.depth, dtype=np.float32).copy()
+        depth_after = depth_before.copy()
+        if bool(params.enable_smoothing):
+            depth_after = smooth_depth_bilateral(depth_before)
+            valid_recon = np.asarray(quality_result.mask_recon, dtype=bool) & np.isfinite(depth_after)
+            xyz = np.asarray(quality_result.xyz, dtype=np.float32).copy()
+            xyz[valid_recon, 2] = depth_after[valid_recon]
+            quality_result.depth = depth_after.astype(np.float32)
+            quality_result.xyz = xyz
+
+        quality_dir = run_dir / "reconstruction_quality"
+        quality_meta = save_reconstruction_outputs(
+            quality_dir,
+            quality_result,
+            recon_cfg=recon_cfg,
+        )
+        standard_ply = standard_dir / "cloud.ply"
+        quality_ply = quality_dir / "cloud.ply"
+        standard_alias = standard_dir / "standard_reconstruction.ply"
+        quality_alias = quality_dir / "high_quality.ply"
+        if standard_ply.exists():
+            shutil.copy2(standard_ply, standard_alias)
+        if quality_ply.exists():
+            shutil.copy2(quality_ply, quality_alias)
+
+        diagnostics = save_quality_diagnostics(
+            out_dir=quality_dir,
+            quality_mask=quality_mask,
+            reproj_err_cam=standard_result.reproj_err_cam,
+            reproj_err_proj=standard_result.reproj_err_proj,
+            B_vertical=B_vertical,
+            B_horizontal=B_horizontal,
+            depth_before=depth_before,
+            depth_after=depth_after,
+            mask_recon=np.asarray(quality_result.mask_recon, dtype=bool),
+        )
+        quality_metrics = summarize_quality_metrics(quality_result, quality_mask)
+
+        sweep_report = None
+        if bool(params.enable_sweep):
+            sweep_report = sweep_reconstruction_quality(
+                run_dir=run_dir,
+                model=model,
+                recon_cfg=recon_cfg,
+                uv=(standard_result.u_map, standard_result.v_map),
+                B_vertical=B_vertical,
+                B_horizontal=B_horizontal,
+                reproj_err_cam=standard_result.reproj_err_cam,
+                reproj_err_proj=standard_result.reproj_err_proj,
+                out_dir=quality_dir,
+            )
+
+        quality_meta["quality_mode"] = {
+            "params": params.to_dict(),
+            "quality_mask_pixels": int(np.count_nonzero(quality_mask)),
+            "quality_mask_ratio": float(np.count_nonzero(quality_mask) / max(1, quality_mask.size)),
+            "quality_metrics": quality_metrics,
+            "diagnostics": diagnostics,
+            "sweep_enabled": bool(params.enable_sweep),
+        }
+        (quality_dir / "reconstruction_meta.json").write_text(json.dumps(_json_safe(quality_meta), indent=2))
+
+        return {
+            "run_id": run_id,
+            "camera_intrinsics": str(camera_intr),
+            "projector_stereo": str(stereo),
+            "standard_output_dir": str(standard_dir),
+            "quality_output_dir": str(quality_dir),
+            "point_count": int(quality_metrics.get("point_count", 0)),
+            "quality_metrics": quality_metrics,
+            "output_file": str(quality_alias if quality_alias.exists() else quality_ply),
+            "standard_output_file": str(standard_alias if standard_alias.exists() else standard_ply),
+            "diagnostics": diagnostics,
+            "sweep": sweep_report,
+            "standard_meta": standard_meta,
+            "quality_meta": quality_meta,
         }
 
     def _select_phase_dir(self, phase_dir: Path) -> Path:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -555,6 +556,13 @@ def solve_session(session_dir: Path) -> dict[str, Any]:
     hist_cam = pruned_cam_resid if selected_model == "pruned" else raw_cam_resid
     hist_proj = pruned_proj_resid if selected_model == "pruned" else raw_proj_resid
     save_residual_histogram(hist_cam, hist_proj, plots_dir / "residual_hist.png")
+
+    # Compatibility outputs: keep plots/ and mirror files at solve/ root.
+    for name in ("reproj_cam.png", "reproj_proj.png", "coverage.png", "residual_hist.png"):
+        src = plots_dir / name
+        dst = solve_dir / name
+        if src.exists():
+            shutil.copy2(src, dst)
 
     selected_result = pruned_result if selected_model == "pruned" else raw_result
     export_path = export_dir / "stereo.json"

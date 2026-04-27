@@ -38,7 +38,6 @@
       <h2>Coverage</h2>
       <div id="coverage_indicator" class="status">Need more variety</div>
       <div id="coverage_summary"></div>
-      <img id="coverage_plot" alt="coverage plot" style="max-width:420px;border:1px solid #ccc;margin-top:8px;" />
     </section>
 
     <section class="preview">
@@ -54,11 +53,15 @@
     <section>
       <h2>Solve</h2>
       <div id="solve_summary"></div>
-      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;">
-        <a id="plot_cam" href="#" target="_blank">Camera reprojection plot</a>
-        <a id="plot_proj" href="#" target="_blank">Projector reprojection plot</a>
-        <a id="plot_hist" href="#" target="_blank">Residual histogram</a>
-      </div>
+      <details style="margin-top:8px;">
+        <summary>Advanced diagnostics</summary>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;">
+          <a id="plot_cam" href="#" target="_blank">Camera reprojection plot</a>
+          <a id="plot_proj" href="#" target="_blank">Projector reprojection plot</a>
+          <a id="plot_cov" href="#" target="_blank">Coverage plot</a>
+          <a id="plot_hist" href="#" target="_blank">Residual histogram</a>
+        </div>
+      </details>
     </section>
   </div>
 

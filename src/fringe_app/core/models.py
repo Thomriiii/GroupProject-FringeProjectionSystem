@@ -41,6 +41,7 @@ class ScanParams:
     auto_normalise: bool = True
     expert_mode: bool = False
     quality_retry_count: int = 0
+    scan_mode: str = "FRINGE_SCAN"
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)

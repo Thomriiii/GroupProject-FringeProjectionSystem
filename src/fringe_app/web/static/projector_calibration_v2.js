@@ -3,12 +3,12 @@ const statusEl = document.getElementById('status');
 const errorEl = document.getElementById('error');
 const coverageIndicatorEl = document.getElementById('coverage_indicator');
 const coverageSummaryEl = document.getElementById('coverage_summary');
-const coveragePlotEl = document.getElementById('coverage_plot');
 const viewsGridEl = document.getElementById('views_grid');
 const solveSummaryEl = document.getElementById('solve_summary');
 const downloadLinkEl = document.getElementById('download_link');
 const plotCamEl = document.getElementById('plot_cam');
 const plotProjEl = document.getElementById('plot_proj');
+const plotCovEl = document.getElementById('plot_cov');
 const plotHistEl = document.getElementById('plot_hist');
 
 const captureBtn = document.getElementById('capture_btn');
@@ -84,15 +84,13 @@ function updateLinks(sessionId, hasSolvePlots = false) {
   if (hasSolvePlots) {
     plotCamEl.href = `/api/calibration/projector_v2/session/${sessionId}/plot/reproj_cam.png?rev=${rev}`;
     plotProjEl.href = `/api/calibration/projector_v2/session/${sessionId}/plot/reproj_proj.png?rev=${rev}`;
+    plotCovEl.href = `/api/calibration/projector_v2/session/${sessionId}/plot/coverage.png?rev=${rev}`;
     plotHistEl.href = `/api/calibration/projector_v2/session/${sessionId}/plot/residual_hist.png?rev=${rev}`;
-    coveragePlotEl.src = `/api/calibration/projector_v2/session/${sessionId}/plot/coverage.png?rev=${rev}`;
-    coveragePlotEl.style.display = '';
   } else {
     plotCamEl.href = '#';
     plotProjEl.href = '#';
+    plotCovEl.href = '#';
     plotHistEl.href = '#';
-    coveragePlotEl.removeAttribute('src');
-    coveragePlotEl.style.display = 'none';
   }
 }
 

@@ -9,7 +9,7 @@
 <body>
   <div class="container">
     <header>
-      <h1>Projector Calibration</h1>
+      <h1>Projector Calibration (Legacy)</h1>
       <div class="header-right">
         <a href="/">Back to Pipeline</a>
         <a href="/calibration/projector-v2">Use v2</a>
@@ -29,7 +29,6 @@
     <section>
       <h2>Solve Controls</h2>
       <div class="actions">
-        <button id="gamma_btn" disabled>Calibrate Gamma</button>
         <button id="solve_btn" disabled>Run Solve</button>
       </div>
     </section>
@@ -53,15 +52,15 @@
     </section>
 
     <section>
-      <h2>Coverage</h2>
-      <div id="coverage_summary"></div>
-      <div id="coverage_heatmap"></div>
-      <div id="coverage_image"></div>
-    </section>
-
-    <section>
-      <h2>Results</h2>
-      <pre id="results_json"></pre>
+      <details>
+        <summary>Advanced diagnostics</summary>
+        <h2>Coverage</h2>
+        <div id="coverage_summary"></div>
+        <div id="coverage_heatmap"></div>
+        <div id="coverage_image"></div>
+        <h2>Results</h2>
+        <pre id="results_json"></pre>
+      </details>
     </section>
   </div>
 

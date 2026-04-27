@@ -14,7 +14,6 @@ const newSessionBtn = document.getElementById('new_session_btn');
 const sessionSelect = document.getElementById('session_select');
 const continueSessionBtn = document.getElementById('continue_session_btn');
 const captureBtn = document.getElementById('capture_view_btn');
-const gammaBtn = document.getElementById('gamma_btn');
 const solveBtn = document.getElementById('solve_btn');
 
 let currentSessionId = null;
@@ -117,7 +116,6 @@ function updateButtons(viewCountValid = 0, coverageSufficient = false) {
   const hasSession = Boolean(currentSessionId);
   const busy = (latestSolveState === 'solving') || (latestSolveState === 'capturing');
   captureBtn.disabled = !hasSession || busy || coverageSufficient;
-  gammaBtn.disabled = !hasSession || busy;
   solveBtn.disabled = !hasSession || busy || viewCountValid < 10;
   continueSessionBtn.disabled = !sessionSelect.value || busy;
   newSessionBtn.disabled = busy;
@@ -328,31 +326,6 @@ solveBtn.addEventListener('click', async () => {
     lastResultsSignature = '';
   } catch (err) {
     setError(err.message || 'Solve failed to start');
-  } finally {
-    await refreshSession();
-  }
-});
-
-gammaBtn.addEventListener('click', async () => {
-  if (!currentSessionId) return;
-  setError('');
-  setSolveFeedback('Running gamma calibration...');
-  try {
-    const data = await fetchJson(`/api/calibration/projector/session/${currentSessionId}/gamma`, {
-      method: 'POST',
-    });
-    const gamma = data.result || {};
-    const g = Number(gamma.gamma ?? NaN);
-    if (Number.isFinite(g)) {
-      const suffix = gamma.enabled === false ? ' (runtime apply disabled in config)' : '';
-      setSolveFeedback(`Gamma calibration done. gamma=${g.toFixed(3)}${suffix}`);
-    } else if (gamma.enabled === false) {
-      setSolveFeedback('Gamma calibration completed, but runtime apply is disabled in config.');
-    } else {
-      setSolveFeedback('Gamma calibration done.');
-    }
-  } catch (err) {
-    setError(err.message || 'Gamma calibration failed');
   } finally {
     await refreshSession();
   }

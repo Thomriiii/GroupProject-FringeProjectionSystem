@@ -46,6 +46,8 @@ class ReconstructionResult:
     reproj_err_cam: np.ndarray
     reproj_err_proj: np.ndarray
     rgb: np.ndarray | None
+    u_map: np.ndarray | None
+    v_map: np.ndarray | None
     meta: dict[str, Any]
 
 
@@ -202,6 +204,7 @@ def reconstruct_uv_run(
     run_dir: Path,
     model: StereoModel,
     recon_cfg: dict[str, Any] | None = None,
+    extra_valid_mask: np.ndarray | None = None,
 ) -> ReconstructionResult:
     cv = _require_cv2()
     recon_cfg = recon_cfg or {}
@@ -210,6 +213,13 @@ def reconstruct_uv_run(
     _validate_model_and_uv(model, u, v, mask_uv, uv_meta)
 
     valid = mask_uv & np.isfinite(u) & np.isfinite(v)
+    if extra_valid_mask is not None:
+        qmask = np.asarray(extra_valid_mask, dtype=bool)
+        if qmask.shape != valid.shape:
+            raise ValueError(
+                f"extra_valid_mask shape mismatch: expected {valid.shape}, got {qmask.shape}"
+            )
+        valid &= qmask
     ys, xs = np.where(valid)
     if ys.size == 0:
         raise ValueError("No valid UV correspondences available for triangulation")
@@ -348,5 +358,7 @@ def reconstruct_uv_run(
         reproj_err_cam=reproj_err_cam_map,
         reproj_err_proj=reproj_err_proj_map,
         rgb=rgb,
+        u_map=u.astype(np.float32),
+        v_map=v.astype(np.float32),
         meta=meta,
     )

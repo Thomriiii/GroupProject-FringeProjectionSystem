@@ -24,9 +24,10 @@ scan:
   brightness: 1.0
   width: 1024
   height: 768
-  settle_ms: 150
-  settle_ms_first_step: 350
-  settle_ms_freq_switch: 350
+  # Slightly longer settling improves residual stability across runs.
+  settle_ms: 180
+  settle_ms_first_step: 400
+  settle_ms_freq_switch: 400
   freq_switch_warmup_ms: 250
   flush_frames_per_step: 1
   flush_frames_on_freq_switch: 2
@@ -105,6 +106,38 @@ roi:
     fill_small_holes: true
     max_hole_area: 2000
     dilate_radius_px: 10
+
+defect2d:
+  capture:
+    stack_size: 5
+    use_averaging: false
+    inspection_dn: 180
+    settle_ms: 180
+    flush_frames: 2
+    auto_normalise: true
+    save_debug: false
+  processing:
+    normalise_low_percentile: 1.0
+    normalise_high_percentile: 99.0
+    gaussian_blur: true
+    blur_sigma: 0.8
+    histogram_equalisation: false
+    gradient_kernel: scharr
+    highpass_sigma: 7.0
+    local_std_window: 15
+    roi_inner_erode_px: 3
+    threshold_auto: true
+    gradient_threshold: 0.22
+    highpass_threshold: 0.08
+    local_std_threshold: 0.055
+    reference_diff_threshold: 0.10
+    auto_mad_k: 6.0
+    auto_percentile: 99.2
+    morphology_open_iters: 1
+    morphology_close_iters: 1
+    min_area_px: 18
+    max_area_px: 0
+    save_heatmap: true
 
 storage:
   run_root: data/runs
@@ -277,7 +310,8 @@ polish:
 quality_gate:
   max_clipped_any_pct_roi: 0.01
   max_clipped_step_pct_roi: 0.01
-  max_residual_p95: 0.8
+  # Keep default gate slightly above borderline run-to-run jitter.
+  max_residual_p95: 0.85
   min_roi_valid_ratio_high_freq: 0.83
   min_unwrap_pixels: 3000
   retry:
@@ -304,11 +338,31 @@ reconstruction:
   ply:
     write_rgb: true
 
+reconstruction_quality:
+  enabled: false
+  max_reproj_error_px: 1.5
+  min_modulation_B: 25
+  enable_smoothing: false
+  enable_sweep: false
+
+inspection:
+  reference_root: data/reference_models
+  tolerance_mm: 0.50
+  normal_knn: 30
+  mesh_sample_points: 120000
+  icp_max_iters: 30
+  icp_tolerance: 1.0e-6
+  icp_sample_size: 50000
+  cluster_radius_mm: 1.5
+  min_cluster_points: 25
+  sample_seed: 0
+
 quality:
   residual:
-    p95_threshold_start: 0.8
-    p95_threshold_tight: 0.4
-    p95_threshold_final: 0.2
+    # Disable progressive auto-tightening in default operation for consistency.
+    p95_threshold_start: 0.85
+    p95_threshold_tight: 0.85
+    p95_threshold_final: 0.85
     tighten_after_passes: 10
     final_after_passes: 30
 

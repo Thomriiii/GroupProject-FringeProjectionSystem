@@ -21,6 +21,30 @@
     </section>
 
     <section>
+      <h2>Reconstruction Quality (Experimental)</h2>
+      <div class="actions">
+        <label><input type="checkbox" id="hq_enable_cb" /> Enable High Quality Mode</label>
+      </div>
+      <div class="actions">
+        <label for="hq_reproj_slider">Reprojection Threshold (px)</label>
+        <input id="hq_reproj_slider" type="range" min="0.5" max="2.5" step="0.1" value="1.5" />
+        <span id="hq_reproj_value">1.5</span>
+      </div>
+      <div class="actions">
+        <label for="hq_mod_slider">Modulation Threshold B</label>
+        <input id="hq_mod_slider" type="range" min="10" max="40" step="1" value="25" />
+        <span id="hq_mod_value">25</span>
+      </div>
+      <div class="actions">
+        <label><input type="checkbox" id="hq_smoothing_cb" /> Enable Smoothing</label>
+      </div>
+      <div class="actions">
+        <button id="run_quality_btn">Run High Quality Reconstruction</button>
+        <button id="run_sweep_btn">Run Quality Sweep</button>
+      </div>
+    </section>
+
+    <section>
       <div id="status" class="status">idle</div>
       <div id="error" class="error"></div>
       <pre id="summary_json"></pre>
@@ -48,6 +72,47 @@
     <section>
       <h2>Outputs</h2>
       <ul id="outputs_list"></ul>
+    </section>
+
+    <section>
+      <h2>Comparison</h2>
+      <div class="captures-grid">
+        <div class="capture-card">
+          <div class="capture-title">Standard Reconstruction</div>
+          <a id="standard_ply_link" href="#" target="_blank">Download Standard PLY</a>
+        </div>
+        <div class="capture-card">
+          <div class="capture-title">High Quality Reconstruction</div>
+          <a id="quality_ply_link" href="#" target="_blank">Download High Quality PLY</a>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Quality Outputs</h2>
+      <ul id="quality_outputs_list"></ul>
+      <div class="captures-grid">
+        <div class="capture-card">
+          <div class="capture-title">Quality Mask</div>
+          <img id="quality_mask_img" alt="quality mask" />
+        </div>
+        <div class="capture-card">
+          <div class="capture-title">Reprojection Error</div>
+          <img id="quality_reproj_img" alt="quality reprojection map" />
+        </div>
+        <div class="capture-card">
+          <div class="capture-title">Modulation Map</div>
+          <img id="quality_mod_img" alt="quality modulation map" />
+        </div>
+        <div class="capture-card">
+          <div class="capture-title">Depth Before</div>
+          <img id="quality_depth_before_img" alt="quality depth before" />
+        </div>
+        <div class="capture-card">
+          <div class="capture-title">Depth After</div>
+          <img id="quality_depth_after_img" alt="quality depth after" />
+        </div>
+      </div>
     </section>
   </div>
 

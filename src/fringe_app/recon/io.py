@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -104,6 +105,17 @@ def save_reconstruction_outputs(
 
     np.save(out_dir / "xyz.npy", result.xyz.astype(np.float32))
     np.save(out_dir / "depth.npy", result.depth.astype(np.float32))
+    if result.u_map is not None and result.v_map is not None:
+        uv_map = np.stack(
+            [
+                np.asarray(result.u_map, dtype=np.float32),
+                np.asarray(result.v_map, dtype=np.float32),
+            ],
+            axis=-1,
+        )
+        invalid = ~np.asarray(result.mask_uv, dtype=bool)
+        uv_map[invalid, :] = np.nan
+        np.save(out_dir / "uv_map.npy", uv_map.astype(np.float32))
     np.save(masks_dir / "mask_uv.npy", result.mask_uv.astype(bool))
     np.save(masks_dir / "mask_recon.npy", result.mask_recon.astype(bool))
     _save_mask_png(result.mask_uv, masks_dir / "mask_uv.png")
@@ -174,7 +186,10 @@ def save_reconstruction_outputs(
         xyzrgb = np.concatenate([pts, colors], axis=1)
         np.save(out_dir / "xyzrgb.npy", xyzrgb.astype(np.float32))
 
-    save_ply(pts, colors, out_dir / "cloud.ply")
+    cloud_path = out_dir / "cloud.ply"
+    pointcloud_path = out_dir / "pointcloud.ply"
+    save_ply(pts, colors, cloud_path)
+    shutil.copy2(cloud_path, pointcloud_path)
 
     meta = dict(result.meta)
     meta.update(
@@ -185,7 +200,9 @@ def save_reconstruction_outputs(
                 "depth": "depth.npy",
                 "depth_debug_fixed": "depth_debug_fixed.png",
                 "depth_debug_autoscale": "depth_debug_autoscale.png",
+                "uv_map": "uv_map.npy" if (result.u_map is not None and result.v_map is not None) else None,
                 "cloud": "cloud.ply",
+                "pointcloud": "pointcloud.ply",
                 "masks": {
                     "mask_uv": "masks/mask_uv.npy",
                     "mask_recon": "masks/mask_recon.npy",

@@ -124,8 +124,10 @@ def save_residual_histogram(
         base_x = x0 + 10 + i * bw
         ch = int((int(cam_hist[i]) / hmax) * (y1 - y0 - 10))
         ph = int((int(proj_hist[i]) / hmax) * (y1 - y0 - 10))
-        draw.rectangle((base_x, y1 - ch, base_x + max(1, bw // 2) - 1, y1 - 1), fill=(80, 150, 230))
-        draw.rectangle((base_x + max(1, bw // 2), y1 - ph, base_x + bw - 1, y1 - 1), fill=(240, 130, 80))
+        if ch > 0:
+            draw.rectangle((base_x, y1 - ch, base_x + max(1, bw // 2) - 1, y1 - 1), fill=(80, 150, 230))
+        if ph > 0:
+            draw.rectangle((base_x + max(1, bw // 2), y1 - ph, base_x + bw - 1, y1 - 1), fill=(240, 130, 80))
 
     draw.text((x0, 12), "Residual Histogram (camera blue / projector orange)", fill=(30, 30, 30))
     draw.text((x0, 490), f"camera_n={cam.size} projector_n={proj.size} max_bin={hmax}", fill=(30, 30, 30))

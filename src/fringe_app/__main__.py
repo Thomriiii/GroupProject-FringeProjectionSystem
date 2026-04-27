@@ -17,20 +17,9 @@ def _load_config() -> dict:
 
 
 def _create_camera(cfg: dict):
-    cam_cfg = cfg.get("camera", {})
-    cam_type = cam_cfg.get("type", "picamera2")
-    if cam_type == "picamera2":
-        from fringe_app.camera.picamera2_impl import Picamera2Camera
+    from fringe_app.camera.camera_driver import create_camera_from_config
 
-        return Picamera2Camera(
-            lores_yuv_format=str(cam_cfg.get("lores_yuv_format", "nv12")),
-            lores_uv_swap=bool(cam_cfg.get("lores_uv_swap", False)),
-        )
-    if cam_type == "mock":
-        from fringe_app.camera.mock import MockCamera
-
-        return MockCamera(data_dir=cam_cfg.get("mock_data", "mock_data"))
-    raise RuntimeError("camera.type must be picamera2 or mock")
+    return create_camera_from_config(cfg)
 
 
 def _default_scan_params(cfg: dict):

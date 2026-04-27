@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 from dataclasses import asdict, dataclass
 import time
@@ -13,6 +14,8 @@ from pathlib import Path
 from typing import Dict, Any, List
 
 import numpy as np
+
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
 from fringe_app.core.models import ScanParams
 from fringe_app.patterns.generator import FringePatternGenerator
@@ -25,6 +28,7 @@ from fringe_app.camera.mock import MockCamera
 from fringe_app.io.run_store import RunStore
 from fringe_app.web.preview import PreviewBroadcaster
 from fringe_app.core.controller import ScanController
+from fringe_app.core.auto_normalise import NormaliseConfig
 from fringe_app.core.quality_gate import (
     QualityThresholds,
     QualityReport,
@@ -48,6 +52,14 @@ from fringe_app.unwrap.temporal import unwrap_multi_frequency, save_unwrap_outpu
 from fringe_app.uv import phase_to_uv, save_uv_outputs
 from fringe_app.recon import load_stereo_model, reconstruct_uv_run, save_reconstruction_outputs
 from fringe_app.reconstruction import save_recon_qa_outputs
+from fringe_app.calibration.manager import CalibrationConfig, CalibrationManager
+from fringe_app.inspection.defect2d import (
+    DEFECT_2D_MODE,
+    capture_and_run as capture_and_run_defect2d,
+    capture_config_from_dict as defect2d_capture_config_from_dict,
+    config_from_dict as defect2d_config_from_dict,
+    run_existing_image as run_existing_image_defect2d,
+)
 
 
 @dataclass(slots=True)
@@ -73,6 +85,44 @@ def _load_config() -> dict:
 
 def _calibration_root(cfg: dict) -> Path:
     return Path(str((cfg.get("calibration", {}) or {}).get("root", "data/calibration")))
+
+
+def _camera_calibration_manager(cfg: dict) -> CalibrationManager:
+    calib_cfg = cfg.get("calibration", {}) or {}
+    camera_calib_cfg = (calib_cfg.get("camera_calibration", {}) or {})
+    camera_cb_cfg = (camera_calib_cfg.get("checkerboard", {}) or {})
+    legacy_cb_cfg = (calib_cfg.get("checkerboard", {}) or {})
+
+    squares_x = int(camera_cb_cfg.get("squares_x", camera_calib_cfg.get("squares_x", 0) or 0))
+    squares_y = int(camera_cb_cfg.get("squares_y", camera_calib_cfg.get("squares_y", 0) or 0))
+    default_cols = max(2, squares_x - 1) if squares_x > 0 else int(legacy_cb_cfg.get("cols", 9))
+    default_rows = max(2, squares_y - 1) if squares_y > 0 else int(legacy_cb_cfg.get("rows", 6))
+
+    camera_checkerboard_cols = int(camera_cb_cfg.get("cols", camera_calib_cfg.get("cols", default_cols)))
+    camera_checkerboard_rows = int(camera_cb_cfg.get("rows", camera_calib_cfg.get("rows", default_rows)))
+    camera_square_size_mm = float(
+        camera_cb_cfg.get(
+            "square_size_mm",
+            camera_calib_cfg.get("square_size_mm", legacy_cb_cfg.get("square_size_mm", 25.0)),
+        )
+    )
+    camera_board_type = str(camera_calib_cfg.get("board_type", calib_cfg.get("board_type", "checkerboard")))
+    camera_charuco_cfg = (camera_calib_cfg.get("charuco", calib_cfg.get("charuco", {}) or {}))
+    camera_min_valid_detections = int(
+        camera_calib_cfg.get("min_valid_detections", calib_cfg.get("min_valid_detections", 10))
+    )
+    camera_root = Path(str(calib_cfg.get("camera_root", str(_calibration_root(cfg) / "camera"))))
+    return CalibrationManager(
+        CalibrationConfig(
+            root=str(camera_root),
+            checkerboard_cols=camera_checkerboard_cols,
+            checkerboard_rows=camera_checkerboard_rows,
+            square_size_mm=camera_square_size_mm,
+            min_valid_detections=camera_min_valid_detections,
+            board_type=camera_board_type,
+            charuco=camera_charuco_cfg,
+        )
+    )
 
 
 def _camera_intrinsics_latest_path(cfg: dict) -> Path:
@@ -226,6 +276,72 @@ def _roi_config(cfg: dict) -> ObjectRoiConfig:
     )
 
 
+def _normalise_config(cfg: dict) -> NormaliseConfig:
+    norm_cfg_d = cfg.get("normalise", {})
+    return NormaliseConfig(
+        enabled=bool(norm_cfg_d.get("enabled", True)),
+        target_A_mean=float(norm_cfg_d.get("target_A_mean", 120.0)),
+        target_A_tolerance=float(norm_cfg_d.get("target_A_tolerance", 10.0)),
+        sat_high=int(norm_cfg_d.get("sat_high", 250)),
+        max_clip_roi=float(norm_cfg_d.get("max_clip_roi", 0.01)),
+        exposure_min_us=int(norm_cfg_d.get("exposure_min_us", 500)),
+        gain_min=float(norm_cfg_d.get("gain_min", 1.0)),
+        exposure_max_safe_us=int(norm_cfg_d.get("exposure_max_safe_us", norm_cfg_d.get("exposure_max_us", 4000))),
+        gain_max_safe=float(norm_cfg_d.get("gain_max_safe", norm_cfg_d.get("gain_max", 2.0))),
+        allow_extend=bool(norm_cfg_d.get("allow_extend", True)),
+        exposure_max_extended_us=int(norm_cfg_d.get("exposure_max_extended_us", 12000)),
+        gain_max_extended=float(norm_cfg_d.get("gain_max_extended", 4.0)),
+        extend_trigger_roi_mean_dn=float(norm_cfg_d.get("extend_trigger_roi_mean_dn", 20.0)),
+        extend_requires_clip_below=float(norm_cfg_d.get("extend_requires_clip_below", 0.0)),
+        max_iters=int(norm_cfg_d.get("max_iters", 10)),
+        allow_pattern_adjust=bool(norm_cfg_d.get("allow_pattern_adjust", True)),
+        contrast_min=float(norm_cfg_d.get("contrast_min", 0.4)),
+        contrast_max=float(norm_cfg_d.get("contrast_max", 0.8)),
+        brightness_offset_min=float(norm_cfg_d.get("brightness_offset_min", 0.40)),
+        brightness_offset_max=float(norm_cfg_d.get("brightness_offset_max", 0.55)),
+        min_intensity=float(norm_cfg_d.get("min_intensity", 0.10)),
+        warmup_ms=int(norm_cfg_d.get("warmup_ms", 250)),
+        settle_ms=int(norm_cfg_d.get("settle_ms", 200)),
+        flush_frames=int(norm_cfg_d.get("flush_frames", 2)),
+        calib_white_dn=int(norm_cfg_d.get("calib_white_dn", 230)),
+    )
+
+
+def _defect2d_processing_config(args, cfg: dict):
+    d2_cfg = cfg.get("defect2d", {}) or {}
+    proc_cfg = d2_cfg.get("processing", {}) or {}
+    out = defect2d_config_from_dict(proc_cfg)
+    threshold_auto = getattr(args, "threshold_auto", None)
+    if threshold_auto is not None:
+        out.threshold_auto = bool(threshold_auto)
+    save_heatmap = getattr(args, "save_heatmap", None)
+    if save_heatmap is not None:
+        out.save_heatmap = bool(save_heatmap)
+    return out
+
+
+def _defect2d_capture_config(args, cfg: dict):
+    d2_cfg = cfg.get("defect2d", {}) or {}
+    cap_cfg = d2_cfg.get("capture", {}) or {}
+    out = defect2d_capture_config_from_dict(cap_cfg)
+    if getattr(args, "use_averaging", None) is not None:
+        out.use_averaging = bool(args.use_averaging)
+    if getattr(args, "stack_size", None) is not None:
+        out.stack_size = max(1, int(args.stack_size))
+    if getattr(args, "inspection_dn", None) is not None:
+        out.inspection_dn = int(max(0, min(255, int(args.inspection_dn))))
+    if getattr(args, "settle_ms", None) is not None:
+        out.settle_ms = max(0, int(args.settle_ms))
+    if getattr(args, "flush_frames", None) is not None:
+        out.flush_frames = max(0, int(args.flush_frames))
+    if getattr(args, "auto_normalise", None) is not None:
+        out.auto_normalise = bool(args.auto_normalise)
+    if getattr(args, "save_debug", None) is not None:
+        out.save_debug = bool(args.save_debug)
+    out.projector_screen_index = (cfg.get("display", {}) or {}).get("screen_index")
+    return out
+
+
 def _postmask_config(cfg: dict) -> dict:
     return cfg.get("phase", {}).get("postmask_cleanup", {}) or {}
 
@@ -274,6 +390,86 @@ def cmd_scan(args) -> int:
             break
         time.sleep(0.2)
 
+    return 0
+
+
+def cmd_run_2d_defect(args) -> int:
+    cfg = _load_config()
+    store = RunStore(root=cfg.get("storage", {}).get("run_root", "data/runs"))
+    roi_cfg = _roi_config(cfg)
+    defect_cfg = _defect2d_processing_config(args, cfg)
+    capture_cfg = _defect2d_capture_config(args, cfg)
+    params = _build_params(args, cfg)
+    params.scan_mode = DEFECT_2D_MODE
+    params.n_steps = capture_cfg.stack_size if capture_cfg.use_averaging else 1
+    params.frequency = 0.0
+    params.frequencies = [0.0]
+    params.orientation = "vertical"
+    params.auto_normalise = bool(capture_cfg.auto_normalise)
+    # Lock auto-normalisation to the same uniform-light level used for final inspection.
+    params.brightness_offset = float(capture_cfg.inspection_dn) / 255.0
+    params.contrast = 0.0
+    params.min_intensity = params.brightness_offset
+
+    reference_path = Path(args.reference) if getattr(args, "reference", None) else None
+    if reference_path is not None and not reference_path.exists():
+        raise SystemExit(f"Reference image not found: {reference_path}")
+
+    input_path = Path(args.input) if getattr(args, "input", None) else None
+    if input_path is not None:
+        if not input_path.exists():
+            raise SystemExit(f"Input image not found: {input_path}")
+        from PIL import Image
+
+        with Image.open(input_path) as im:
+            params.resolution = (int(im.width), int(im.height))
+        params.n_steps = 1
+        metrics = run_existing_image_defect2d(
+            input_path,
+            store,
+            params,
+            roi_cfg,
+            defect_cfg,
+            reference_path=reference_path,
+            save_debug=bool(capture_cfg.save_debug),
+        )
+    else:
+        display = PygameProjectorDisplay()
+        camera = _camera_from_cfg(cfg)
+        metrics = capture_and_run_defect2d(
+            display=display,
+            camera=camera,
+            store=store,
+            params=params,
+            roi_cfg=roi_cfg,
+            defect_cfg=defect_cfg,
+            capture_cfg=capture_cfg,
+            normalise_cfg=_normalise_config(cfg),
+            reference_path=reference_path,
+        )
+
+    run_dir_value = metrics.get("run_dir")
+    if run_dir_value:
+        try:
+            meta = store.load_meta(Path(str(run_dir_value)))
+            meta.cmdline = "python -m fringe_app " + " ".join(sys.argv[1:])
+            meta.invoked_command = "run-2d-defect"
+            store.save_meta(Path(str(run_dir_value)), meta)
+        except Exception:
+            pass
+
+    summary = {
+        "ok": True,
+        "mode": DEFECT_2D_MODE,
+        "run_id": metrics.get("run_id"),
+        "run_dir": metrics.get("run_dir"),
+        "output_dir": str(Path(str(metrics.get("run_dir"))) / "2d_defect") if metrics.get("run_dir") else None,
+        "defect_area_percent": metrics.get("defect_area_percent"),
+        "defect_region_count": metrics.get("defect_region_count"),
+        "average_defect_size_px": metrics.get("average_defect_size_px"),
+        "outputs": metrics.get("outputs"),
+    }
+    print(json.dumps(summary, indent=2))
     return 0
 
 
@@ -1998,6 +2194,40 @@ def cmd_projector_calibrate_v2(args) -> int:
     return 0
 
 
+def cmd_calibrate_camera(args) -> int:
+    cfg = _load_config()
+    manager = _camera_calibration_manager(cfg)
+    session_id = str(getattr(args, "session", "") or "").strip()
+    if not session_id:
+        raise SystemExit("--session is required")
+    intrinsics = manager.calibrate(session_id)
+    print(f"session={session_id}")
+    print(f"rms={float(intrinsics.get('rms', float('nan'))):.6f}")
+    print(f"captures_found={int(intrinsics.get('captures_found', 0))}")
+    print(f"views_used={int(intrinsics.get('views_used', 0))}")
+    print(f"intrinsics_latest={Path(manager.root) / 'intrinsics_latest.json'}")
+    return 0
+
+
+def cmd_calibrate_projector(args) -> int:
+    # Stable default is projector calibration v2; legacy remains opt-in.
+    if bool(getattr(args, "legacy", False)):
+        legacy_args = argparse.Namespace(
+            session=str(args.session),
+            prune=bool(getattr(args, "prune", False)),
+            refine_uv=bool(getattr(args, "refine_uv", False)),
+            recalibrate=bool(getattr(args, "recalibrate", False)),
+            report_only=bool(getattr(args, "report_only", False)),
+        )
+        return int(cmd_projector_calibrate(legacy_args))
+
+    v2_args = argparse.Namespace(
+        session=str(args.session),
+        solve_only=bool(getattr(args, "solve_only", False)),
+    )
+    return int(cmd_projector_calibrate_v2(v2_args))
+
+
 def _print_score(score):
     print(
         f"valid_ratio={score.valid_ratio:.3f} | largest_component_ratio={score.largest_component_ratio:.3f} | "
@@ -2735,6 +2965,29 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--contrast", type=float, default=1.0)
     scan.add_argument("--min-intensity", type=float, default=None)
 
+    defect2d = sub.add_parser("run-2d-defect")
+    defect2d.add_argument("--input", default=None, help="Optional existing image path; skips live capture")
+    defect2d.add_argument("--reference", default=None, help="Optional baseline image for reference subtraction")
+    defect2d.add_argument("--use-averaging", dest="use_averaging", action="store_true", default=None)
+    defect2d.add_argument("--no-averaging", dest="use_averaging", action="store_false")
+    defect2d.add_argument("--stack-size", type=int, default=None)
+    defect2d.add_argument("--save-debug", dest="save_debug", action="store_true", default=None)
+    defect2d.add_argument("--no-save-debug", dest="save_debug", action="store_false")
+    defect2d.add_argument("--threshold-auto", dest="threshold_auto", action="store_true", default=None)
+    defect2d.add_argument("--no-threshold-auto", dest="threshold_auto", action="store_false")
+    defect2d.add_argument("--save-heatmap", dest="save_heatmap", action="store_true", default=None)
+    defect2d.add_argument("--no-heatmap", dest="save_heatmap", action="store_false")
+    defect2d.add_argument("--auto-normalise", dest="auto_normalise", action="store_true", default=None)
+    defect2d.add_argument("--no-auto-normalise", dest="auto_normalise", action="store_false")
+    defect2d.add_argument("--inspection-dn", type=int, default=None)
+    defect2d.add_argument("--settle-ms", type=int, default=180)
+    defect2d.add_argument("--flush-frames", type=int, default=None)
+    defect2d.add_argument("--exposure-us", type=int, default=None)
+    defect2d.add_argument("--gain", "--analogue-gain", dest="gain", type=float, default=None)
+    defect2d.add_argument("--ae-enable", type=lambda v: str(v).lower() in {"1", "true", "yes", "on"}, default=None)
+    defect2d.add_argument("--width", type=int, default=None)
+    defect2d.add_argument("--height", type=int, default=None)
+
     phase = sub.add_parser("phase")
     phase.add_argument("--run", required=True)
 
@@ -2894,14 +3147,44 @@ def build_parser() -> argparse.ArgumentParser:
     pcal_v2.add_argument("--session", required=True)
     pcal_v2.add_argument("--solve-only", action="store_true")
 
+    cam_cal = sub.add_parser("calibrate-camera")
+    cam_cal.add_argument("--session", required=True, help="Camera calibration session id under calibration/camera/sessions")
+
+    proj_cal = sub.add_parser("calibrate-projector")
+    proj_cal.add_argument("--session", required=True, help="Projector calibration session id")
+    proj_cal.add_argument("--solve-only", action="store_true", help="Run solve only (v2 default behavior)")
+    proj_cal.add_argument("--legacy", action="store_true", help="Use legacy projector calibration implementation")
+    proj_cal.add_argument("--prune", action="store_true", help="Legacy-only: enable prune")
+    proj_cal.add_argument("--refine-uv", action="store_true", help="Legacy-only: enable UV refinement")
+    proj_cal.add_argument("--recalibrate", action="store_true", help="Legacy-only: force recalibration")
+    proj_cal.add_argument("--report-only", action="store_true", help="Legacy-only: write reports only")
+
     return p
 
 
 def main(argv: List[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    experimental_cmds = {
+        "autotune-mask",
+        "autotune-capture",
+        "polish-run",
+        "experiment-mask",
+        "quality-state",
+        "audit-run",
+        "projector-calib-diagnose",
+        "projector-selfcheck",
+        "recon-qa",
+    }
+    if args.cmd in experimental_cmds and os.environ.get("FRINGE_ENABLE_EXPERIMENTAL", "0") != "1":
+        raise SystemExit(
+            f"Command '{args.cmd}' is disabled in stable mode. "
+            "Set FRINGE_ENABLE_EXPERIMENTAL=1 to enable experimental commands."
+        )
     if args.cmd == "scan":
         return cmd_scan(args)
+    if args.cmd == "run-2d-defect":
+        return cmd_run_2d_defect(args)
     if args.cmd == "phase":
         return cmd_phase(args)
     if args.cmd == "score":
@@ -2942,5 +3225,9 @@ def main(argv: List[str] | None = None) -> int:
         return cmd_projector_calibrate(args)
     if args.cmd == "projector-calibrate-v2":
         return cmd_projector_calibrate_v2(args)
+    if args.cmd == "calibrate-camera":
+        return cmd_calibrate_camera(args)
+    if args.cmd == "calibrate-projector":
+        return cmd_calibrate_projector(args)
     parser.print_help()
     return 0
