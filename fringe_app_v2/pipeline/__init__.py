@@ -1,0 +1,1 @@
+"""Structured-light pipeline stages."""

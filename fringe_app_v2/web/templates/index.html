@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fringe App v2</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+</head>
+<body>
+  <main class="shell">
+    <section class="feed">
+      <img src="/video" alt="Live camera feed">
+    </section>
+    <aside class="panel">
+      <h1>Fringe App v2</h1>
+      <div class="controls">
+        <button id="captureRoi" type="button">Capture ROI</button>
+        <button id="scan" type="button">Run Structured Scan</button>
+        <button id="full" type="button">Run Full Pipeline</button>
+      </div>
+      <dl class="status">
+        <dt>Pipeline</dt><dd id="pipelineState">idle</dd>
+        <dt>Stage</dt><dd id="stage">idle</dd>
+        <dt>Run</dt><dd id="runId">none</dd>
+        <dt>Calibration</dt><dd id="calibration">checking</dd>
+        <dt>Error</dt><dd id="error">none</dd>
+      </dl>
+    </aside>
+  </main>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

@@ -1,0 +1,53 @@
+{
+  "cfg": {
+    "downscale_max_w": 640,
+    "blur_ksize": 7,
+    "black_bg_percentile": 82.0,
+    "threshold_offset": 22.0,
+    "min_area_ratio": 0.01,
+    "max_area_ratio": 0.5,
+    "close_iters": 1,
+    "open_iters": 2,
+    "fill_holes": true,
+    "ref_method": "median_over_frames",
+    "post_enabled": true,
+    "post_keep_largest_component": true,
+    "post_fill_small_holes": true,
+    "post_max_hole_area": 2000,
+    "post_dilate_radius_px": 10
+  },
+  "bbox": [
+    293,
+    231,
+    418,
+    373
+  ],
+  "bbox_core": [
+    308,
+    246,
+    385,
+    340
+  ],
+  "bbox_dilated": [
+    293,
+    231,
+    418,
+    373
+  ],
+  "area_ratio": 0.14336013793945312,
+  "debug": {
+    "bg_percentile": 82.0,
+    "bg_value": 8.091836929321289,
+    "threshold_offset": 22.0,
+    "threshold": 30.09183692932129,
+    "area_ratio": 0.11230143229166667,
+    "roi_fallback": false,
+    "post": {
+      "enabled": true,
+      "keep_largest_component": true,
+      "fill_small_holes": true,
+      "max_hole_area": 2000,
+      "dilate_radius_px": 10
+    }
+  }
+}

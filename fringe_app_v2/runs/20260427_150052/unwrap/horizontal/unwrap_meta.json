@@ -1,0 +1,35 @@
+{
+  "frequencies": [
+    1.0,
+    4.0,
+    16.0
+  ],
+  "stages": [
+    {
+      "f_low": 1.0,
+      "f_high": 4.0,
+      "ratio": 4.0,
+      "pair_valid_ratio": 0.11067835489908855,
+      "pair_valid_px": 87041
+    },
+    {
+      "f_low": 4.0,
+      "f_high": 16.0,
+      "ratio": 4.0,
+      "pair_valid_ratio": 0.11053721110026042,
+      "pair_valid_px": 86930
+    }
+  ],
+  "phi_min": -11.370137214660645,
+  "phi_max": 114.04764556884766,
+  "valid_ratio": 0.11053721110026042,
+  "unwrap_valid_px": 86930,
+  "residual_rms": 0.39759811758995056,
+  "residual_p50": 0.2195892333984375,
+  "residual_p75": 0.34854888916015625,
+  "residual_p95": 0.6141826510429382,
+  "residual_max_abs": 3.1383440494537354,
+  "residual_gt_1rad_pct": 1.7335787415161625,
+  "residual_p95_threshold": 0.2,
+  "residual_ok": false
+}

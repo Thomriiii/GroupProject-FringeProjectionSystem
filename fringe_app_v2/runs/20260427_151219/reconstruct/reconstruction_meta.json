@@ -1,0 +1,60 @@
+{
+  "camera_intrinsics": "/home/pi/fringe/data/calibration/camera/intrinsics_latest.json",
+  "projector_stereo": "/home/pi/fringe/data/calibration/projector/stereo_latest.json",
+  "camera_size": [
+    1024,
+    768
+  ],
+  "projector_size": [
+    1920,
+    1080
+  ],
+  "valid_uv_points": 86806,
+  "valid_reconstruct_points": 85263,
+  "z_min_m": 0.05,
+  "z_max_m": 5.0,
+  "max_reproj_err_px": 15.0,
+  "height_min_m": 0.35994961857795715,
+  "height_max_m": 2.0570228099823,
+  "height_median_m": 0.6297231912612915,
+  "rejected_by_depth_px": 17,
+  "rejected_by_camera_reproj_px": 1526,
+  "rejected_by_projector_reproj_px": 0,
+  "uv_meta": {
+    "projector_width": 1920,
+    "projector_height": 1080,
+    "frequency_semantics": "cycles_across_dimension",
+    "freq_u": 16.0,
+    "freq_v": 16.0,
+    "cycles_u": 16.0,
+    "cycles_v": 16.0,
+    "phase_origin_u_rad": 0.0,
+    "phase_origin_v_rad": 0.0,
+    "valid_ratio": 0.11037953694661458,
+    "u_min": 2.7629663944244385,
+    "u_max": 1918.9918212890625,
+    "v_min": 0.4284987449645996,
+    "v_max": 1079.0650634765625,
+    "u_p01": 950.0944366455078,
+    "u_p99": 1180.25859375,
+    "v_p01": 343.7982711791992,
+    "v_p99": 762.3937835693359,
+    "u_range": 230.16415710449223,
+    "v_range": 418.5955123901367,
+    "u_edge_pct": 1.1519941017901989e-05,
+    "v_edge_pct": 3.4559823053705965e-05,
+    "u_zero_pct": 0.0,
+    "v_zero_pct": 0.0,
+    "uv_gate_ok": true,
+    "uv_gate_thresholds": {
+      "enabled": true,
+      "min_u_range_px": 40.0,
+      "min_v_range_px": 40.0,
+      "max_edge_pct": 0.1,
+      "max_zero_pct": 0.01,
+      "min_valid_ratio": 0.03
+    },
+    "uv_gate_failed_checks": [],
+    "uv_gate_hints": []
+  }
+}

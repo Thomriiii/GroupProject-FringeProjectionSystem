@@ -1,0 +1,126 @@
+web:
+  host: 0.0.0.0
+  port: 5000
+  debug: false
+
+storage:
+  run_root: fringe_app_v2/runs
+
+camera:
+  type: picamera2
+  mock_data: mock_data
+  lores_yuv_format: i420
+  lores_uv_swap: false
+  preview_fps: 10.0
+
+display:
+  fullscreen: true
+  screen_index: null
+  vsync: true
+  idle_white_enabled: true
+  idle_white_dn: 255
+
+calibration:
+  root: data/calibration
+  camera_intrinsics_path: data/calibration/camera/intrinsics_latest.json
+  projector_stereo_path: data/calibration/projector/stereo_latest.json
+
+scan:
+  width: 1024
+  height: 768
+  n_steps: 8
+  frequencies: [1.0, 4.0, 16.0]
+  frequency_semantics: cycles_across_dimension
+  orientations: [vertical, horizontal]
+  settle_ms: 180
+  settle_ms_first_step: 400
+  settle_ms_freq_switch: 400
+  freq_switch_warmup_ms: 250
+  flush_frames_per_step: 1
+  flush_frames_on_freq_switch: 2
+  save_patterns: false
+  exposure_us: 2000
+  analogue_gain: 1.0
+  awb_enable: false
+  ae_enable: false
+  brightness: 1.0
+  contrast: 0.6
+  brightness_offset: 0.45
+  min_intensity: 0.10
+  phase_origin_rad: 0.0
+
+exposure_lock:
+  enabled: true
+  target_dn: 128.0
+  tolerance_dn: 8.0
+  max_iters: 8
+  min_exposure_us: 500
+  max_exposure_us: 12000
+  min_gain: 1.0
+  max_gain: 4.0
+  settle_ms: 180
+  flush_frames: 2
+
+roi:
+  ref_method: median_over_frames
+  downscale_max_w: 640
+  blur_ksize: 7
+  black_bg_percentile: 82
+  threshold_offset: 22
+  min_area_ratio: 0.01
+  max_area_ratio: 0.50
+  close_iters: 1
+  open_iters: 2
+  fill_holes: true
+  post:
+    enabled: true
+    keep_largest_component: true
+    fill_small_holes: true
+    max_hole_area: 2000
+    dilate_radius_px: 10
+
+phase:
+  sat_low: 0
+  sat_high: 250
+  B_thresh: 7
+  A_min: 15
+  debug_percentiles: [1, 99]
+  postmask_cleanup:
+    enabled: true
+    min_component_area: 200
+    fill_small_holes: true
+    max_hole_area: 200
+  masks:
+    defects:
+      enabled: true
+      keep_largest_component: true
+      dilate_radius_px: 3
+      erosion_radius_px: 0
+    display:
+      enabled: true
+      use_b_smooth: true
+      b_smooth_ksize: 5
+      b_thresh_display: 5
+
+unwrap:
+  use_roi: true
+  mask_post:
+    enabled: true
+    keep_largest_component: true
+    closing_radius_px: 3
+    erosion_radius_px: 2
+    min_area_px: 5000
+    b_thresh_unwrap: 0
+
+uv_gate:
+  enabled: true
+  min_u_range_px: 40.0
+  min_v_range_px: 40.0
+  max_edge_pct: 0.10
+  max_zero_pct: 0.01
+  min_valid_ratio: 0.03
+
+reconstruction:
+  z_min_m: 0.05
+  z_max_m: 5.0
+  max_reproj_err_px: 15.0
