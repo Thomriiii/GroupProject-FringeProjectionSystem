@@ -49,6 +49,14 @@ scan:
   min_intensity: 0.10
   phase_origin_rad: 0.0
 
+gamma: 2.2
+
+phase_quality:
+  min_modulation: 10
+  min_intensity: 5
+  max_intensity: 250
+  calibration_fail_on_mismatch: false
+
 exposure_lock:
   enabled: true
   target_dn: 128.0
@@ -62,6 +70,16 @@ exposure_lock:
   flush_frames: 2
 
 roi:
+  method: not_dark
+  border_width_px: 24
+  background_percentile: 80
+  gray_offset: 6
+  max_channel_offset: 8
+  min_foreground_gray: 12
+  min_foreground_max_channel: 16
+  sigma_px: 1.5
+  close_radius_px: 3
+  open_radius_px: 1
   ref_method: median_over_frames
   downscale_max_w: 640
   blur_ksize: 7
@@ -77,7 +95,7 @@ roi:
     keep_largest_component: true
     fill_small_holes: true
     max_hole_area: 2000
-    dilate_radius_px: 10
+    dilate_radius_px: 12
 
 phase:
   sat_low: 0
@@ -108,7 +126,7 @@ unwrap:
     enabled: true
     keep_largest_component: true
     closing_radius_px: 3
-    erosion_radius_px: 2
+    erosion_radius_px: 1
     min_area_px: 5000
     b_thresh_unwrap: 0
 
@@ -124,3 +142,106 @@ reconstruction:
   z_min_m: 0.05
   z_max_m: 5.0
   max_reproj_err_px: 15.0
+  min_component_px: 50
+  sor_enabled: true
+  sor_k: 20
+  sor_std_multiplier: 3.0
+
+enable_flatten: true
+flatten_sigma: 8
+
+turntable:
+  enabled: false
+  ip: null              # ESP8266 IP on local network (e.g. 192.168.0.50)
+  port: 80
+  timeout_s: 10.0
+  settle_ms: 600        # ms to wait after rotation before scanning
+  auto_discover: true   # nmap scan on startup when no ip is set
+
+multi_scan:
+  angles_deg: [0, 90, 180, 270]
+  rotation_sign: -1.0    # +1 = CW positive, -1 = CCW positive; calibrated from latest merged scan
+  rotation_axis_vector: [-0.045275, 0.439239, 0.897229]  # calibrated tilted axis direction, session 20260501_135837
+  axis_x_m: -0.04755     # rotation axis X in camera coords m — from turntable cal session 20260501_135837
+  axis_y_m: -0.05557     # rotation axis Y in camera coords m — from turntable cal session 20260501_135837
+  axis_z_m: null         # use each merged set's mean depth
+  axis_from_top:
+    enabled: false
+    side: max
+    percentile: 95.0
+    min_points: 500
+  axis_from_edges:
+    enabled: true
+    max_shift_m: 0.015
+    coarse_steps: 7
+    sample_points: 3000
+    seed: 1
+  refine_icp:
+    enabled: false
+    max_points: 15000
+    max_iterations: 30
+    max_correspondence_m: 0.010  # 10 mm — covers the ~2-3 mm step-angle residual with margin
+    max_rotation_deg: 2.0        # tight: coarse rotation is already within ~1 deg
+    max_translation_m: 0.010     # tight: residual translation is <5 mm
+    min_pairs: 300
+    seed: 0
+    top_anchor:
+      enabled: false
+      max_translation_m: 0.01
+
+defect:
+  smoothing: 12
+  depth_threshold_mm: 1.5
+  min_area_px: 30
+  mm_per_pixel: 0.165
+  open_radius_px: 1
+  close_radius_px: 2
+  boundary_exclusion_px: 12
+  max_area_px: 0
+  max_area_fraction: 0.005
+  max_area_floor_px: 500
+  edge_suppression_enabled: true
+  edge_percentile: 90
+  edge_exclusion_radius_px: 12
+  edge_overlap_reject: 0.25
+  linear_aspect_ratio: 4.0
+  linear_max_minor_mm: 0.0
+  point_aspect_min: 0.8
+  point_max_major_mm: 5.0
+
+turntable_calibration:
+  enabled: true
+  nominal_step_deg: 15
+  total_degrees: 360
+  storage_root: data/turntable/sessions
+
+  board:
+    squares_x: 9
+    squares_y: 7
+    square_length_m: 0.010
+    marker_length_m: 0.0075
+    dict_name: DICT_4X4_50
+    dpi: 300
+    add_center_mark: true
+    add_scale_bar: true
+
+  charuco:
+    dict: DICT_4X4_50
+    squares_x: 9
+    squares_y: 7
+    square_length_m: 0.010
+    marker_length_m: 0.0075
+    min_corners: 6
+    max_reprojection_error_px: 2.0
+
+  camera:
+    exposure_us: 15000
+    analogue_gain: 4.0
+    awb_enable: true
+    settle_ms: 300          # wait after applying controls before first capture
+
+  capture:
+    settle_ms_after_rotation: 300
+
+  inspection_2d:
+    output_root: data/inspection_2d/sessions

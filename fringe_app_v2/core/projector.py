@@ -9,7 +9,7 @@ from typing import Any
 
 import numpy as np
 
-from fringe_app.display.pygame_display import PygameProjectorDisplay
+from fringe_app_v2.core.pygame_display import PygameProjectorDisplay
 
 
 @dataclass(slots=True)

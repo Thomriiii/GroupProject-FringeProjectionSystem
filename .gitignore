@@ -6,5 +6,5 @@ __pycache__/
 mock_data/
 scripts/
 docs/
-!new_app/docs/
-!new_app/docs/system_analysis.md
+fringe_app_v2/runs/**
+.claude

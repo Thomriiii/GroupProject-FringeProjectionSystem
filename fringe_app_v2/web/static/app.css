@@ -5,9 +5,7 @@
   color: #f2f2f2;
 }
 
-* {
-  box-sizing: border-box;
-}
+* { box-sizing: border-box; }
 
 body {
   margin: 0;
@@ -38,6 +36,7 @@ body {
   border-left: 1px solid #2e2e2e;
   padding: 24px;
   background: #181818;
+  overflow-y: auto;
 }
 
 h1 {
@@ -45,6 +44,22 @@ h1 {
   font-size: 22px;
   font-weight: 650;
 }
+
+h2 {
+  margin: 0 0 12px;
+  font-size: 14px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #888;
+}
+
+.section-divider {
+  border-top: 1px solid #2e2e2e;
+  margin: 24px 0;
+}
+
+/* ── buttons ─────────────────────────────────────────────── */
 
 .controls {
   display: grid;
@@ -61,40 +76,87 @@ button {
   min-height: 42px;
   font: inherit;
   cursor: pointer;
+  transition: background 0.12s;
 }
 
-button:hover {
-  background: #333;
-}
+button:hover  { background: #333; }
+button:active { background: #3a3a3a; }
 
 button:disabled {
   cursor: wait;
   opacity: 0.55;
 }
 
+button.busy {
+  opacity: 0.7;
+  cursor: wait;
+}
+
+/* ── status grid ─────────────────────────────────────────── */
+
 .status {
   display: grid;
-  grid-template-columns: 104px minmax(0, 1fr);
-  gap: 10px 12px;
-  margin: 0;
+  grid-template-columns: 88px minmax(0, 1fr);
+  gap: 8px 12px;
+  margin: 0 0 0;
   font-size: 14px;
 }
 
-dt {
-  color: #aaa;
+dt { color: #aaa; }
+dd { margin: 0; overflow-wrap: anywhere; }
+
+/* ── turntable section ───────────────────────────────────── */
+
+.tt-connect {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 14px;
 }
 
-dd {
-  margin: 0;
-  overflow-wrap: anywhere;
+#ttIpInput {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid #444;
+  border-radius: 6px;
+  background: #222;
+  color: #fff;
+  font: inherit;
+  font-size: 14px;
 }
+
+#ttIpInput:focus {
+  outline: none;
+  border-color: #666;
+}
+
+.tt-connect-buttons {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.tt-info {
+  margin-bottom: 16px;
+}
+
+.tt-controls {
+  margin-top: 0;
+}
+
+/* status pill colours */
+.status-connected    { color: #4ade80; }
+.status-discovering  { color: #facc15; }
+.status-disconnected { color: #f87171; }
+.status-not_found    { color: #f87171; }
+.status-error        { color: #f87171; }
+
+/* ── responsive ──────────────────────────────────────────── */
 
 @media (max-width: 760px) {
   .shell {
     grid-template-columns: 1fr;
     grid-template-rows: 60vh auto;
   }
-
   .panel {
     border-left: 0;
     border-top: 1px solid #2e2e2e;

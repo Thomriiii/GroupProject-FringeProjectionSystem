@@ -11,9 +11,9 @@ from typing import Any, Iterator
 import numpy as np
 from PIL import Image
 
-from fringe_app.camera.mock import MockCamera
-from fringe_app.camera.picamera2_impl import Picamera2Camera
-from fringe_app.core.models import ScanParams
+from fringe_app_v2.core.camera_mock import MockCamera
+from fringe_app_v2.core.camera_picamera2 import Picamera2Camera
+from fringe_app_v2.core.models import ScanParams
 
 
 @dataclass(slots=True)

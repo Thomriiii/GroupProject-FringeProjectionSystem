@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 
 import fringe_app_v2
-from fringe_app.uv import phase_to_uv
+from fringe_app_v2.pipeline.phase_to_projector import phase_to_projector_coords
 from fringe_app_v2.utils.io import load_yaml
 
 
@@ -195,22 +195,21 @@ class CalibrationService:
         recon_cfg: dict[str, Any] | None = None,
         uv_gate_cfg: dict[str, Any] | None = None,
     ) -> tuple[Any, WorldMap]:
-        uv = phase_to_uv(
-            phi_abs_vertical=phase_vertical,
-            phi_abs_horizontal=phase_horizontal,
-            freq_u=freq_u,
-            freq_v=freq_v,
-            proj_width=self.projector.projector_size[0],
-            proj_height=self.projector.projector_size[1],
-            mask_u=mask_vertical,
-            mask_v=mask_horizontal,
-            roi_mask=roi_mask,
+        uv = phase_to_projector_coords(
+            phi_horizontal=phase_horizontal,
+            phi_vertical=phase_vertical,
+            mask_horizontal=mask_horizontal,
+            mask_vertical=mask_vertical,
+            projector_width=self.projector.projector_size[0],
+            projector_height=self.projector.projector_size[1],
+            frequency_u=freq_u,
+            frequency_v=freq_v,
             frequency_semantics=frequency_semantics,
             phase_origin_u_rad=phase_origin_u_rad,
             phase_origin_v_rad=phase_origin_v_rad,
-            gate_cfg=uv_gate_cfg or {},
+            roi_mask=roi_mask,
         )
-        world = triangulate_uv_maps(self.camera, self.projector, uv.u, uv.v, uv.mask_uv, recon_cfg or {})
+        world = triangulate_uv_maps(self.camera, self.projector, uv.u, uv.v, uv.mask, recon_cfg or {})
         world.meta["uv_meta"] = uv.meta
         return uv, world
 

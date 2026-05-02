@@ -8,11 +8,12 @@ from typing import Any
 
 import numpy as np
 
-from fringe_app.core.models import ScanParams
+from fringe_app_v2.core.models import ScanParams
 
 from fringe_app_v2.core.camera import CameraService
 from fringe_app_v2.core.patterns import PatternService
 from fringe_app_v2.core.projector import ProjectorService
+from fringe_app_v2.phase_quality.gamma import apply_gamma, gamma_from_config
 from fringe_app_v2.utils.io import RunPaths, freq_tag, save_image, write_json
 
 
@@ -34,6 +35,7 @@ def run_structured_capture(
     flush_step = int(scan.get("flush_frames_per_step", 1))
     flush_switch = int(scan.get("flush_frames_on_freq_switch", 2))
     save_patterns = bool(scan.get("save_patterns", params.save_patterns))
+    gamma = gamma_from_config(config)
     captured: list[dict[str, Any]] = []
 
     for orientation in orientations:
@@ -49,12 +51,13 @@ def run_structured_capture(
                 time.sleep(max(warmup_ms, switch_ms) / 1000.0)
                 camera.flush(flush_switch)
             for step, pattern in enumerate(sequence):
-                projector.show_gray(pattern)
+                display_pattern = apply_gamma(pattern, gamma)
+                projector.show_gray(display_pattern)
                 time.sleep((first_ms if step == 0 else settle_ms) / 1000.0)
                 frame = camera.capture(flush_frames=flush_step)
                 save_image(capture_dir / f"step_{step:03d}.png", frame)
                 if save_patterns:
-                    save_image(pattern_dir / f"pattern_{step:03d}.png", pattern)
+                    save_image(pattern_dir / f"pattern_{step:03d}.png", display_pattern)
                 captured.append(
                     {
                         "orientation": orientation,
@@ -71,6 +74,7 @@ def run_structured_capture(
         "n_steps": int(params.n_steps),
         "frequency_semantics": params.frequency_semantics,
         "phase_origin_rad": float(params.phase_origin_rad),
+        "gamma": gamma,
         "captures": captured,
     }
     write_json(run.structured / "structured_meta.json", meta)

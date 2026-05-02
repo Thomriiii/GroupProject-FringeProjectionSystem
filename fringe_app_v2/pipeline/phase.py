@@ -7,16 +7,18 @@ from typing import Any
 
 import numpy as np
 
-from fringe_app.core.models import ScanParams
-from fringe_app.phase import visualize
-from fringe_app.phase.masking_post import (
+from fringe_app_v2.core.models import ScanParams
+from fringe_app_v2.core import phase_viz as visualize
+from fringe_app_v2.core.masking import (
     build_mask_for_defects,
     build_mask_for_display,
     build_unwrap_mask,
     cleanup_mask,
 )
-from fringe_app.phase.psp import PhaseShiftProcessor, PhaseThresholds, PhaseResult
+from fringe_app_v2.core.psp import PhaseShiftProcessor, PhaseThresholds, PhaseResult
 
+from fringe_app_v2.phase_quality.diagnostics import save_wrapped_phase_diagnostics
+from fringe_app_v2.phase_quality.validation import save_phase_quality_validation
 from fringe_app_v2.utils.io import RunPaths, freq_tag, load_image_stack, save_mask_png, sorted_step_images, write_json
 
 
@@ -56,8 +58,9 @@ def run_phase_stage(
                 raise FileNotFoundError(
                     f"Expected {params.n_steps} captures in {run.structured / orientation / tag}, found {len(image_paths)}"
                 )
+            images = load_image_stack(image_paths)
             result = processor.compute_phase(
-                load_image_stack(image_paths),
+                images,
                 orient_params,
                 thresholds,
                 roi_mask=roi_mask,
@@ -65,6 +68,16 @@ def run_phase_stage(
             _apply_mask_policies(result, thresholds, roi_mask, config)
             out_dir = run.phase / orientation / tag
             _save_phase_result(out_dir, result)
+            quality_dir = run.phase_quality / "validation" / orientation / tag
+            result.debug["phase_quality"] = save_phase_quality_validation(quality_dir, images, config, roi_mask=roi_mask)
+            diag_dir = run.phase_quality / "diagnostics"
+            result.debug["phase_diagnostics"] = save_wrapped_phase_diagnostics(
+                diag_dir,
+                result.phi_wrapped,
+                result.mask_for_display,
+                f"{orientation}_{tag}",
+            )
+            write_json(out_dir / "phase_meta.json", result.debug)
             summaries[orientation][tag] = result.debug
 
     write_json(run.phase / "phase_summary.json", summaries)

@@ -15,7 +15,17 @@ from PIL import Image
 from .math_utils import json_safe
 
 
-RUN_SUBDIRS = ("raw", "roi", "structured", "phase", "unwrap", "reconstruct")
+RUN_SUBDIRS = (
+    "raw",
+    "roi",
+    "structured",
+    "phase",
+    "phase_quality",
+    "unwrap",
+    "reconstruct",
+    "flatten",
+    "defect",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,8 +36,11 @@ class RunPaths:
     roi: Path
     structured: Path
     phase: Path
+    phase_quality: Path
     unwrap: Path
     reconstruct: Path
+    flatten: Path
+    defect: Path
 
 
 def load_yaml(path: Path) -> dict[str, Any]:
@@ -77,8 +90,11 @@ def create_run(root: Path) -> RunPaths:
         roi=run_root / "roi",
         structured=run_root / "structured",
         phase=run_root / "phase",
+        phase_quality=run_root / "phase_quality",
         unwrap=run_root / "unwrap",
         reconstruct=run_root / "reconstruct",
+        flatten=run_root / "flatten",
+        defect=run_root / "defect",
     )
     for name in RUN_SUBDIRS:
         (run_root / name).mkdir(parents=True, exist_ok=True)

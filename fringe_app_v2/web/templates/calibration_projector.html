@@ -1,0 +1,368 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Projector Calibration</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+  <style>
+    body { font-family: monospace; background: #111; color: #ddd; margin: 0; }
+    main { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 16px; max-width: 1400px; margin: 0 auto; }
+    @media (max-width: 800px) { main { grid-template-columns: 1fr; } }
+    h1 { margin: 0 0 4px 0; font-size: 1.2em; }
+    h2 { margin: 12px 0 6px 0; font-size: 1em; border-bottom: 1px solid #333; padding-bottom: 4px; }
+    header { display: flex; align-items: center; gap: 16px; padding: 12px 16px; background: #1a1a1a; border-bottom: 1px solid #333; }
+    header a { color: #88f; text-decoration: none; font-size: 0.85em; }
+    .panel { background: #1a1a1a; border: 1px solid #333; border-radius: 6px; padding: 12px; margin-bottom: 12px; }
+    button { background: #224; color: #aaf; border: 1px solid #446; border-radius: 4px; padding: 6px 14px; cursor: pointer; font-family: monospace; font-size: 0.9em; }
+    button:disabled { opacity: 0.4; cursor: default; }
+    button:hover:not(:disabled) { background: #334; }
+    .btn-primary { background: #142; color: #6f6; border-color: #264; }
+    .btn-primary:hover:not(:disabled) { background: #1a4; }
+    .btn-danger { background: #421; color: #f86; border-color: #642; font-size: 0.8em; padding: 3px 8px; }
+    select { background: #2a2a2a; color: #ddd; border: 1px solid #444; border-radius: 4px; padding: 4px 8px; font-family: monospace; }
+    .controls { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; align-items: center; }
+    .status-bar { padding: 6px 10px; background: #222; border-radius: 4px; font-size: 0.85em; margin-bottom: 8px; }
+    .error-bar { padding: 6px 10px; background: #320; border-radius: 4px; font-size: 0.85em; color: #f86; display: none; margin-bottom: 8px; }
+    .pill { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 0.78em; font-weight: bold; }
+    .pill-good { background: #1a3a1a; color: #6f6; }
+    .pill-bad { background: #3a1a1a; color: #f66; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
+    th, td { padding: 5px 8px; text-align: left; border-bottom: 1px solid #2a2a2a; }
+    th { color: #888; font-weight: normal; }
+    img.preview { width: 100%; border: 1px solid #333; border-radius: 4px; }
+    img.overlay-img { width: 100%; border: 1px solid #333; border-radius: 4px; margin-top: 6px; }
+    .results { background: #151515; border: 1px solid #333; border-radius: 4px; padding: 10px; margin-top: 8px; display: none; }
+    .results dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; }
+    .results dt { color: #888; }
+    .results dd { margin: 0; }
+    .coverage-bar { display: flex; gap: 4px; flex-wrap: wrap; margin: 4px 0; }
+    .cov-bin { width: 28px; height: 28px; border-radius: 3px; border: 1px solid #333; display: inline-block; }
+    .cov-filled { background: #264; }
+    .cov-empty { background: #1a1a1a; }
+    .hint-list { margin: 4px 0; padding: 0; list-style: none; }
+    .hint-list li { color: #fa4; font-size: 0.82em; margin-bottom: 2px; }
+    .hint-list li::before { content: "⚠ "; }
+    .spinner { display: none; }
+    .spinner.active { display: inline; }
+    a.dl-link { color: #88f; font-size: 0.85em; display: none; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>Projector Calibration</h1>
+  <a href="/">← Back to Pipeline</a>
+</header>
+
+<main>
+
+  <!-- LEFT: Live preview + session + capture -->
+  <div>
+    <div class="panel">
+      <h2>Live Preview</h2>
+      <img class="preview" src="/video" alt="camera feed">
+
+      <div style="margin-top:10px;">
+        <h2>Session</h2>
+        <p style="color:#888;font-size:0.82em;margin:0 0 6px 0;">
+          Requires camera intrinsics. Run Camera Calibration first if not done.
+        </p>
+        <div class="controls">
+          <button id="newSessionBtn" class="btn-primary">New Session</button>
+        </div>
+        <div class="controls">
+          <select id="sessionSelect" style="flex:1;">
+            <option value="">— select existing session —</option>
+          </select>
+          <button id="loadSessionBtn">Load</button>
+        </div>
+        <div class="status-bar" id="statusBar">No session loaded.</div>
+        <div class="error-bar" id="errorBar"></div>
+      </div>
+
+      <div style="margin-top:10px;">
+        <h2>Capture View</h2>
+        <p style="color:#888;font-size:0.82em;margin:0 0 6px 0;">
+          Place the ChArUco board so it is visible. The projector will project fringe patterns,
+          then white light for board detection. Vary position, distance, and tilt across captures.
+        </p>
+        <div class="controls">
+          <button id="captureBtn" class="btn-primary" disabled>
+            <span id="captureSpinner" class="spinner">⟳ </span>Capture View
+          </button>
+        </div>
+        <div id="lastOverlay" style="margin-top:6px; display:none;">
+          <div style="font-size:0.8em;color:#888;margin-bottom:3px;">Last capture — ChArUco overlay</div>
+          <img class="overlay-img" id="overlayImg" alt="overlay">
+          <div style="font-size:0.8em;color:#888;margin:3px 0;">UV map overlay</div>
+          <img class="overlay-img" id="uvOverlayImg" alt="uv overlay">
+        </div>
+        <div id="lastHints" style="margin-top:6px; display:none;">
+          <ul class="hint-list" id="hintList"></ul>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- RIGHT: Coverage + View list + Solve -->
+  <div>
+    <div class="panel">
+      <h2>Coverage</h2>
+      <div id="coverageDisplay">
+        <div style="color:#888;font-size:0.85em;">No session loaded.</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <h2>Views</h2>
+        <div class="controls" style="margin-bottom:0;">
+          <button id="solveBtn" disabled>Solve Stereo</button>
+          <a class="dl-link" id="downloadLink" href="#">⬇ stereo.json</a>
+        </div>
+      </div>
+      <p id="noViewMsg" style="color:#666;font-size:0.85em;">No views captured yet.</p>
+      <table id="viewTable" style="display:none;">
+        <thead><tr><th>ID</th><th>Status</th><th>Corners</th><th>UV valid</th><th>View</th><th></th></tr></thead>
+        <tbody id="viewTbody"></tbody>
+      </table>
+
+      <div class="results" id="resultsPanel">
+        <h2 style="margin-top:0;">Stereo Result</h2>
+        <div id="resultsContent"></div>
+      </div>
+    </div>
+  </div>
+
+</main>
+
+<script>
+const API = '/api/calibration/projector';
+let currentSession = null;
+
+async function apiPost(url, body) {
+  const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  return r.json();
+}
+async function apiGet(url) { return (await fetch(url)).json(); }
+async function apiDelete(url) { return (await fetch(url, {method:'DELETE'})).json(); }
+
+function setStatus(msg, isError) {
+  document.getElementById('statusBar').textContent = msg;
+  const eb = document.getElementById('errorBar');
+  if (isError) { eb.textContent = msg; eb.style.display = 'block'; }
+  else eb.style.display = 'none';
+}
+
+function pillHtml(status) {
+  return status === 'accepted'
+    ? '<span class="pill pill-good">accepted</span>'
+    : '<span class="pill pill-bad">rejected</span>';
+}
+
+function renderCoverage(cov, indicator) {
+  if (!cov || !cov.visited_bins) {
+    document.getElementById('coverageDisplay').innerHTML =
+      `<div style="color:#888;font-size:0.85em;">${indicator || 'No data'}</div>`;
+    return;
+  }
+  const bins = cov.visited_bins;
+  let binsHtml = '<div class="coverage-bar">';
+  for (const row of bins) {
+    for (const v of row) {
+      binsHtml += `<div class="cov-bin ${v ? 'cov-filled' : 'cov-empty'}" title="${v ? 'visited' : 'empty'}"></div>`;
+    }
+    binsHtml += '<br style="width:100%">';
+  }
+  binsHtml += '</div>';
+
+  const buckets = cov.bucket_counts || [];
+  const minB = cov.min_bucket_counts || [];
+  const tilts = cov.tilt_buckets_deg || [];
+  let tiltHtml = '';
+  if (buckets.length && tilts.length > 1) {
+    tiltHtml = '<div style="font-size:0.82em; margin-top:4px; color:#888;">Tilt buckets: ';
+    buckets.forEach((cnt, i) => {
+      const lo = tilts[i], hi = tilts[i+1];
+      const ok = cnt >= (minB[i] || 0);
+      tiltHtml += `<span style="color:${ok?'#6f6':'#f86'}">${lo}°–${hi ? hi+'°' : '+'}: ${cnt}</span>  `;
+    });
+    tiltHtml += '</div>';
+  }
+
+  const colour = indicator === 'Sufficient coverage' ? '#6f6' : '#fa4';
+  document.getElementById('coverageDisplay').innerHTML = `
+    <div style="color:${colour};font-size:0.9em;margin-bottom:4px;">${indicator}</div>
+    ${binsHtml}${tiltHtml}
+    <div style="font-size:0.8em;color:#888;margin-top:3px;">${cov.bins_filled}/${cov.min_bins_filled} grid bins filled</div>
+    ${(cov.guidance||[]).map(g=>`<div style="font-size:0.8em;color:#888;">${g}</div>`).join('')}
+  `;
+}
+
+function renderViews(views) {
+  const tbody = document.getElementById('viewTbody');
+  const noMsg = document.getElementById('noViewMsg');
+  const table = document.getElementById('viewTable');
+  if (!views || views.length === 0) {
+    table.style.display = 'none'; noMsg.style.display = ''; return;
+  }
+  noMsg.style.display = 'none'; table.style.display = '';
+  tbody.innerHTML = views.map(v => {
+    const n_corners = (v.metrics || {}).corner_count ?? '—';
+    const n_uv = ((v.metrics || {}).corner_count && v.status === 'accepted') ? '✓' : '—';
+    return `<tr>
+      <td>${v.view_id}</td>
+      <td>${pillHtml(v.status)}</td>
+      <td>${n_corners}</td>
+      <td>${n_uv}</td>
+      <td>
+        <button onclick="showView('${currentSession}','${v.view_id}','overlay')" style="padding:2px 8px;font-size:0.75em;">board</button>
+        <button onclick="showView('${currentSession}','${v.view_id}','uv_overlay')" style="padding:2px 8px;font-size:0.75em;">uv</button>
+      </td>
+      <td><button class="btn-danger" onclick="deleteView('${currentSession}','${v.view_id}')">✕</button></td>
+    </tr>`;
+  }).join('');
+}
+
+async function showView(sid, vid, type) {
+  const url = `${API}/session/${sid}/view/${vid}/${type}?t=${Date.now()}`;
+  if (type === 'overlay') {
+    document.getElementById('overlayImg').src = url;
+    document.getElementById('lastOverlay').style.display = '';
+  } else {
+    document.getElementById('uvOverlayImg').src = url;
+    document.getElementById('lastOverlay').style.display = '';
+  }
+}
+
+async function deleteView(sid, vid) {
+  if (!confirm(`Delete view ${vid}?`)) return;
+  await apiDelete(`${API}/session/${sid}/view/${vid}`);
+  await loadSession(sid);
+}
+
+async function loadSessions() {
+  const data = await apiGet(`${API}/sessions`);
+  const sel = document.getElementById('sessionSelect');
+  sel.innerHTML = '<option value="">— select existing session —</option>';
+  (data.sessions || []).forEach(s => {
+    const opt = document.createElement('option');
+    opt.value = s.session_id;
+    opt.textContent = `${s.session_id}  (${s.views_accepted} accepted${s.solved ? ', solved' : ''})`;
+    sel.appendChild(opt);
+  });
+}
+
+async function loadSession(sid) {
+  const data = await apiGet(`${API}/session/${sid}`);
+  if (data.error) { setStatus('Session not found', true); return; }
+  currentSession = sid;
+  const accepted = data.accepted_views || 0;
+  const total = (data.views || []).length;
+  setStatus(`Session: ${sid}  — ${accepted} accepted / ${total} total  — ${data.coverage_indicator}`);
+  document.getElementById('captureBtn').disabled = false;
+  document.getElementById('solveBtn').disabled = accepted < 5;
+  renderViews(data.views || []);
+  renderCoverage(data.coverage, data.coverage_indicator);
+
+  if (data.solve) {
+    showSolveResult(data.solve);
+    document.getElementById('downloadLink').href = `${API}/session/${sid}/stereo_download`;
+    document.getElementById('downloadLink').style.display = '';
+  }
+}
+
+function showSolveResult(solve) {
+  const colour = { raw: '#fa4', pruned: '#6f6' }[solve.selected_model] || '#ddd';
+  document.getElementById('resultsContent').innerHTML = `
+    <dl>
+      <dt>Selected model</dt><dd style="color:${colour}">${solve.selected_model}</dd>
+      <dt>Raw RMS</dt><dd>${solve.raw_rms != null ? solve.raw_rms.toFixed(4)+' px' : '—'}</dd>
+      <dt>Pruned RMS</dt><dd>${solve.pruned_rms != null ? solve.pruned_rms.toFixed(4)+' px' : '—'}</dd>
+      <dt>Views used</dt><dd>${solve.views_used}</dd>
+    </dl>
+    <p style="color:#6f6; margin:8px 0 0 0; font-size:0.85em;">✓ stereo.json saved to export/</p>
+  `;
+  document.getElementById('resultsPanel').style.display = '';
+}
+
+document.getElementById('newSessionBtn').addEventListener('click', async () => {
+  const data = await apiPost(`${API}/session/new`, {});
+  if (data.ok) {
+    await loadSessions();
+    await loadSession(data.session_id);
+    document.getElementById('sessionSelect').value = data.session_id;
+  } else {
+    setStatus('Failed: ' + (data.error || ''), true);
+  }
+});
+
+document.getElementById('loadSessionBtn').addEventListener('click', async () => {
+  const id = document.getElementById('sessionSelect').value;
+  if (!id) { setStatus('Select a session first', true); return; }
+  await loadSession(id);
+});
+
+document.getElementById('captureBtn').addEventListener('click', async () => {
+  if (!currentSession) return;
+  const btn = document.getElementById('captureBtn');
+  const spinner = document.getElementById('captureSpinner');
+  btn.disabled = true;
+  spinner.classList.add('active');
+  setStatus('Running structured-light capture…');
+
+  const data = await apiPost(`${API}/session/${currentSession}/capture`, {});
+
+  btn.disabled = false;
+  spinner.classList.remove('active');
+
+  if (data.ok) {
+    const status = data.status === 'accepted' ? '✓ accepted' : `✗ rejected`;
+    setStatus(`View ${data.view_id}: ${status}  corners=${(data.metrics||{}).corner_count ?? '?'}`);
+
+    // Show overlays
+    document.getElementById('overlayImg').src =
+      `${API}/session/${currentSession}/view/${data.view_id}/overlay?t=${Date.now()}`;
+    document.getElementById('uvOverlayImg').src =
+      `${API}/session/${currentSession}/view/${data.view_id}/uv_overlay?t=${Date.now()}`;
+    document.getElementById('lastOverlay').style.display = '';
+
+    // Show hints if rejected
+    const hints = data.hints || [];
+    const hintList = document.getElementById('hintList');
+    const hintDiv = document.getElementById('lastHints');
+    if (hints.length) {
+      hintList.innerHTML = hints.map(h => `<li>${h}</li>`).join('');
+      hintDiv.style.display = '';
+    } else {
+      hintDiv.style.display = 'none';
+    }
+
+    await loadSession(currentSession);
+  } else {
+    setStatus('Capture failed: ' + (data.error || ''), true);
+  }
+});
+
+document.getElementById('solveBtn').addEventListener('click', async () => {
+  if (!currentSession) return;
+  setStatus('Running stereo solve…');
+  document.getElementById('solveBtn').disabled = true;
+  const data = await apiPost(`${API}/session/${currentSession}/solve`, {});
+  if (data.ok) {
+    showSolveResult(data);
+    document.getElementById('downloadLink').href = `${API}/session/${currentSession}/stereo_download`;
+    document.getElementById('downloadLink').style.display = '';
+    setStatus(`Solve complete — ${data.selected_model} RMS: ${(data[data.selected_model+'_rms']||0).toFixed(4)} px`);
+  } else {
+    setStatus('Solve failed: ' + (data.error || ''), true);
+  }
+  document.getElementById('solveBtn').disabled = false;
+});
+
+loadSessions();
+</script>
+
+</body>
+</html>

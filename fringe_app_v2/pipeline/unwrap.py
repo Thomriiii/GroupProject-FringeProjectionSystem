@@ -6,8 +6,9 @@ from typing import Any
 
 import numpy as np
 
-from fringe_app.unwrap.temporal import unwrap_multi_frequency
+from fringe_app_v2.core.temporal_unwrap import unwrap_multi_frequency
 
+from fringe_app_v2.phase_quality.diagnostics import save_unwrapped_phase_diagnostics
 from fringe_app_v2.utils.io import RunPaths, freq_tag, save_mask_png, write_json
 
 
@@ -42,8 +43,16 @@ def run_unwrap_stage(
         np.save(out_dir / "phi_abs.npy", phi_abs.astype(np.float32))
         np.save(out_dir / "phase_final.npy", phi_abs.astype(np.float32))
         np.save(out_dir / "mask_unwrap.npy", mask_unwrap.astype(bool))
+        np.save(out_dir / "mask_final.npy", mask_unwrap.astype(bool))
         np.save(out_dir / "residual.npy", residual.astype(np.float32))
         save_mask_png(out_dir / "mask_unwrap.png", mask_unwrap)
+        save_mask_png(out_dir / "mask_final.png", mask_unwrap)
+        meta["phase_diagnostics"] = save_unwrapped_phase_diagnostics(
+            run.phase_quality / "diagnostics",
+            phi_abs,
+            mask_unwrap,
+            orientation,
+        )
         write_json(out_dir / "unwrap_meta.json", meta)
         summary[orientation] = meta
 

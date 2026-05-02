@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Turntable Calibration</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+  <style>
+    body { font-family: monospace; background: #111; color: #ddd; margin: 0; }
+    main { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 16px; max-width: 1200px; margin: 0 auto; }
+    @media (max-width: 700px) { main { grid-template-columns: 1fr; } }
+    h1 { margin: 0 0 4px 0; font-size: 1.2em; }
+    h2 { margin: 12px 0 6px 0; font-size: 1em; border-bottom: 1px solid #333; padding-bottom: 4px; }
+    header { display: flex; align-items: center; gap: 16px; padding: 12px 16px; background: #1a1a1a; border-bottom: 1px solid #333; }
+    header a { color: #88f; text-decoration: none; font-size: 0.85em; }
+    .panel { background: #1a1a1a; border: 1px solid #333; border-radius: 6px; padding: 12px; }
+    label { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; font-size: 0.9em; }
+    input[type=number], input[type=text], select { background: #2a2a2a; color: #ddd; border: 1px solid #444; border-radius: 4px; padding: 4px 8px; font-family: monospace; }
+    button { background: #224; color: #aaf; border: 1px solid #446; border-radius: 4px; padding: 6px 14px; cursor: pointer; font-family: monospace; font-size: 0.9em; }
+    button:disabled { opacity: 0.4; cursor: default; }
+    button:hover:not(:disabled) { background: #334; }
+    .btn-primary { background: #142; color: #6f6; border-color: #264; }
+    .btn-primary:hover:not(:disabled) { background: #1a4; }
+    .btn-danger { background: #421; color: #f86; border-color: #642; }
+    .controls { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+    .status-bar { padding: 6px 10px; background: #222; border-radius: 4px; font-size: 0.85em; margin-bottom: 8px; }
+    .error-bar { padding: 6px 10px; background: #320; border-radius: 4px; font-size: 0.85em; color: #f86; display: none; margin-bottom: 8px; }
+    .pill { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 0.78em; font-weight: bold; }
+    .pill-good { background: #1a3a1a; color: #6f6; }
+    .pill-warning { background: #3a2a00; color: #fd0; }
+    .pill-bad { background: #3a1a1a; color: #f66; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
+    th, td { padding: 5px 8px; text-align: left; border-bottom: 1px solid #2a2a2a; }
+    th { color: #888; font-weight: normal; }
+    img.preview { width: 100%; border: 1px solid #333; border-radius: 4px; }
+    img.overlay { width: 100%; border: 1px solid #333; border-radius: 4px; margin-top: 6px; display: none; }
+    .results { background: #151515; border: 1px solid #333; border-radius: 4px; padding: 10px; margin-top: 8px; font-size: 0.85em; display: none; }
+    .results dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; }
+    .results dt { color: #888; }
+    .results dd { margin: 0; }
+    a.download-link { color: #88f; font-size: 0.85em; display: none; }
+    .sessions-select { width: 100%; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>Turntable Calibration</h1>
+  <a href="/">← Back to Pipeline</a>
+</header>
+
+<main>
+
+  <!-- LEFT: Camera + Capture -->
+  <div>
+    <div class="panel">
+      <h2>Live Preview</h2>
+      <img class="preview" src="/video" alt="camera feed">
+
+      <div style="margin-top: 10px;">
+        <h2>Session</h2>
+        <div class="controls">
+          <label>Step (°) <input id="stepInput" type="number" value="15" min="1" max="180" style="width:60px"></label>
+          <button id="newSessionBtn" class="btn-primary">New Session</button>
+        </div>
+        <div class="controls">
+          <select id="sessionSelect" class="sessions-select">
+            <option value="">— select existing session —</option>
+          </select>
+          <button id="loadSessionBtn">Load</button>
+        </div>
+        <div class="status-bar" id="statusBar">No session loaded.</div>
+        <div class="error-bar" id="errorBar"></div>
+      </div>
+
+      <div style="margin-top: 10px;">
+        <h2>Capture Frame</h2>
+        <div class="controls">
+          <label>Angle (°) <input id="angleInput" type="number" value="0" min="0" max="359" step="1" style="width:70px"></label>
+          <button id="captureBtn" class="btn-primary" disabled>Capture</button>
+        </div>
+        <div class="controls" style="margin-top:6px;">
+          <button id="autoCaptureBtn" class="btn-primary" disabled title="Rotates turntable automatically 0°→345° in 15° steps">Auto 360° Capture</button>
+        </div>
+        <div id="autoProgress" style="display:none; margin-top:8px;">
+          <div style="display:flex; justify-content:space-between; font-size:0.8em; margin-bottom:3px;">
+            <span>Auto-capturing…</span><span id="autoProgressText">0 / 24</span>
+          </div>
+          <div style="background:#222; border-radius:4px; height:8px; overflow:hidden;">
+            <div id="autoProgressBar" style="background:#264; height:100%; width:0%; transition:width 0.3s;"></div>
+          </div>
+        </div>
+        <img class="overlay" id="overlayImg" alt="ChArUco overlay">
+      </div>
+    </div>
+  </div>
+
+  <!-- RIGHT: Frame list + Analysis -->
+  <div>
+    <div class="panel">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <h2>Frames</h2>
+        <div class="controls" style="margin-bottom:0;">
+          <button id="analyseBtn" disabled>Analyse</button>
+          <a class="download-link" id="reportLink" href="#" download>⬇ Report</a>
+        </div>
+      </div>
+
+      <table id="frameTable">
+        <thead><tr><th>Angle</th><th>Status</th><th>Corners</th><th>Reproj.</th><th>View</th></tr></thead>
+        <tbody id="frameTbody"></tbody>
+      </table>
+      <p id="noFramesMsg" style="color:#666; font-size:0.85em;">No frames captured yet.</p>
+
+      <div class="results" id="resultsPanel">
+        <h2 style="margin-top:0;">Analysis Results</h2>
+        <div id="resultsContent"></div>
+      </div>
+    </div>
+  </div>
+
+</main>
+
+<script>
+const API = '/api/turntable-cal';
+let currentSession = null;
+
+async function apiPost(url, body) {
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  });
+  return r.json();
+}
+async function apiGet(url) {
+  const r = await fetch(url);
+  return r.json();
+}
+
+function setStatus(msg, isError) {
+  document.getElementById('statusBar').textContent = msg;
+  const eb = document.getElementById('errorBar');
+  if (isError) { eb.textContent = msg; eb.style.display = 'block'; }
+  else eb.style.display = 'none';
+}
+
+function pillHtml(status) {
+  const map = { good: 'pill-good', warning: 'pill-warning', bad: 'pill-bad' };
+  return `<span class="pill ${map[status] || ''}">${status}</span>`;
+}
+
+function renderFrames(frames) {
+  const tbody = document.getElementById('frameTbody');
+  const noMsg = document.getElementById('noFramesMsg');
+  if (!frames || frames.length === 0) {
+    tbody.innerHTML = '';
+    noMsg.style.display = '';
+    return;
+  }
+  noMsg.style.display = 'none';
+  tbody.innerHTML = frames.map(f => {
+    const reproj = f.reprojection_error_px != null ? f.reprojection_error_px.toFixed(2) + ' px' : '—';
+    const label = `angle_${String(Math.round(f.angle_deg)).padStart(3,'0')}`;
+    return `<tr>
+      <td>${f.angle_deg}°</td>
+      <td>${pillHtml(f.status)}</td>
+      <td>${f.n_corners}</td>
+      <td>${reproj}</td>
+      <td><button onclick="showOverlay('${currentSession}','${label}')" style="padding:2px 8px;font-size:0.75em;">overlay</button></td>
+    </tr>`;
+  }).join('');
+}
+
+async function showOverlay(sessionId, label) {
+  const img = document.getElementById('overlayImg');
+  img.src = `${API}/session/${sessionId}/frame/${label}/overlay?t=${Date.now()}`;
+  img.style.display = 'block';
+}
+
+async function loadSessions() {
+  const data = await apiGet(`${API}/sessions`);
+  const sel = document.getElementById('sessionSelect');
+  sel.innerHTML = '<option value="">— select existing session —</option>';
+  (data.sessions || []).forEach(s => {
+    const opt = document.createElement('option');
+    opt.value = s.session_id;
+    opt.textContent = `${s.session_id}  (${s.n_frames} frames${s.analysed ? ', analysed' : ''})`;
+    sel.appendChild(opt);
+  });
+}
+
+async function loadSession(sessionId) {
+  const data = await apiGet(`${API}/session/${sessionId}`);
+  if (data.error) { setStatus('Session not found', true); return; }
+  currentSession = sessionId;
+  setStatus(`Session: ${sessionId}  (${data.n_frames} frames, ${data.n_good} good)`);
+  document.getElementById('captureBtn').disabled = false;
+  document.getElementById('autoCaptureBtn').disabled = false;
+  document.getElementById('analyseBtn').disabled = data.n_frames < 2;
+  renderFrames(data.frames);
+  if (data.analysed) {
+    document.getElementById('reportLink').href = `${API}/session/${sessionId}/report`;
+    document.getElementById('reportLink').style.display = '';
+  }
+}
+
+document.getElementById('newSessionBtn').addEventListener('click', async () => {
+  const step = parseFloat(document.getElementById('stepInput').value) || 15;
+  const data = await apiPost(`${API}/session/new`, { nominal_step_deg: step });
+  if (data.ok) {
+    await loadSessions();
+    await loadSession(data.session_id);
+    document.getElementById('sessionSelect').value = data.session_id;
+  } else {
+    setStatus('Failed to create session: ' + (data.error || ''), true);
+  }
+});
+
+document.getElementById('loadSessionBtn').addEventListener('click', async () => {
+  const id = document.getElementById('sessionSelect').value;
+  if (!id) { setStatus('Select a session first', true); return; }
+  await loadSession(id);
+});
+
+document.getElementById('captureBtn').addEventListener('click', async () => {
+  if (!currentSession) return;
+  const angle = parseFloat(document.getElementById('angleInput').value) || 0;
+  setStatus(`Capturing angle=${angle}°…`);
+  const data = await apiPost(`${API}/session/${currentSession}/capture`, { angle_deg: angle });
+  if (data.ok) {
+    setStatus(`Captured ${angle}°  ${data.status}  corners=${data.n_corners}`);
+    const label = `angle_${String(Math.round(angle)).padStart(3,'0')}`;
+    showOverlay(currentSession, label);
+    document.getElementById('angleInput').value = angle + (parseFloat(document.getElementById('stepInput').value) || 15);
+    await loadSession(currentSession);
+  } else {
+    setStatus('Capture failed: ' + (data.error || ''), true);
+  }
+});
+
+let _autoPollTimer = null;
+
+document.getElementById('autoCaptureBtn').addEventListener('click', async () => {
+  if (!currentSession) return;
+  if (!confirm('This will rotate the turntable automatically through 360°.\nMake sure the turntable is connected and the board is mounted.\n\nContinue?')) return;
+
+  setStatus('Starting auto-capture…');
+  const data = await apiPost(`${API}/session/${currentSession}/capture-auto`, {});
+  if (!data.ok) {
+    setStatus('Auto-capture failed: ' + (data.error || ''), true);
+    return;
+  }
+
+  const total = data.total_frames || 24;
+  document.getElementById('autoProgress').style.display = '';
+  document.getElementById('autoCaptureBtn').disabled = true;
+  document.getElementById('captureBtn').disabled = true;
+  document.getElementById('analyseBtn').disabled = true;
+
+  function updateBar(frame) {
+    const pct = total > 0 ? (frame / total * 100).toFixed(0) : 0;
+    document.getElementById('autoProgressBar').style.width = pct + '%';
+    document.getElementById('autoProgressText').textContent = `${frame} / ${total}`;
+  }
+  updateBar(0);
+
+  _autoPollTimer = setInterval(async () => {
+    const st = await apiGet(`${API}/session/${currentSession}/capture-auto/status`);
+    updateBar(st.frame || 0);
+    setStatus(`Auto-capturing… frame ${st.frame}/${st.total}`);
+    if (st.done) {
+      clearInterval(_autoPollTimer);
+      document.getElementById('autoProgress').style.display = 'none';
+      document.getElementById('autoCaptureBtn').disabled = false;
+      document.getElementById('captureBtn').disabled = false;
+      if (st.error) {
+        setStatus('Auto-capture error: ' + st.error, true);
+      } else {
+        setStatus('Auto-capture complete — analysis done, report ready.');
+        document.getElementById('reportLink').href = `${API}/session/${currentSession}/report`;
+        document.getElementById('reportLink').style.display = '';
+        document.getElementById('resultsPanel').style.display = 'none';
+      }
+      await loadSession(currentSession);
+    }
+  }, 1500);
+});
+
+document.getElementById('analyseBtn').addEventListener('click', async () => {
+  if (!currentSession) return;
+  setStatus('Running analysis…');
+  document.getElementById('analyseBtn').disabled = true;
+  const data = await apiPost(`${API}/session/${currentSession}/analyse`, {});
+  if (data.ok) {
+    const ax = data.axis_fit || {};
+    const al = data.alignment || {};
+    const quality = ax.quality || '?';
+    const qualityColor = {good:'#6f6', warning:'#fd0', bad:'#f66'}[quality] || '#ddd';
+    document.getElementById('resultsContent').innerHTML = `
+      <dl>
+        <dt>Quality</dt><dd style="color:${qualityColor}">${quality}</dd>
+        <dt>Step mean</dt><dd>${(ax.step_mean_deg||0).toFixed(2)}°</dd>
+        <dt>Step std</dt><dd>${(ax.step_std_deg||0).toFixed(2)}°</dd>
+        <dt>Step error</dt><dd>${(ax.step_error_deg||0) >= 0 ? '+' : ''}${(ax.step_error_deg||0).toFixed(2)}°</dd>
+        <dt>Axis X (cam)</dt><dd>${ax.axis_x_camera_m != null ? (ax.axis_x_camera_m*1000).toFixed(1)+' mm' : '—'}</dd>
+        <dt>Axis Y (cam)</dt><dd>${ax.axis_y_camera_m != null ? (ax.axis_y_camera_m*1000).toFixed(1)+' mm' : '—'}</dd>
+        <dt>Alignment pairs</dt><dd>${al.n_ok||0} / ${al.n_pairs||0} OK</dd>
+      </dl>
+    `;
+    document.getElementById('resultsPanel').style.display = '';
+    document.getElementById('reportLink').href = `${API}/session/${currentSession}/report`;
+    document.getElementById('reportLink').style.display = '';
+    setStatus(`Analysis complete — quality: ${quality}`);
+  } else {
+    setStatus('Analysis failed: ' + (data.error || ''), true);
+  }
+  document.getElementById('analyseBtn').disabled = false;
+});
+
+// Init
+loadSessions();
+</script>
+
+</body>
+</html>

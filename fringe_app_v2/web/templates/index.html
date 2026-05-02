@@ -13,18 +13,60 @@
     </section>
     <aside class="panel">
       <h1>Fringe App v2</h1>
+
+      <!-- ── Scan controls ─────────────────────────────────── -->
       <div class="controls">
-        <button id="captureRoi" type="button">Capture ROI</button>
-        <button id="scan" type="button">Run Structured Scan</button>
-        <button id="full" type="button">Run Full Pipeline</button>
+        <button id="captureRoi"  type="button">Capture ROI</button>
+        <button id="scan"        type="button">Run Structured Scan</button>
+        <button id="full"        type="button">Run Full Pipeline + Defects</button>
       </div>
+
       <dl class="status">
         <dt>Pipeline</dt><dd id="pipelineState">idle</dd>
-        <dt>Stage</dt><dd id="stage">idle</dd>
-        <dt>Run</dt><dd id="runId">none</dd>
+        <dt>Stage</dt>   <dd id="stage">idle</dd>
+        <dt>Run</dt>     <dd id="runId">none</dd>
         <dt>Calibration</dt><dd id="calibration">checking</dd>
-        <dt>Error</dt><dd id="error">none</dd>
+        <dt>Error</dt>   <dd id="error">none</dd>
       </dl>
+
+      <!-- ── Turntable ─────────────────────────────────────── -->
+      <div class="section-divider"></div>
+      <h2>Turntable</h2>
+
+      <div class="tt-connect">
+        <input id="ttIpInput" type="text" placeholder="192.168.0.x" spellcheck="false">
+        <div class="tt-connect-buttons">
+          <button id="ttConnect"  type="button">Connect</button>
+          <button id="ttDiscover" type="button">Auto-detect</button>
+        </div>
+      </div>
+
+      <dl class="status tt-info">
+        <dt>Status</dt><dd id="ttStatus">—</dd>
+        <dt>IP</dt>    <dd id="ttIp">—</dd>
+        <dt>Position</dt><dd id="ttPos">—</dd>
+      </dl>
+
+      <div class="controls tt-controls" id="ttControls">
+        <button id="ttHome"      type="button">Home (0°)</button>
+        <button id="multiScan"   type="button">360° Multi-Scan</button>
+      </div>
+
+      <!-- ── Calibration ──────────────────────────────────────── -->
+      <div class="section-divider"></div>
+      <h2>Calibration</h2>
+      <div class="controls">
+        <a href="/camera-calibration" style="text-decoration:none;">
+          <button type="button">Camera Intrinsics</button>
+        </a>
+        <a href="/projector-calibration" style="text-decoration:none;">
+          <button type="button">Projector Stereo</button>
+        </a>
+        <a href="/turntable-calibration" style="text-decoration:none;">
+          <button type="button">Turntable</button>
+        </a>
+      </div>
+
     </aside>
   </main>
   <script src="{{ url_for('static', filename='app.js') }}"></script>

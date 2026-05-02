@@ -6,8 +6,8 @@ from dataclasses import replace
 
 import numpy as np
 
-from fringe_app.core.models import ScanParams
-from fringe_app.patterns.generator import FringePatternGenerator
+from fringe_app_v2.core.models import ScanParams
+from fringe_app_v2.core.pattern_generator import FringePatternGenerator
 
 
 class PatternService:

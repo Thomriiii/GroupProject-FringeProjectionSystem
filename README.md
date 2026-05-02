@@ -1,18 +1,23 @@
-# Fringe App
+# Fringe App v2
 
-Fringe projection system for Raspberry Pi with:
-- synchronized projector pattern display + camera capture
-- multi-frequency PSP (`[1, 4, 16]` default)
-- ROI-aware masking and temporal unwrapping
-- UV correspondence map generation
-- projector stereo calibration (camera ↔ projector)
-- stage-3 triangulation and point cloud export
+Structured-light 3D scanner running on a Raspberry Pi. Projects sinusoidal fringe patterns via a connected projector, captures with a Pi camera, and reconstructs 3D surface geometry using multi-frequency phase-shifting profilometry.
 
-## Requirements
+## Hardware
 
-- Python 3.11+
-- Raspberry Pi camera stack (`libcamera`/`Picamera2`) for hardware capture
-- OpenCV (`cv2`) for checkerboard detection/calibration/triangulation utilities
+- Raspberry Pi (tested on Pi 4/5) with camera module
+- HDMI projector connected as a second display
+- Optional: motorised turntable with ESP8266 Wi-Fi controller
+
+## Algorithm Pipeline
+
+1. **Structured capture** — N-step PSP at 3 frequencies (1, 4, 16 cycles) × 2 orientations (vertical + horizontal)
+2. **Phase extraction** — `atan2(-S, C)` wrapped phase per frequency
+3. **Temporal unwrapping** — coarse→fine multi-frequency unwrap
+4. **ROI detection** — object segmentation on black background
+5. **UV mapping** — absolute phase → projector pixel coordinates
+6. **Triangulation** — ray-ray intersection using stereo calibration (camera ↔ projector)
+7. **Point cloud** — outlier removal, optional multi-scan merge via turntable
+8. **Defect detection** — height-deviation segmentation on flattened surface
 
 ## Install
 
@@ -22,146 +27,158 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-## Run Server
+## Run
 
 ```bash
-python -m fringe_app
+python -m fringe_app_v2
 ```
 
-Pages:
-- Pipeline: `http://<pi-ip>:8000/`
-- Camera calibration: `http://<pi-ip>:8000/calibration`
-- Projector calibration: `http://<pi-ip>:8000/projector-calibration`
-- Reconstruction: `http://<pi-ip>:8000/reconstruction`
+Web UI at `http://<pi-ip>:5000/`
 
-## Core CLI
+| Page | URL |
+|------|-----|
+| Main pipeline | `/` |
+| Camera calibration | `/calibration-camera` |
+| Projector calibration | `/calibration-projector` |
+| Turntable | `/turntable` |
 
-Single-orientation scan:
+## CLI Commands
+
+### Web server
+
 ```bash
-python -m fringe_app scan --n 8 --frequencies 1 4 16 --orientation vertical --settle-ms 150
+python -m fringe_app_v2 [--config path/to/config.yaml] [--host 0.0.0.0] [--port 5000]
 ```
 
-Phase, unwrap, score:
+### Defect / analysis
+
 ```bash
-python -m fringe_app phase --run <run_id>
-python -m fringe_app unwrap --run <run_id> --use-roi auto
-python -m fringe_app score --run <run_id>
+python -m fringe_app_v2 run-defect        --run <run_id>
+python -m fringe_app_v2 run-phase-defect  --run <run_id>
+python -m fringe_app_v2 run-3d-defect     --run <run_id>
+python -m fringe_app_v2 run-height-defect --run <run_id>
+python -m fringe_app_v2 run-scratch-defect --run <run_id>
+python -m fringe_app_v2 run-flatten       --run <run_id>
+python -m fringe_app_v2 run-phase-debug   --run <run_id>
 ```
 
-Safe pipeline (single orientation):
+### Turntable calibration
+
 ```bash
-python -m fringe_app pipeline-run-safe --print-hints
+# Print ChArUco board to physical media
+python -m fringe_app_v2 turntable-print-board --output data/turntable/board.png
+
+# Manual capture sequence (prompt per angle)
+python -m fringe_app_v2 turntable-new-session --step 15
+python -m fringe_app_v2 turntable-capture-sequence --session <session_id>
+
+# Fully automated capture (ESP8266 turntable)
+python -m fringe_app_v2 turntable-capture-auto [--ip 192.168.x.x] [--step 15]
+
+# Analyse session and fit rotation axis
+python -m fringe_app_v2 turntable-analyse --session <session_id>
+python -m fringe_app_v2 turntable-report  --session <session_id>
 ```
 
-UV pipeline (vertical + horizontal + projector UV):
-```bash
-python -m fringe_app pipeline-run-uv --print-hints
-```
+## Calibration Workflows
 
-3D pipeline (UV + triangulation):
-```bash
-python -m fringe_app pipeline-run-3d --print-hints
-```
+### Camera intrinsics (checkerboard)
 
-Reconstruct from an existing UV run:
-```bash
-python -m fringe_app reconstruct --run <run_id>_uv
-```
+1. Open `/calibration-camera` in the web UI
+2. Create a session
+3. Capture ≥10 checkerboard poses from different angles
+4. Click **Calibrate**
 
-Quality state:
-```bash
-python -m fringe_app quality-state --show
-python -m fringe_app quality-state --reset
-```
+Outputs: `data/calibration/camera/intrinsics_latest.json`
 
-## Camera Calibration (Checkerboard)
+### Projector stereo calibration
 
-Workflow:
-1. Open `/calibration`
-2. Create session
-3. Capture checkerboard poses
-4. Calibrate
+1. Open `/calibration-projector` in the web UI
+2. Create or resume a session
+3. Place ChArUco board in view and capture multiple positions
+4. Click **Calibrate**
 
-Saved under:
-- `data/calibration/camera/sessions/<session_id>/...`
-- `data/calibration/camera/intrinsics_latest.json`
-
-Only captures with successful checkerboard detection are used for solving.
-
-## Projector Calibration (Stereo)
-
-Workflow:
-1. Open `/projector-calibration`
-2. Create or continue session
-3. Capture multiple checkerboard views
-4. Run projector stereo calibration
-
-Per-view data includes:
-- camera frame + checkerboard corners
-- UV artifacts (`u.npy`, `v.npy`, `mask_uv.npy`, `uv_meta.json`)
-- camera↔projector corner correspondences
-- diagnostics (`view_diag.json`, corner validity overlays)
-
-Calibration outputs:
-- `data/calibration/projector/sessions/<session_id>/results/stereo.json`
-- `data/calibration/projector/sessions/<session_id>/results/stereo.npz`
+Per-view data saved under `data/calibration/projector/sessions/<session_id>/views/`.
+Outputs:
 - `data/calibration/projector/stereo_latest.json`
+- `data/calibration/projector/stereo_latest.npz`
 
-## Reconstruction Outputs
+### Turntable axis calibration
 
-For UV run `data/runs/<run_id>_uv/`:
+Run `turntable-capture-auto` or `turntable-capture-sequence`, then `turntable-analyse`. The fitted axis vector and translation are written to:
+- `data/turntable/sessions/<session_id>/axis_fit.json`
+- `data/turntable/sessions/<session_id>/alignment.json`
 
-`reconstruction/`
-- `xyz.npy` (H×W×3, NaN invalid)
-- `xyzrgb.npy` (optional exported xyz+rgb points)
-- `depth.npy`
-- `depth_debug_fixed.png`
-- `depth_debug_autoscale.png`
-- `cloud.ply`
-- `reprojection errors` (`reproj_err_cam.npy`, `reproj_err_proj.npy`)
-- `reconstruction_meta.json`
-- `masks/mask_uv.npy|png`, `masks/mask_recon.npy|png`
-
-Triangulation is done in the camera coordinate frame with distortion-aware normalized-point triangulation.
-
-## Data Layout
-
-### Runs
-
-Single-orientation run:
-- `data/runs/<run_id>/captures/`
-- `data/runs/<run_id>/phase/`
-- `data/runs/<run_id>/unwrap/`
-- `data/runs/<run_id>/roi/`
-- `data/runs/<run_id>/normalise/`
-- `data/runs/<run_id>/quality_report.json`
-
-Combined UV run:
-- `data/runs/<run_id>_uv/vertical/...`
-- `data/runs/<run_id>_uv/horizontal/...`
-- `data/runs/<run_id>_uv/projector_uv/...`
-- `data/runs/<run_id>_uv/reconstruction/...`
-
-### Calibration
-
-- `data/calibration/camera/...`
-- `data/calibration/projector/...`
+Copy the axis values into `multi_scan.rotation_axis_vector` / `axis_x_m` / `axis_y_m` in `config/default.yaml`.
 
 ## Configuration
 
-Main config: `config/default.yaml`
+Main config: `fringe_app_v2/config/default.yaml`
 
-Important sections:
-- `scan`, `patterns`, `phase`, `unwrap`, `roi`
-- `normalise`, `quality_gate`, `quality`, `uv_gate`
-- `calibration`, `projector_calibration`
-- `reconstruction`
+Override at runtime:
+```bash
+python -m fringe_app_v2 --config /path/to/my_config.yaml
+```
+
+Key sections:
+
+| Section | Controls |
+|---------|----------|
+| `web` | host, port, debug |
+| `camera` | type (`picamera2`/`mock`), exposure, gain |
+| `scan` | resolution, n_steps, frequencies, orientations, settle_ms |
+| `phase` | saturation thresholds, modulation threshold, mask cleanup |
+| `unwrap` | ROI-constrained unwrap, mask post-processing |
+| `roi` | background percentile, morphology, post-cleanup |
+| `reconstruction` | z range, reprojection error gate, statistical outlier removal |
+| `defect` | depth threshold, area gates, edge suppression |
+| `turntable` | IP, auto-discover, settle_ms |
+| `multi_scan` | angles, rotation axis, ICP refinement |
+| `turntable_calibration` | ChArUco board spec, capture settings |
+| `calibration` | intrinsics / stereo paths |
+
+## Data Layout
+
+```
+data/
+  calibration/
+    camera/
+      intrinsics_latest.json
+      sessions/<session_id>/
+    projector/
+      stereo_latest.json
+      stereo_latest.npz
+      sessions/<session_id>/
+  turntable/
+    sessions/<session_id>/
+
+fringe_app_v2/runs/<run_id>/
+  structured/
+    vertical/freq_<f>/   step_000.png … step_N.png
+    horizontal/freq_<f>/
+  phase/
+    vertical/freq_<f>/   phi_wrapped.npy  A.npy  B.npy  mask*.npy
+    horizontal/freq_<f>/
+  unwrap/
+    vertical/   phi_abs.npy  mask_unwrap.npy  residual.npy
+    horizontal/
+  phase_quality/
+  roi/          roi_mask.npy  roi_meta.json
+  reconstruction/
+    xyz.npy           (H×W×3, NaN = invalid)
+    cloud.ply
+    depth.npy
+    reproj_err_cam.npy  reproj_err_proj.npy
+    reconstruction_meta.json
+  defect/
+    defect_mask.npy
+    defect_overlay.png
+    defect_report.json
+```
 
 ## Notes
 
-- The pipeline is strict about clipping and quality gates unless `--force` is used.
-- Projector and camera calibration resolutions must match UV run expectations.
-- If 3D reconstruction fails, check:
-  - `data/calibration/projector/stereo_latest.json`
-  - `data/runs/<run_id>_uv/projector_uv/uv_meta.json`
-  - `data/runs/<run_id>_uv/reconstruction/reconstruction_meta.json`
+- **Mock camera**: set `camera.type: mock` in config and place PNG/JPEG frames in `mock_data/` for development without hardware.
+- **Projector display**: the app drives the projector via Pygame fullscreen on the second HDMI output. Set `display.screen_index` if display detection is unreliable.
+- **Multi-scan**: requires a working turntable axis calibration. The rotation axis vector in `config/default.yaml` was calibrated from session `20260501_135837`.
+- **3D reconstruction** requires both camera intrinsics and projector stereo calibration to be present under `data/calibration/`.
