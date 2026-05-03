@@ -814,6 +814,68 @@ def load_scan_cloud(run_dir: Path) -> np.ndarray:
     return pts.astype(np.float32)
 
 
+def _load_json_if_exists(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _quality_gate_reasons(
+    run_dir: Path,
+    point_count: int,
+    gate_cfg: dict[str, Any],
+) -> list[str]:
+    reasons: list[str] = []
+    min_points = int(gate_cfg.get("min_points", 1))
+    if point_count < min_points:
+        reasons.append(f"point_count<{min_points}")
+
+    roi_meta = _load_json_if_exists(run_dir / "roi" / "roi_meta.json")
+    if bool(gate_cfg.get("reject_roi_fallback", True)) and bool((roi_meta.get("debug") or {}).get("roi_fallback")):
+        reasons.append("roi_fallback")
+    area_ratio = roi_meta.get("area_ratio")
+    max_roi_area_ratio = gate_cfg.get("max_roi_area_ratio")
+    if max_roi_area_ratio is not None and area_ratio is not None and float(area_ratio) > float(max_roi_area_ratio):
+        reasons.append(f"roi_area_ratio>{float(max_roi_area_ratio):.3f}")
+
+    unwrap_meta = _load_json_if_exists(run_dir / "unwrap" / "unwrap_summary.json")
+    max_residual_gt_1rad_pct = gate_cfg.get("max_unwrap_residual_gt_1rad_pct")
+    if max_residual_gt_1rad_pct is not None:
+        limit = float(max_residual_gt_1rad_pct)
+        for orientation in ("horizontal", "vertical"):
+            orientation_meta = unwrap_meta.get(orientation) or {}
+            pct = orientation_meta.get("residual_gt_1rad_pct")
+            if pct is not None and float(pct) > limit:
+                reasons.append(f"{orientation}_residual_gt_1rad_pct>{limit:.1f}")
+    max_residual_filter_removed_pct = gate_cfg.get("max_unwrap_residual_filter_removed_pct")
+    if max_residual_filter_removed_pct is not None:
+        limit = float(max_residual_filter_removed_pct)
+        for orientation in ("horizontal", "vertical"):
+            orientation_meta = unwrap_meta.get(orientation) or {}
+            before = int(orientation_meta.get("valid_before_residual_filter_px") or 0)
+            removed = int(orientation_meta.get("residual_filter_removed_px") or 0)
+            if before > 0 and (removed / float(before)) * 100.0 > limit:
+                reasons.append(f"{orientation}_residual_filter_removed_pct>{limit:.1f}")
+
+    recon_meta = _load_json_if_exists(run_dir / "reconstruct" / "reconstruction_meta.json")
+    valid_uv = int(recon_meta.get("valid_uv_points") or 0)
+    rejected_proj = int(recon_meta.get("rejected_by_projector_reproj_px") or 0)
+    max_reject_ratio = gate_cfg.get("max_projector_reject_ratio")
+    if max_reject_ratio is not None and valid_uv > 0:
+        reject_ratio = rejected_proj / float(valid_uv)
+        if reject_ratio > float(max_reject_ratio):
+            reasons.append(f"projector_reject_ratio>{float(max_reject_ratio):.3f}")
+    max_reproj_mean = gate_cfg.get("max_reproj_proj_mean_px")
+    reproj_mean = recon_meta.get("reproj_proj_mean_px")
+    if max_reproj_mean is not None and reproj_mean is not None and float(reproj_mean) > float(max_reproj_mean):
+        reasons.append(f"reproj_proj_mean_px>{float(max_reproj_mean):.2f}")
+
+    return reasons
+
+
 def merge_run_dirs(
     run_dirs_with_angles: list[tuple[float, Path]],
     config: dict[str, Any],
@@ -845,11 +907,49 @@ def merge_run_dirs(
     ax_y = ms_cfg.get("axis_y_m")
     ax_z = ms_cfg.get("axis_z_m")
 
-    clouds_with_angles: list[tuple[float, np.ndarray]] = []
+    gate_cfg = dict(ms_cfg.get("quality_gate") or {})
+    gate_enabled = bool(gate_cfg.get("enabled", True))
+    loaded_scans: list[dict[str, Any]] = []
     for angle_deg, run_dir in run_dirs_with_angles:
         pts = load_scan_cloud(run_dir)
+        reasons = _quality_gate_reasons(run_dir, len(pts), gate_cfg) if gate_enabled else []
+        loaded_scans.append({"angle_deg": angle_deg, "run_dir": run_dir, "points": pts, "rejected": reasons})
+
+    if gate_enabled:
+        accepted_counts = [len(s["points"]) for s in loaded_scans if not s["rejected"] and len(s["points"]) > 0]
+        max_ratio = gate_cfg.get("max_points_ratio_to_median")
+        if max_ratio is not None and accepted_counts:
+            median_count = float(np.median(np.asarray(accepted_counts, dtype=np.float64)))
+            for scan in loaded_scans:
+                if scan["rejected"] or median_count <= 0:
+                    continue
+                if len(scan["points"]) > median_count * float(max_ratio):
+                    scan["rejected"].append(f"point_count_ratio>{float(max_ratio):.2f}x_median")
+
+    clouds_with_angles: list[tuple[float, np.ndarray]] = []
+    rejected_scans: list[dict[str, Any]] = []
+    for scan in loaded_scans:
+        angle_deg = float(scan["angle_deg"])
+        pts = scan["points"]
+        run_dir = scan["run_dir"]
+        reasons = list(scan["rejected"])
+        if reasons:
+            rejected_scans.append({"angle_deg": angle_deg, "run_dir": str(run_dir), "points": int(len(pts)), "reasons": reasons})
+            print(f"[merge] angle={angle_deg:.1f}° rejected by quality gate: {', '.join(reasons)}")
+            continue
         clouds_with_angles.append((angle_deg, pts))
         print(f"[merge] angle={angle_deg:.1f}° → {len(pts)} points from {run_dir.name}")
+
+    min_accepted = min(int(gate_cfg.get("min_accepted_scans", 2)), len(run_dirs_with_angles))
+    if len(clouds_with_angles) < max(1, min_accepted):
+        reasons = "; ".join(
+            f"{item['angle_deg']:.1f}°: {', '.join(item['reasons'])}"
+            for item in rejected_scans
+        )
+        raise RuntimeError(
+            f"Only {len(clouds_with_angles)} scan(s) passed merge quality gate; "
+            f"need at least {max(1, min_accepted)}. Rejections: {reasons}"
+        )
 
     if ax_x is not None and ax_y is not None:
         valid_clouds = [p for _, p in clouds_with_angles if len(p) > 0]
@@ -917,8 +1017,15 @@ def merge_run_dirs(
         save_colored_ply(merged, colors, colored_ply_path)
 
     meta = {
-        "n_scans": len(run_dirs_with_angles),
-        "angles_deg": [a for a, _ in run_dirs_with_angles],
+        "input_n_scans": len(run_dirs_with_angles),
+        "n_scans": len(clouds_with_angles),
+        "angles_deg": [a for a, _ in clouds_with_angles],
+        "input_angles_deg": [a for a, _ in run_dirs_with_angles],
+        "quality_gate": {
+            "enabled": gate_enabled,
+            "config": gate_cfg,
+            "rejected_scans": rejected_scans,
+        },
         "points_per_scan": [len(p) for _, p in clouds_with_angles],
         "total_points": int(len(merged)),
         "axis_m": axis_used.tolist(),

@@ -17,6 +17,21 @@ from fringe_app_v2.phase_quality.gamma import apply_gamma, gamma_from_config
 from fringe_app_v2.utils.io import RunPaths, freq_tag, save_image, write_json
 
 
+def _capture_averaged_frame(
+    camera: CameraService,
+    frame_count: int,
+    flush_frames: int,
+) -> np.ndarray:
+    count = max(1, int(frame_count))
+    first = camera.capture(flush_frames=flush_frames)
+    if count == 1:
+        return first
+    acc = first.astype(np.float32)
+    for _ in range(1, count):
+        acc += camera.capture(flush_frames=0).astype(np.float32)
+    return np.clip(np.rint(acc / float(count)), 0, 255).astype(np.uint8)
+
+
 def run_structured_capture(
     run: RunPaths,
     camera: CameraService,
@@ -34,12 +49,17 @@ def run_structured_capture(
     warmup_ms = int(scan.get("freq_switch_warmup_ms", 250))
     flush_step = int(scan.get("flush_frames_per_step", 1))
     flush_switch = int(scan.get("flush_frames_on_freq_switch", 2))
+    average_frames = int(scan.get("average_frames_per_step", 1))
     save_patterns = bool(scan.get("save_patterns", params.save_patterns))
     gamma = gamma_from_config(config)
+    projector_resolution = (
+        int(scan.get("projector_width", params.resolution[0])),
+        int(scan.get("projector_height", params.resolution[1])),
+    )
     captured: list[dict[str, Any]] = []
 
     for orientation in orientations:
-        orient_params = replace(params, orientation=orientation)  # type: ignore[arg-type]
+        orient_params = replace(params, orientation=orientation, resolution=projector_resolution)  # type: ignore[arg-type]
         for freq_index, freq in enumerate(freqs):
             tag = freq_tag(freq)
             capture_dir = run.structured / orientation / tag
@@ -54,7 +74,7 @@ def run_structured_capture(
                 display_pattern = apply_gamma(pattern, gamma)
                 projector.show_gray(display_pattern)
                 time.sleep((first_ms if step == 0 else settle_ms) / 1000.0)
-                frame = camera.capture(flush_frames=flush_step)
+                frame = _capture_averaged_frame(camera, average_frames, flush_step)
                 save_image(capture_dir / f"step_{step:03d}.png", frame)
                 if save_patterns:
                     save_image(pattern_dir / f"pattern_{step:03d}.png", display_pattern)
@@ -73,7 +93,12 @@ def run_structured_capture(
         "frequencies": freqs,
         "n_steps": int(params.n_steps),
         "frequency_semantics": params.frequency_semantics,
+        "camera_resolution": list(params.resolution),
+        "projector_resolution": list(projector_resolution),
+        "average_frames_per_step": int(max(1, average_frames)),
         "phase_origin_rad": float(params.phase_origin_rad),
+        "projector_u_offset_px": float(scan.get("projector_u_offset_px", 0.0)),
+        "projector_v_offset_px": float(scan.get("projector_v_offset_px", 0.0)),
         "gamma": gamma,
         "captures": captured,
     }

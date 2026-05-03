@@ -45,6 +45,7 @@ def roi_config_from_dict(config: dict[str, Any]) -> ObjectRoiConfig:
         post_fill_small_holes=bool(post.get("fill_small_holes", True)),
         post_max_hole_area=int(post.get("max_hole_area", 2000)),
         post_dilate_radius_px=int(post.get("dilate_radius_px", 10)),
+        fallback_mode=str(roi.get("fallback_mode", "empty")),  # type: ignore[arg-type]
     )
 
 
@@ -84,6 +85,7 @@ def detect_not_dark_roi(image: np.ndarray, config: dict[str, Any]) -> RoiResult:
     roi = config.get("roi", {}) or {}
     post = roi.get("post", {}) or {}
     gray = to_gray_float(image).astype(np.float32)
+    h, w = gray.shape
     max_channel = _max_channel(image)
     border_width = int(roi.get("border_width_px", 24))
     border = _border_mask(gray.shape, border_width)
@@ -99,18 +101,32 @@ def detect_not_dark_roi(image: np.ndarray, config: dict[str, Any]) -> RoiResult:
     post_mask = _morphology(raw_mask, close_radius=int(roi.get("close_radius_px", 3)), open_radius=int(roi.get("open_radius_px", 1)))
     core_mask = _largest_component_mask(post_mask)
     fallback = core_mask is None
+    fallback_reason = "no_component" if fallback else None
+    min_area_ratio = float(roi.get("min_area_ratio", 0.0))
+    max_area_ratio = float(roi.get("max_area_ratio", 1.0))
     if core_mask is None:
-        core_mask = np.ones_like(raw_mask, dtype=bool)
+        core_mask = _roi_fallback_mask(gray.shape, str(roi.get("fallback_mode", "empty")), roi)
     else:
         core_mask = _fill_holes(core_mask)
+        core_ratio = float(np.count_nonzero(core_mask) / core_mask.size)
+        if core_ratio < min_area_ratio or core_ratio > max_area_ratio:
+            fallback = True
+            fallback_reason = "area_ratio_out_of_range"
+            core_mask = _roi_fallback_mask(gray.shape, str(roi.get("fallback_mode", "empty")), roi)
 
     dilated = core_mask.copy()
-    if bool(post.get("enabled", True)):
+    if bool(post.get("enabled", True)) and np.any(dilated):
         if bool(post.get("fill_small_holes", True)):
             dilated = _fill_holes(dilated)
         radius = int(post.get("dilate_radius_px", 12))
         if radius > 0:
             dilated = _binary_dilate(dilated, radius)
+    final_ratio = float(np.count_nonzero(dilated) / float(h * w))
+    if not fallback and (final_ratio < min_area_ratio or final_ratio > max_area_ratio):
+        fallback = True
+        fallback_reason = "post_area_ratio_out_of_range"
+        core_mask = _roi_fallback_mask(gray.shape, str(roi.get("fallback_mode", "empty")), roi)
+        dilated = core_mask.copy()
     bbox_core = _bbox_from_mask(core_mask)
     bbox_dilated = _bbox_from_mask(dilated)
     debug_cfg = {
@@ -142,8 +158,33 @@ def detect_not_dark_roi(image: np.ndarray, config: dict[str, Any]) -> RoiResult:
             "gray_threshold": gray_threshold,
             "max_channel_threshold": max_threshold,
             "roi_fallback": fallback,
+            "fallback_reason": fallback_reason,
+            "min_area_ratio": min_area_ratio,
+            "max_area_ratio": max_area_ratio,
         },
     )
+
+
+def _roi_fallback_mask(
+    shape: tuple[int, int],
+    mode: str,
+    roi: dict[str, Any],
+) -> np.ndarray:
+    h, w = shape
+    normalized = mode.strip().lower()
+    if normalized in {"full", "full_frame", "all"}:
+        return np.ones(shape, dtype=bool)
+    if normalized in {"center", "center_crop"}:
+        frac = float(roi.get("fallback_center_fraction", 0.5))
+        frac = min(1.0, max(0.05, frac))
+        crop_w = max(1, int(round(w * frac)))
+        crop_h = max(1, int(round(h * frac)))
+        x0 = max(0, (w - crop_w) // 2)
+        y0 = max(0, (h - crop_h) // 2)
+        mask = np.zeros(shape, dtype=bool)
+        mask[y0:y0 + crop_h, x0:x0 + crop_w] = True
+        return mask
+    return np.zeros(shape, dtype=bool)
 
 
 def _max_channel(image: np.ndarray) -> np.ndarray:

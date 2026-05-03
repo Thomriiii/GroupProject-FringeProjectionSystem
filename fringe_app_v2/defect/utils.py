@@ -136,7 +136,7 @@ def normalise_to_u8(values: np.ndarray, mask: np.ndarray | None = None) -> np.nd
     if hi <= lo:
         return np.zeros(arr.shape, dtype=np.uint8)
     scaled = np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
-    scaled[~finite] = 0.0
+    scaled[~valid] = 0.0
     return np.rint(scaled * 255.0).astype(np.uint8)
 
 

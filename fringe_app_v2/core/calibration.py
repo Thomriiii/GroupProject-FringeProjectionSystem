@@ -192,6 +192,8 @@ class CalibrationService:
         frequency_semantics: str,
         phase_origin_u_rad: float,
         phase_origin_v_rad: float,
+        projector_u_offset_px: float = 0.0,
+        projector_v_offset_px: float = 0.0,
         recon_cfg: dict[str, Any] | None = None,
         uv_gate_cfg: dict[str, Any] | None = None,
     ) -> tuple[Any, WorldMap]:
@@ -207,6 +209,8 @@ class CalibrationService:
             frequency_semantics=frequency_semantics,
             phase_origin_u_rad=phase_origin_u_rad,
             phase_origin_v_rad=phase_origin_v_rad,
+            projector_u_offset_px=projector_u_offset_px,
+            projector_v_offset_px=projector_v_offset_px,
             roi_mask=roi_mask,
         )
         world = triangulate_uv_maps(self.camera, self.projector, uv.u, uv.v, uv.mask, recon_cfg or {})
@@ -343,6 +347,8 @@ def phase_to_world(
     frequency_semantics: str = "cycles_across_dimension",
     phase_origin_u_rad: float = 0.0,
     phase_origin_v_rad: float = 0.0,
+    projector_u_offset_px: float = 0.0,
+    projector_v_offset_px: float = 0.0,
     config: dict[str, Any] | None = None,
 ) -> tuple[Any, WorldMap]:
     cfg = config or _default_config()
@@ -357,6 +363,8 @@ def phase_to_world(
         frequency_semantics=frequency_semantics,
         phase_origin_u_rad=phase_origin_u_rad,
         phase_origin_v_rad=phase_origin_v_rad,
+        projector_u_offset_px=projector_u_offset_px,
+        projector_v_offset_px=projector_v_offset_px,
         recon_cfg=cfg.get("reconstruction", {}) or {},
         uv_gate_cfg=cfg.get("uv_gate", {}) or {},
     )

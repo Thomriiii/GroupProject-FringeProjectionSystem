@@ -27,7 +27,10 @@ class ProjectorSettings:
             fullscreen=bool(display.get("fullscreen", True)),
             screen_index=None if display.get("screen_index") is None else int(display.get("screen_index")),
             vsync=bool(display.get("vsync", True)),
-            resolution=(int(scan.get("width", 1024)), int(scan.get("height", 768))),
+            resolution=(
+                int(scan.get("projector_width", scan.get("width", 1024))),
+                int(scan.get("projector_height", scan.get("height", 768))),
+            ),
         )
 
 

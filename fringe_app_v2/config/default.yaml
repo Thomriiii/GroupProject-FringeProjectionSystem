@@ -28,6 +28,8 @@ calibration:
 scan:
   width: 1024
   height: 768
+  projector_width: 1920
+  projector_height: 1080
   n_steps: 8
   frequencies: [1.0, 4.0, 16.0]
   frequency_semantics: cycles_across_dimension
@@ -38,16 +40,21 @@ scan:
   freq_switch_warmup_ms: 250
   flush_frames_per_step: 1
   flush_frames_on_freq_switch: 2
+  average_frames_per_step: 1
   save_patterns: false
   exposure_us: 2000
   analogue_gain: 1.0
   awb_enable: false
   ae_enable: false
   brightness: 1.0
-  contrast: 0.6
+  contrast: 0.45
   brightness_offset: 0.45
   min_intensity: 0.10
   phase_origin_rad: 0.0
+  phase_origin_u_rad: 0.0
+  phase_origin_v_rad: 0.0
+  projector_u_offset_px: 0.0
+  projector_v_offset_px: 18.0
 
 gamma: 2.2
 
@@ -61,6 +68,13 @@ exposure_lock:
   enabled: true
   target_dn: 128.0
   tolerance_dn: 8.0
+  meter: top_fraction_mean
+  meter_top_fraction: 0.10
+  meter_percentile: 90.0
+  fail_on_error: true
+  accept_under_target_at_limits: true
+  min_usable_meter_dn: 45.0
+  max_clip_pct: 0.01
   max_iters: 8
   min_exposure_us: 500
   max_exposure_us: 12000
@@ -80,6 +94,8 @@ roi:
   sigma_px: 1.5
   close_radius_px: 3
   open_radius_px: 1
+  fallback_mode: empty     # empty rejects bad ROIs instead of treating the full frame as object
+  fallback_center_fraction: 0.50
   ref_method: median_over_frames
   downscale_max_w: 640
   blur_ksize: 7
@@ -122,6 +138,9 @@ phase:
 
 unwrap:
   use_roi: true
+  residual_filter:
+    enabled: true
+    max_abs_rad: 1.0
   mask_post:
     enabled: true
     keep_largest_component: true
@@ -142,6 +161,14 @@ reconstruction:
   z_min_m: 0.05
   z_max_m: 5.0
   max_reproj_err_px: 15.0
+  fail_on_quality_error: true
+  quality_gate:
+    enabled: true
+    min_valid_uv_points: 1000
+    min_valid_reconstruct_points: 1000
+    min_reconstruct_to_uv_ratio: 0.10
+    max_projector_reject_ratio: 0.50
+    max_reproj_proj_mean_px: null
   min_component_px: 50
   sor_enabled: true
   sor_k: 20
@@ -176,6 +203,17 @@ multi_scan:
     coarse_steps: 7
     sample_points: 3000
     seed: 1
+  quality_gate:
+    enabled: true
+    reject_roi_fallback: true
+    max_roi_area_ratio: 0.80
+    max_unwrap_residual_gt_1rad_pct: 10.0
+    max_unwrap_residual_filter_removed_pct: 20.0
+    max_projector_reject_ratio: 0.15
+    max_reproj_proj_mean_px: null
+    max_points_ratio_to_median: 2.5
+    min_points: 1000
+    min_accepted_scans: 2
   refine_icp:
     enabled: false
     max_points: 15000

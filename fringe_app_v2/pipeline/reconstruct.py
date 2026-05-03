@@ -89,8 +89,10 @@ def run_reconstruct_stage(
         frequency_u=high_freq,
         frequency_v=high_freq,
         frequency_semantics=str(scan_cfg.get("frequency_semantics", "cycles_across_dimension")),
-        phase_origin_u_rad=float(scan_cfg.get("phase_origin_rad", 0.0)),
-        phase_origin_v_rad=float(scan_cfg.get("phase_origin_rad", 0.0)),
+        phase_origin_u_rad=float(scan_cfg.get("phase_origin_u_rad", scan_cfg.get("phase_origin_rad", 0.0))),
+        phase_origin_v_rad=float(scan_cfg.get("phase_origin_v_rad", scan_cfg.get("phase_origin_rad", 0.0))),
+        projector_u_offset_px=float(scan_cfg.get("projector_u_offset_px", 0.0)),
+        projector_v_offset_px=float(scan_cfg.get("projector_v_offset_px", 0.0)),
         roi_mask=roi_mask,
     )
 
@@ -178,8 +180,12 @@ def run_reconstruct_stage(
     )
     meta["component_filter_removed"] = n_comp_removed
     meta["sor_removed"] = n_sor_removed
+    quality = _reconstruction_quality(meta, recon_cfg)
+    meta["quality_gate"] = quality
 
     write_json(run.reconstruct / "reconstruction_meta.json", meta)
+    if bool(recon_cfg.get("fail_on_quality_error", True)) and not bool(quality.get("ok", True)):
+        raise RuntimeError("Reconstruction quality gate failed: " + "; ".join(quality.get("reasons", [])))
 
     # Export point cloud
     try:
@@ -192,6 +198,46 @@ def run_reconstruct_stage(
         _save_debug_images(run.reconstruct, tri_result, uv_map)
 
     return meta
+
+
+def _reconstruction_quality(meta: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    cfg = config.get("quality_gate", {}) or {}
+    if not bool(cfg.get("enabled", True)):
+        return {"enabled": False, "ok": True, "reasons": []}
+
+    valid_uv = int(meta.get("valid_uv_points") or 0)
+    valid_reconstruct = int(meta.get("valid_reconstruct_points") or 0)
+    rejected_proj = int(meta.get("rejected_by_projector_reproj_px") or 0)
+    reconstruct_ratio = valid_reconstruct / float(valid_uv) if valid_uv > 0 else 0.0
+    projector_reject_ratio = rejected_proj / float(valid_uv) if valid_uv > 0 else 1.0
+    reasons: list[str] = []
+
+    min_uv = int(cfg.get("min_valid_uv_points", 1000))
+    if valid_uv < min_uv:
+        reasons.append(f"valid_uv_points<{min_uv}")
+    min_reconstruct = int(cfg.get("min_valid_reconstruct_points", 1000))
+    if valid_reconstruct < min_reconstruct:
+        reasons.append(f"valid_reconstruct_points<{min_reconstruct}")
+    min_ratio = float(cfg.get("min_reconstruct_to_uv_ratio", 0.10))
+    if valid_uv > 0 and reconstruct_ratio < min_ratio:
+        reasons.append(f"reconstruct_to_uv_ratio<{min_ratio:.3f}")
+    max_reject = float(cfg.get("max_projector_reject_ratio", 0.50))
+    if projector_reject_ratio > max_reject:
+        reasons.append(f"projector_reject_ratio>{max_reject:.3f}")
+    max_reproj_mean = cfg.get("max_reproj_proj_mean_px")
+    reproj_mean = meta.get("reproj_proj_mean_px")
+    if max_reproj_mean is not None and reproj_mean is not None and float(reproj_mean) > float(max_reproj_mean):
+        reasons.append(f"reproj_proj_mean_px>{float(max_reproj_mean):.2f}")
+
+    return {
+        "enabled": True,
+        "ok": not reasons,
+        "reasons": reasons,
+        "valid_uv_points": valid_uv,
+        "valid_reconstruct_points": valid_reconstruct,
+        "reconstruct_to_uv_ratio": reconstruct_ratio,
+        "projector_reject_ratio": projector_reject_ratio,
+    }
 
 
 def _remove_small_components(
@@ -451,6 +497,4 @@ def _export_pointcloud(out_dir: Path, xyz: np.ndarray, mask: np.ndarray) -> None
                     fh.write(f"{float(x):.6f} {float(y):.6f} {float(z):.6f}\n")
         except Exception as e:
             print(f"[reconstruct] Warning: Failed to write {cloud_path}: {e}")
-
-
 

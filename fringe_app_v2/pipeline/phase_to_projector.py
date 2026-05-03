@@ -48,6 +48,8 @@ def phase_to_projector_coords(
     frequency_semantics: str = "cycles_across_dimension",
     phase_origin_u_rad: float = 0.0,
     phase_origin_v_rad: float = 0.0,
+    projector_u_offset_px: float = 0.0,
+    projector_v_offset_px: float = 0.0,
     roi_mask: np.ndarray | None = None,
 ) -> UVMap:
     """
@@ -99,13 +101,13 @@ def phase_to_projector_coords(
     valid_u = np.isfinite(phi_vertical) & mask_vertical.astype(bool)
     if np.any(valid_u):
         phi_u = phi_vertical[valid_u] - float(phase_origin_u_rad)
-        u[valid_u] = (phi_u / span_u) * float(projector_width)
+        u[valid_u] = (phi_u / span_u) * float(projector_width) + float(projector_u_offset_px)
 
     # Horizontal patterns vary top-bottom → projector Y (v)
     valid_v = np.isfinite(phi_horizontal) & mask_horizontal.astype(bool)
     if np.any(valid_v):
         phi_v = phi_horizontal[valid_v] - float(phase_origin_v_rad)
-        v[valid_v] = (phi_v / span_v) * float(projector_height)
+        v[valid_v] = (phi_v / span_v) * float(projector_height) + float(projector_v_offset_px)
 
     # Combine masks
     mask = np.isfinite(u) & np.isfinite(v)
@@ -155,6 +157,8 @@ def phase_to_projector_coords(
         "cycles_v": float(cycles_v),
         "phase_origin_u_rad": float(phase_origin_u_rad),
         "phase_origin_v_rad": float(phase_origin_v_rad),
+        "projector_u_offset_px": float(projector_u_offset_px),
+        "projector_v_offset_px": float(projector_v_offset_px),
         "valid_pixel_count": int(np.count_nonzero(valid_pixels)),
         "valid_ratio": float(np.count_nonzero(valid_pixels) / valid_pixels.size),
         "u_min": u_min,
