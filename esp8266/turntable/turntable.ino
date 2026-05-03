@@ -10,10 +10,11 @@ const char* PASSWORD = "postmanpat";
 // Connect ENA and ENB on the L298N to 5V (or 3.3V) — always enabled.
 // Control only via IN1–IN4.
 // Raw GPIO numbers: generic ESP8266 board target does not define Dx aliases.
-#define PIN_IN1  14  // D5
-#define PIN_IN2  12  // D6
-#define PIN_IN3  13  // D7
-#define PIN_IN4  15  // D8 — must be LOW at boot (coils released = LOW, OK)
+// Avoid strapping pins (GPIO0, GPIO2, GPIO15) to prevent boot issues.
+#define PIN_IN1  4  // D2
+#define PIN_IN2  14  // D5
+#define PIN_IN3  12  // D6
+#define PIN_IN4  13  // D7 
 
 // ── Half-step sequence ────────────────────────────────────────────────────────
 // 8 phases. Rows = phase index, columns = {IN1, IN2, IN3, IN4}
@@ -259,6 +260,7 @@ void handleSerial() {
 
 // ── Setup / Loop ──────────────────────────────────────────────────────────────
 void setup() {
+    delay(1000);  // Allow power to stabilize
     Serial.begin(115200);
     Serial.println("\nTurntable controller starting...");
 
@@ -266,7 +268,7 @@ void setup() {
     pinMode(PIN_IN2, OUTPUT);
     pinMode(PIN_IN3, OUTPUT);
     pinMode(PIN_IN4, OUTPUT);
-    releaseMotor();
+    releaseMotor();  // Enter idle mode immediately
 
     WiFi.persistent(false);
     WiFi.disconnect(true);
@@ -283,8 +285,10 @@ void setup() {
         delay(500);
         Serial.print('.');
     }
-    if (WiFi.status() == WL_CONNECTED)
+    if (WiFi.status() == WL_CONNECTED) {
         Serial.printf("\nConnected — IP: %s\n", WiFi.localIP().toString().c_str());
+        WiFi.setAutoReconnect(true);  // Reconnect automatically if connection drops
+    }
 
     server.on("/rotate",   HTTP_POST, handleRotate);
     server.on("/position", HTTP_GET,  handlePosition);
