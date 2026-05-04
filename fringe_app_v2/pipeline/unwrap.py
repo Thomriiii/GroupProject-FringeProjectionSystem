@@ -22,14 +22,7 @@ def run_unwrap_stage(
         raise ValueError("At least two frequencies are required for temporal unwrapping")
     orientations = [p.name for p in sorted(run.phase.iterdir()) if p.is_dir() and p.name in {"vertical", "horizontal"}]
     summary: dict[str, Any] = {}
-    unwrap_cfg = config.get("unwrap", {}) or {}
-    use_roi = bool(unwrap_cfg.get("use_roi", True))
-    residual_filter = unwrap_cfg.get("residual_filter", {}) or {}
-    max_residual_rad = (
-        float(residual_filter.get("max_abs_rad"))
-        if bool(residual_filter.get("enabled", False)) and residual_filter.get("max_abs_rad") is not None
-        else None
-    )
+    use_roi = bool((config.get("unwrap", {}) or {}).get("use_roi", True))
 
     for orientation in orientations:
         phases: list[np.ndarray] = []
@@ -44,7 +37,6 @@ def run_unwrap_stage(
             freqs,
             roi_mask=roi_mask,
             use_roi=use_roi,
-            max_residual_rad=max_residual_rad,
         )
         out_dir = run.unwrap / orientation
         out_dir.mkdir(parents=True, exist_ok=True)

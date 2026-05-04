@@ -1,0 +1,57 @@
+Metadata-Version: 2.4
+Name: fringe_app
+Version: 0.1.0
+Summary: Minimal fringe projection capture system
+Author: Fringe App
+License: MIT
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: fastapi>=0.111
+Requires-Dist: uvicorn>=0.29
+Requires-Dist: numpy>=1.24
+Requires-Dist: pygame>=2.5
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: pillow>=10.0
+
+# Fringe App
+
+Minimal fringe projection capture system for Raspberry Pi using pygame for projector output and FastAPI for control.
+
+## Install
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+```
+
+## Run
+
+```bash
+python -m fringe_app
+```
+
+Open the UI at `http://<pi-ip>:8000/`.
+
+## Camera
+
+- **Picamera2 (real camera)**: set `camera.type: picamera2` in `config/default.yaml`.
+- **Mock (dev only)**: set `camera.type: mock` and place images in `mock_data/`.
+
+## Projector Display Selection
+
+- Use `display.screen_index` in `config/default.yaml` to select the target display.
+- `display.fullscreen` controls fullscreen mode.
+
+## Self Test
+
+1. Start the app: `python -m fringe_app`.
+2. Start a scan:
+
+```bash
+curl -X POST http://localhost:8000/api/scan/start \
+  -H 'Content-Type: application/json' \
+  -d '{"n_steps":4,"frequency":8.0,"orientation":"vertical","brightness":1.0,"settle_ms":10,"preview_fps":5}'
+```
+
+4. Verify output under `data/runs/<timestamp>/` with `captures/` and `meta.json`.

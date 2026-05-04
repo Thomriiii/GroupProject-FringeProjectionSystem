@@ -238,18 +238,8 @@ def build_mask_for_display(
         m = b_s >= b_thresh
     else:
         m = mask_raw.astype(bool).copy()
-    if roi_mask is not None:
-        m &= roi_mask.astype(bool)
-    if clipped_any is not None:
-        m &= ~clipped_any.astype(bool)
     if bool(cfg.get("keep_largest_component", True)):
         m = largest_component(m)
-    if not np.any(m):
-        m = mask_raw.astype(bool).copy()
-        if roi_mask is not None:
-            m &= roi_mask.astype(bool)
-        if clipped_any is not None:
-            m &= ~clipped_any.astype(bool)
     if roi_mask is not None:
         m &= roi_mask.astype(bool)
     if clipped_any is not None:

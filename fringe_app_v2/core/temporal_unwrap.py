@@ -19,7 +19,6 @@ def unwrap_multi_frequency(
     freqs: list[float],
     roi_mask: np.ndarray | None = None,
     use_roi: bool = True,
-    max_residual_rad: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict, np.ndarray]:
     """
     Temporal unwrapping coarse->fine.
@@ -86,22 +85,6 @@ def unwrap_multi_frequency(
     if residual_final is None:
         residual_final = np.full_like(phi_abs, np.nan, dtype=np.float32)
     residual_final[~mask_unwrap] = np.nan
-    pre_filter_residual_vals = np.abs(residual_final[np.isfinite(residual_final)])
-    valid_before_residual_filter = int(np.count_nonzero(mask_unwrap))
-    residual_p95_before_filter = (
-        float(np.percentile(pre_filter_residual_vals, 95)) if pre_filter_residual_vals.size else None
-    )
-    residual_gt_1rad_pct_before_filter = (
-        float(np.mean(pre_filter_residual_vals > 1.0) * 100.0) if pre_filter_residual_vals.size else None
-    )
-    residual_filter_removed = 0
-    if max_residual_rad is not None and max_residual_rad > 0:
-        residual_ok = np.isfinite(residual_final) & (np.abs(residual_final) <= float(max_residual_rad))
-        filtered_mask = mask_unwrap & residual_ok
-        residual_filter_removed = int(np.count_nonzero(mask_unwrap & ~filtered_mask))
-        mask_unwrap = filtered_mask
-        phi_abs[~mask_unwrap] = np.nan
-        residual_final[~mask_unwrap] = np.nan
 
     finite = phi_abs[np.isfinite(phi_abs)]
     residual_vals = np.abs(residual_final[np.isfinite(residual_final)])
@@ -121,11 +104,6 @@ def unwrap_multi_frequency(
         "residual_gt_1rad_pct": float(np.mean(residual_vals > 1.0) * 100.0) if residual_vals.size else None,
         "residual_p95_threshold": residual_p95_thresh,
         "residual_ok": bool(np.percentile(residual_vals, 95) < residual_p95_thresh) if residual_vals.size else False,
-        "residual_filter_max_rad": float(max_residual_rad) if max_residual_rad is not None else None,
-        "residual_filter_removed_px": residual_filter_removed,
-        "valid_before_residual_filter_px": valid_before_residual_filter,
-        "residual_p95_before_filter": residual_p95_before_filter,
-        "residual_gt_1rad_pct_before_filter": residual_gt_1rad_pct_before_filter,
     }
     return phi_abs, mask_unwrap, meta, residual_final
 

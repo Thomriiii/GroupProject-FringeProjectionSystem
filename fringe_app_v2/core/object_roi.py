@@ -25,7 +25,6 @@ class ObjectRoiConfig:
     post_fill_small_holes: bool = True
     post_max_hole_area: int = 2000
     post_dilate_radius_px: int = 10
-    fallback_mode: Literal["empty", "full_frame"] = "empty"
 
 
 @dataclass(slots=True)
@@ -93,18 +92,14 @@ def detect_object_roi(image: np.ndarray, cfg: ObjectRoiConfig) -> ObjectRoiResul
     roi_fallback = False
     if area_ratio < cfg.min_area_ratio or area_ratio > cfg.max_area_ratio or cc_mask is None:
         roi_fallback = True
-        roi_mask = (
-            np.ones_like(gray, dtype=bool)
-            if cfg.fallback_mode == "full_frame"
-            else np.zeros_like(gray, dtype=bool)
-        )
+        roi_mask = np.ones_like(gray, dtype=bool)
         roi_core_mask = roi_mask.copy()
         roi_dilated_mask = roi_mask.copy()
-        raw_mask_full = _resize_nearest(mask.astype(np.uint8), w, h).astype(bool)
+        raw_mask_full = roi_mask.copy()
         post_mask_full = roi_mask.copy()
-        bbox_full = _bbox_from_mask(roi_mask)
-        bbox_core = bbox_full
-        bbox_dilated = bbox_full
+        bbox_full = None
+        bbox_core = None
+        bbox_dilated = None
     else:
         if cfg.fill_holes:
             cc_mask = _fill_holes(cc_mask)
@@ -152,7 +147,6 @@ def detect_object_roi(image: np.ndarray, cfg: ObjectRoiConfig) -> ObjectRoiResul
         "threshold": thresh,
         "area_ratio": area_ratio,
         "roi_fallback": roi_fallback,
-        "fallback_mode": cfg.fallback_mode,
         "post": {
             "enabled": bool(cfg.post_enabled),
             "keep_largest_component": bool(cfg.post_keep_largest_component),

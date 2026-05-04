@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Projector Calibration v2</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Projector Calibration v2</h1>
+      <div class="header-right">
+        <a href="/">Pipeline</a>
+        <a href="/projector-calibration">Legacy Calibration</a>
+      </div>
+    </header>
+
+    <section>
+      <div id="status" class="status">Initializing session...</div>
+      <div id="error" class="error"></div>
+    </section>
+
+    <section class="actions">
+      <button id="new_session_btn">New Session</button>
+      <select id="session_select"></select>
+      <button id="continue_session_btn" disabled>Continue Session</button>
+    </section>
+
+    <section class="actions">
+      <button id="capture_btn" disabled>Capture View</button>
+      <button id="solve_btn" disabled>Solve</button>
+      <button id="reset_btn" disabled>Reset Session</button>
+      <a id="download_link" href="#" target="_blank">Download session zip</a>
+    </section>
+
+    <section>
+      <h2>Coverage</h2>
+      <div id="coverage_indicator" class="status">Need more variety</div>
+      <div id="coverage_summary"></div>
+    </section>
+
+    <section class="preview">
+      <h2>Live Preview</h2>
+      <img id="preview_img" alt="live preview" />
+    </section>
+
+    <section>
+      <h2>Views</h2>
+      <div id="views_grid" class="captures-grid"></div>
+    </section>
+
+    <section>
+      <h2>Solve</h2>
+      <div id="solve_summary"></div>
+      <details style="margin-top:8px;">
+        <summary>Advanced diagnostics</summary>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;">
+          <a id="plot_cam" href="#" target="_blank">Camera reprojection plot</a>
+          <a id="plot_proj" href="#" target="_blank">Projector reprojection plot</a>
+          <a id="plot_cov" href="#" target="_blank">Coverage plot</a>
+          <a id="plot_hist" href="#" target="_blank">Residual histogram</a>
+        </div>
+      </details>
+    </section>
+  </div>
+
+  <script src="/static/projector_calibration_v2.js"></script>
+</body>
+</html>

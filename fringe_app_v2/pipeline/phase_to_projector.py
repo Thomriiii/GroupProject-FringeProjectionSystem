@@ -62,6 +62,7 @@ def phase_to_projector_coords(
       mask_vertical: Boolean mask for vertical phase (True = valid)
       frequency_u/v: Modulation frequency (cycles across dimension or pixels/period)
       phase_origin_u_rad, phase_origin_v_rad: Phase offsets (typically 0)
+      projector_u_offset_px, projector_v_offset_px: Display origin offsets in projector pixels
 
     OUTPUT:
       UVMap with u[y,x] = projector X, v[y,x] = projector Y

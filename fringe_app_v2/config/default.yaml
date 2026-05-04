@@ -28,8 +28,6 @@ calibration:
 scan:
   width: 1024
   height: 768
-  projector_width: 1920
-  projector_height: 1080
   n_steps: 8
   frequencies: [1.0, 4.0, 16.0]
   frequency_semantics: cycles_across_dimension
@@ -40,19 +38,16 @@ scan:
   freq_switch_warmup_ms: 250
   flush_frames_per_step: 1
   flush_frames_on_freq_switch: 2
-  average_frames_per_step: 1
   save_patterns: false
   exposure_us: 2000
   analogue_gain: 1.0
   awb_enable: false
   ae_enable: false
   brightness: 1.0
-  contrast: 0.45
+  contrast: 0.6
   brightness_offset: 0.45
   min_intensity: 0.10
   phase_origin_rad: 0.0
-  phase_origin_u_rad: 0.0
-  phase_origin_v_rad: 0.0
   projector_u_offset_px: 0.0
   projector_v_offset_px: 18.0
 
@@ -68,13 +63,6 @@ exposure_lock:
   enabled: true
   target_dn: 128.0
   tolerance_dn: 8.0
-  meter: top_fraction_mean
-  meter_top_fraction: 0.10
-  meter_percentile: 90.0
-  fail_on_error: true
-  accept_under_target_at_limits: true
-  min_usable_meter_dn: 45.0
-  max_clip_pct: 0.01
   max_iters: 8
   min_exposure_us: 500
   max_exposure_us: 12000
@@ -94,8 +82,6 @@ roi:
   sigma_px: 1.5
   close_radius_px: 3
   open_radius_px: 1
-  fallback_mode: empty     # empty rejects bad ROIs instead of treating the full frame as object
-  fallback_center_fraction: 0.50
   ref_method: median_over_frames
   downscale_max_w: 640
   blur_ksize: 7
@@ -138,9 +124,6 @@ phase:
 
 unwrap:
   use_roi: true
-  residual_filter:
-    enabled: true
-    max_abs_rad: 1.0
   mask_post:
     enabled: true
     keep_largest_component: true
@@ -161,14 +144,6 @@ reconstruction:
   z_min_m: 0.05
   z_max_m: 5.0
   max_reproj_err_px: 15.0
-  fail_on_quality_error: true
-  quality_gate:
-    enabled: true
-    min_valid_uv_points: 1000
-    min_valid_reconstruct_points: 1000
-    min_reconstruct_to_uv_ratio: 0.10
-    max_projector_reject_ratio: 0.50
-    max_reproj_proj_mean_px: null
   min_component_px: 50
   sor_enabled: true
   sor_k: 20
@@ -187,11 +162,36 @@ turntable:
 
 multi_scan:
   angles_deg: [0, 90, 180, 270]
+  roi_light_check:
+    settle_ms: 350      # wait after idle-white before ROI capture
+    flush_frames: 3     # discard stale black frames after projector changes
+    retries: 2
+    min_mean_dn: 8.0
+    min_p99_dn: 25.0
+    fail_on_dark: true
   rotation_sign: -1.0    # +1 = CW positive, -1 = CCW positive; calibrated from latest merged scan
   rotation_axis_vector: [-0.045275, 0.439239, 0.897229]  # calibrated tilted axis direction, session 20260501_135837
   axis_x_m: -0.04755     # rotation axis X in camera coords m — from turntable cal session 20260501_135837
   axis_y_m: -0.05557     # rotation axis Y in camera coords m — from turntable cal session 20260501_135837
   axis_z_m: null         # use each merged set's mean depth
+  fiducials:
+    enabled: true
+    max_reproj_err_px: 200.0
+    # Auto-detection parameters (HSV thresholding on roi_capture.png)
+    n_marks: 4
+    detect_hue_ranges:      # Marker can look red/orange/yellow depending on capture
+      - [340.0, 25.0]       # red, wrapping through 0°
+      - [25.0, 90.0]        # orange/yellow/green-yellow
+    detect_sat_min: 0.55
+    detect_val_min: 0.35
+    detect_min_px: 50       # Minimum pixels per detected cluster
+    detect_max_px: 6000     # Reject large red blobs from the object/rim
+    # Fallback fixed pixel coords (used only if auto-detect fails)
+    pixel_coords:
+      - [616, 168]   # top-right
+      - [234, 286]   # left
+      - [752, 485]   # right
+      - [382, 629]   # bottom
   axis_from_top:
     enabled: false
     side: max
@@ -203,24 +203,13 @@ multi_scan:
     coarse_steps: 7
     sample_points: 3000
     seed: 1
-  quality_gate:
-    enabled: true
-    reject_roi_fallback: true
-    max_roi_area_ratio: 0.80
-    max_unwrap_residual_gt_1rad_pct: 10.0
-    max_unwrap_residual_filter_removed_pct: 20.0
-    max_projector_reject_ratio: 0.15
-    max_reproj_proj_mean_px: null
-    max_points_ratio_to_median: 2.5
-    min_points: 1000
-    min_accepted_scans: 2
   refine_icp:
-    enabled: false
+    enabled: true
     max_points: 15000
     max_iterations: 30
-    max_correspondence_m: 0.010  # 10 mm — covers the ~2-3 mm step-angle residual with margin
-    max_rotation_deg: 2.0        # tight: coarse rotation is already within ~1 deg
-    max_translation_m: 0.010     # tight: residual translation is <5 mm
+    max_correspondence_m: 0.040  # 40 mm — wide enough to cover ~30 mm axis residual when fiducials fail
+    max_rotation_deg: 10.0
+    max_translation_m: 0.040
     min_pairs: 300
     seed: 0
     top_anchor:

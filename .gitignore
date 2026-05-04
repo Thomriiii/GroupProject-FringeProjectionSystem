@@ -1,4 +1,10 @@
-.venv
 data/
-fringe_app_v2/runs
+logs/
 __pycache__/
+.venv/
+*.zip
+mock_data/
+scripts/
+docs/
+fringe_app_v2/runs/**
+.claude

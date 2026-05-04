@@ -492,6 +492,202 @@ def optimize_axis_from_edges(
     }
 
 
+# ── fiducial-based alignment ─────────────────────────────────────────────────
+
+def load_fiducial_positions(
+    run_dir: Path,
+    pixel_coords: list[tuple[int, int]],
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """
+    Extract 3D positions of fiducial marks from a reconstruction run.
+
+    Reads from reconstruct/fiducials.json (produced by _reconstruct_fiducial_pixels,
+    which bypasses the ROI mask). Falls back to xyz.npy for older runs.
+
+    Returns (positions, valid_mask) where:
+      positions:   (N, 3) float64 — NaN rows for failed marks
+      valid_mask:  (N,) bool — True where the mark was successfully reconstructed
+    Returns None if fewer than 3 marks are valid.
+    """
+    import json as _json
+
+    fid_json = Path(run_dir) / "reconstruct" / "fiducials.json"
+    if fid_json.exists():
+        data = _json.loads(fid_json.read_text())
+        n = len(data)
+        positions = np.full((n, 3), np.nan, dtype=np.float64)
+        valid = np.zeros(n, dtype=bool)
+        for i, entry in enumerate(data):
+            if entry.get("ok"):
+                positions[i] = entry["xyz_m"]
+                valid[i] = True
+        if int(np.count_nonzero(valid)) < 3:
+            return None
+        return positions, valid
+
+    # Fallback: xyz.npy (marks may be NaN if ROI excludes them)
+    xyz_path = Path(run_dir) / "reconstruct" / "xyz.npy"
+    if not xyz_path.exists():
+        return None
+    xyz = np.load(xyz_path)
+    h, w = xyz.shape[:2]
+    n = len(pixel_coords)
+    positions = np.full((n, 3), np.nan, dtype=np.float64)
+    valid = np.zeros(n, dtype=bool)
+    for i, (u, v) in enumerate(pixel_coords):
+        if 0 <= int(v) < h and 0 <= int(u) < w:
+            pt = xyz[int(v), int(u)].astype(np.float64)
+            if np.all(np.isfinite(pt)):
+                positions[i] = pt
+                valid[i] = True
+    if int(np.count_nonzero(valid)) < 3:
+        return None
+    return positions, valid
+
+
+def _best_fiducial_transform(
+    src_pts: np.ndarray,
+    ref_pts: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """
+    Find the rigid transform from src_pts to ref_pts using exhaustive permutation
+    matching. Tries all N! orderings of src_pts and returns the (R, t, perm, residual)
+    with the lowest mean per-mark error.
+
+    This is needed because the marks rotate with the turntable: at each scan angle
+    the marks appear at different pixel positions, so their order in fiducials.json
+    (sorted top-to-bottom in the image) changes. We cannot assume mark index i in
+    scan A corresponds to mark index i in scan B.
+    """
+    from itertools import combinations, permutations
+
+    best_R: np.ndarray | None = None
+    best_t: np.ndarray | None = None
+    best_src_idx: tuple[int, ...] | None = None
+    best_ref_idx: tuple[int, ...] | None = None
+    best_perm: tuple[int, ...] | None = None
+    best_residual = float("inf")
+
+    n_use = min(len(src_pts), len(ref_pts))
+    if n_use < 3:
+        raise ValueError("at least 3 fiducial points are required")
+
+    for src_idx in combinations(range(len(src_pts)), n_use):
+        src_subset = src_pts[list(src_idx)]
+        for ref_idx in combinations(range(len(ref_pts)), n_use):
+            ref_subset = ref_pts[list(ref_idx)]
+            for perm in permutations(range(n_use)):
+                src_ordered = src_subset[list(perm)]
+                R, t = _rigid_transform(src_ordered, ref_subset)
+                aligned = (R @ src_ordered.T).T + t
+                residual = float(np.mean(np.linalg.norm(aligned - ref_subset, axis=1)))
+                if residual < best_residual:
+                    best_residual = residual
+                    best_R = R
+                    best_t = t
+                    best_src_idx = src_idx
+                    best_ref_idx = ref_idx
+                    best_perm = perm
+
+    if best_R is None or best_t is None or best_src_idx is None or best_ref_idx is None or best_perm is None:
+        raise ValueError("fiducial permutation search failed")
+
+    # Return source indexes in the order corresponding to ref indexes.
+    src_match = np.array([best_src_idx[j] for j in best_perm], dtype=int)
+    ref_match = np.array(best_ref_idx, dtype=int)
+    return best_R, best_t, np.stack([src_match, ref_match], axis=1), best_residual
+
+
+def align_clouds_from_fiducials(
+    clouds_with_angles: list[tuple[float, np.ndarray]],
+    run_dirs: list[Path],
+    pixel_coords: list[tuple[int, int]],
+) -> tuple[list[tuple[float, np.ndarray]], list[dict[str, Any]], bool]:
+    """
+    Compute per-scan rigid transforms from 3D fiducial mark positions.
+
+    Uses exhaustive permutation matching so mark ordering does not need to be
+    consistent between scans — the marks rotate with the turntable and will
+    appear in different image positions (and thus different sorted order) at
+    each angle.
+
+    Returns (aligned_clouds_with_angles, per_scan_meta, all_applied).
+    all_applied is True only when every scan was successfully fiducial-aligned.
+    """
+    fid_data = [load_fiducial_positions(rd, pixel_coords) for rd in run_dirs]
+
+    ref_idx = next((i for i, d in enumerate(fid_data) if d is not None), None)
+    if ref_idx is None:
+        return (
+            clouds_with_angles,
+            [{"enabled": True, "applied": False, "reason": "no_fiducials_reconstructed"} for _ in clouds_with_angles],
+            False,
+        )
+
+    ref_positions, ref_valid = fid_data[ref_idx]
+    ref_pts = ref_positions[ref_valid]
+    aligned: list[tuple[float, np.ndarray]] = []
+    meta_list: list[dict[str, Any]] = []
+    n_applied = 0
+
+    for i, ((angle_deg, pts), data) in enumerate(zip(clouds_with_angles, fid_data)):
+        if i == ref_idx:
+            aligned.append((0.0, pts))
+            meta_list.append({
+                "enabled": True, "applied": False, "role": "reference",
+                "angle_deg": float(angle_deg),
+                "n_valid_marks": int(np.count_nonzero(ref_valid)),
+            })
+            n_applied += 1
+            continue
+        if data is None or len(pts) == 0:
+            aligned.append((angle_deg, pts))
+            meta_list.append({
+                "enabled": True, "applied": False,
+                "reason": "fiducials_not_reconstructed",
+                "angle_deg": float(angle_deg),
+            })
+            continue
+
+        src_positions, src_valid = data
+        src_pts = src_positions[src_valid]
+        n_src = len(src_pts)
+        n_ref = len(ref_pts)
+
+        if n_src < 3 or n_ref < 3:
+            aligned.append((angle_deg, pts))
+            meta_list.append({
+                "enabled": True, "applied": False,
+                "reason": f"too_few_marks_src={n_src}_ref={n_ref}",
+                "angle_deg": float(angle_deg),
+            })
+            continue
+
+        R, t, matches, residual = _best_fiducial_transform(src_pts, ref_pts)
+
+        transformed = ((R @ pts.astype(np.float64).T).T + t).astype(np.float32)
+        src_match = matches[:, 0]
+        ref_match = matches[:, 1]
+        aligned_fid = (R @ src_pts[src_match].T).T + t
+        per_mark_err = np.linalg.norm(aligned_fid - ref_pts[ref_match], axis=1)
+        aligned.append((0.0, transformed))
+        meta_list.append({
+            "enabled": True, "applied": True,
+            "angle_deg": float(angle_deg),
+            "n_valid_marks_src": n_src,
+            "n_valid_marks_ref": n_ref,
+            "n_marks_used": int(len(matches)),
+            "best_matches_src_to_ref": matches.tolist(),
+            "fiducial_search_residual_mean_m": float(residual),
+            "fiducial_residual_mean_m": float(np.mean(per_mark_err)),
+            "fiducial_residual_max_m": float(np.max(per_mark_err)),
+            "per_mark_error_m": per_mark_err.tolist(),
+        })
+        n_applied += 1
+
+    return aligned, meta_list, n_applied == len(clouds_with_angles)
+
+
 # ── axis estimation ───────────────────────────────────────────────────────────
 
 def estimate_axis(clouds: list[np.ndarray]) -> np.ndarray:
@@ -814,68 +1010,6 @@ def load_scan_cloud(run_dir: Path) -> np.ndarray:
     return pts.astype(np.float32)
 
 
-def _load_json_if_exists(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def _quality_gate_reasons(
-    run_dir: Path,
-    point_count: int,
-    gate_cfg: dict[str, Any],
-) -> list[str]:
-    reasons: list[str] = []
-    min_points = int(gate_cfg.get("min_points", 1))
-    if point_count < min_points:
-        reasons.append(f"point_count<{min_points}")
-
-    roi_meta = _load_json_if_exists(run_dir / "roi" / "roi_meta.json")
-    if bool(gate_cfg.get("reject_roi_fallback", True)) and bool((roi_meta.get("debug") or {}).get("roi_fallback")):
-        reasons.append("roi_fallback")
-    area_ratio = roi_meta.get("area_ratio")
-    max_roi_area_ratio = gate_cfg.get("max_roi_area_ratio")
-    if max_roi_area_ratio is not None and area_ratio is not None and float(area_ratio) > float(max_roi_area_ratio):
-        reasons.append(f"roi_area_ratio>{float(max_roi_area_ratio):.3f}")
-
-    unwrap_meta = _load_json_if_exists(run_dir / "unwrap" / "unwrap_summary.json")
-    max_residual_gt_1rad_pct = gate_cfg.get("max_unwrap_residual_gt_1rad_pct")
-    if max_residual_gt_1rad_pct is not None:
-        limit = float(max_residual_gt_1rad_pct)
-        for orientation in ("horizontal", "vertical"):
-            orientation_meta = unwrap_meta.get(orientation) or {}
-            pct = orientation_meta.get("residual_gt_1rad_pct")
-            if pct is not None and float(pct) > limit:
-                reasons.append(f"{orientation}_residual_gt_1rad_pct>{limit:.1f}")
-    max_residual_filter_removed_pct = gate_cfg.get("max_unwrap_residual_filter_removed_pct")
-    if max_residual_filter_removed_pct is not None:
-        limit = float(max_residual_filter_removed_pct)
-        for orientation in ("horizontal", "vertical"):
-            orientation_meta = unwrap_meta.get(orientation) or {}
-            before = int(orientation_meta.get("valid_before_residual_filter_px") or 0)
-            removed = int(orientation_meta.get("residual_filter_removed_px") or 0)
-            if before > 0 and (removed / float(before)) * 100.0 > limit:
-                reasons.append(f"{orientation}_residual_filter_removed_pct>{limit:.1f}")
-
-    recon_meta = _load_json_if_exists(run_dir / "reconstruct" / "reconstruction_meta.json")
-    valid_uv = int(recon_meta.get("valid_uv_points") or 0)
-    rejected_proj = int(recon_meta.get("rejected_by_projector_reproj_px") or 0)
-    max_reject_ratio = gate_cfg.get("max_projector_reject_ratio")
-    if max_reject_ratio is not None and valid_uv > 0:
-        reject_ratio = rejected_proj / float(valid_uv)
-        if reject_ratio > float(max_reject_ratio):
-            reasons.append(f"projector_reject_ratio>{float(max_reject_ratio):.3f}")
-    max_reproj_mean = gate_cfg.get("max_reproj_proj_mean_px")
-    reproj_mean = recon_meta.get("reproj_proj_mean_px")
-    if max_reproj_mean is not None and reproj_mean is not None and float(reproj_mean) > float(max_reproj_mean):
-        reasons.append(f"reproj_proj_mean_px>{float(max_reproj_mean):.2f}")
-
-    return reasons
-
-
 def merge_run_dirs(
     run_dirs_with_angles: list[tuple[float, Path]],
     config: dict[str, Any],
@@ -907,49 +1041,27 @@ def merge_run_dirs(
     ax_y = ms_cfg.get("axis_y_m")
     ax_z = ms_cfg.get("axis_z_m")
 
-    gate_cfg = dict(ms_cfg.get("quality_gate") or {})
-    gate_enabled = bool(gate_cfg.get("enabled", True))
-    loaded_scans: list[dict[str, Any]] = []
+    clouds_with_angles: list[tuple[float, np.ndarray]] = []
     for angle_deg, run_dir in run_dirs_with_angles:
         pts = load_scan_cloud(run_dir)
-        reasons = _quality_gate_reasons(run_dir, len(pts), gate_cfg) if gate_enabled else []
-        loaded_scans.append({"angle_deg": angle_deg, "run_dir": run_dir, "points": pts, "rejected": reasons})
-
-    if gate_enabled:
-        accepted_counts = [len(s["points"]) for s in loaded_scans if not s["rejected"] and len(s["points"]) > 0]
-        max_ratio = gate_cfg.get("max_points_ratio_to_median")
-        if max_ratio is not None and accepted_counts:
-            median_count = float(np.median(np.asarray(accepted_counts, dtype=np.float64)))
-            for scan in loaded_scans:
-                if scan["rejected"] or median_count <= 0:
-                    continue
-                if len(scan["points"]) > median_count * float(max_ratio):
-                    scan["rejected"].append(f"point_count_ratio>{float(max_ratio):.2f}x_median")
-
-    clouds_with_angles: list[tuple[float, np.ndarray]] = []
-    rejected_scans: list[dict[str, Any]] = []
-    for scan in loaded_scans:
-        angle_deg = float(scan["angle_deg"])
-        pts = scan["points"]
-        run_dir = scan["run_dir"]
-        reasons = list(scan["rejected"])
-        if reasons:
-            rejected_scans.append({"angle_deg": angle_deg, "run_dir": str(run_dir), "points": int(len(pts)), "reasons": reasons})
-            print(f"[merge] angle={angle_deg:.1f}° rejected by quality gate: {', '.join(reasons)}")
-            continue
         clouds_with_angles.append((angle_deg, pts))
         print(f"[merge] angle={angle_deg:.1f}° → {len(pts)} points from {run_dir.name}")
 
-    min_accepted = min(int(gate_cfg.get("min_accepted_scans", 2)), len(run_dirs_with_angles))
-    if len(clouds_with_angles) < max(1, min_accepted):
-        reasons = "; ".join(
-            f"{item['angle_deg']:.1f}°: {', '.join(item['reasons'])}"
-            for item in rejected_scans
-        )
-        raise RuntimeError(
-            f"Only {len(clouds_with_angles)} scan(s) passed merge quality gate; "
-            f"need at least {max(1, min_accepted)}. Rejections: {reasons}"
-        )
+    fid_cfg = dict(ms_cfg.get("fiducials") or {})
+    fid_meta: list[dict[str, Any]] = []
+    fid_all_applied = False
+    if bool(fid_cfg.get("enabled", False)):
+        raw_coords = fid_cfg.get("pixel_coords", [])
+        pixel_coords_list = [(int(c[0]), int(c[1])) for c in raw_coords if len(c) >= 2]
+        if len(pixel_coords_list) >= 3:
+            run_dirs_list = [rd for _, rd in run_dirs_with_angles]
+            clouds_with_angles, fid_meta, fid_all_applied = align_clouds_from_fiducials(
+                clouds_with_angles, run_dirs_list, pixel_coords_list
+            )
+            n_ok = sum(1 for m in fid_meta if m.get("applied") or m.get("role") == "reference")
+            print(f"[merge] fiducials: {n_ok}/{len(fid_meta)} scans aligned via 4-point Procrustes")
+        else:
+            print(f"[merge] fiducials: need ≥3 pixel_coords, got {len(pixel_coords_list)} — skipping")
 
     if ax_x is not None and ax_y is not None:
         valid_clouds = [p for _, p in clouds_with_angles if len(p) > 0]
@@ -959,6 +1071,8 @@ def merge_run_dirs(
 
     aft_cfg = dict(ms_cfg.get("axis_from_top") or {})
     aft_meta: dict[str, Any] = {"enabled": bool(aft_cfg.get("enabled", False)), "applied": False}
+    if fid_all_applied:
+        aft_meta = {"enabled": False, "applied": False, "reason": "skipped_fiducials_active"}
     if aft_meta["enabled"] and axis is not None:
         axis, aft_meta = optimize_axis_from_top(
             clouds_with_angles,
@@ -980,6 +1094,8 @@ def merge_run_dirs(
 
     afe_cfg = dict(ms_cfg.get("axis_from_edges") or {})
     afe_meta: dict[str, Any] = {"enabled": bool(afe_cfg.get("enabled", False)), "applied": False}
+    if fid_all_applied:
+        afe_meta = {"enabled": False, "applied": False, "reason": "skipped_fiducials_active"}
     if afe_meta["enabled"] and axis is not None:
         axis, afe_meta = optimize_axis_from_edges(
             clouds_with_angles,
@@ -1017,20 +1133,14 @@ def merge_run_dirs(
         save_colored_ply(merged, colors, colored_ply_path)
 
     meta = {
-        "input_n_scans": len(run_dirs_with_angles),
-        "n_scans": len(clouds_with_angles),
-        "angles_deg": [a for a, _ in clouds_with_angles],
-        "input_angles_deg": [a for a, _ in run_dirs_with_angles],
-        "quality_gate": {
-            "enabled": gate_enabled,
-            "config": gate_cfg,
-            "rejected_scans": rejected_scans,
-        },
+        "n_scans": len(run_dirs_with_angles),
+        "angles_deg": [a for a, _ in run_dirs_with_angles],
         "points_per_scan": [len(p) for _, p in clouds_with_angles],
         "total_points": int(len(merged)),
         "axis_m": axis_used.tolist(),
         "rotation_sign": rotation_sign,
         "rotation_axis": rotation_axis.tolist() if isinstance(rotation_axis, np.ndarray) else rotation_axis,
+        "fiducials": fid_meta,
         "axis_from_top": aft_meta,
         "axis_from_edges": afe_meta,
         "refine_icp": refine_config,

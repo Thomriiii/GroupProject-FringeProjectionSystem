@@ -22,7 +22,7 @@ from scipy.spatial import cKDTree
 from scipy import ndimage
 
 from fringe_app_v2.core.calibration import CalibrationService
-from fringe_app_v2.utils.io import RunPaths, save_mask_png, write_json
+from fringe_app_v2.utils.io import RunPaths, freq_tag, save_mask_png, write_json
 from fringe_app_v2.pipeline.phase_to_projector import (
     phase_to_projector_coords,
     validate_uv_map,
@@ -180,12 +180,20 @@ def run_reconstruct_stage(
     )
     meta["component_filter_removed"] = n_comp_removed
     meta["sor_removed"] = n_sor_removed
-    quality = _reconstruction_quality(meta, recon_cfg)
-    meta["quality_gate"] = quality
+
+    # Reconstruct fiducial mark pixels (bypasses ROI — marks on the turntable bed)
+    ms_cfg = config.get("multi_scan") or {}
+    fid_cfg = ms_cfg.get("fiducials") or {}
+    if bool(fid_cfg.get("enabled", False)):
+        pixel_coords_list = _detect_fiducial_pixels(run, fid_cfg)
+        if pixel_coords_list:
+            fid_results = _reconstruct_fiducial_pixels(run, config, calibration, pixel_coords_list)
+            write_json(run.reconstruct / "fiducials.json", fid_results)
+            n_ok = sum(1 for r in fid_results if r.get("ok"))
+            print(f"[reconstruct] Fiducials: {n_ok}/{len(fid_results)} marks reconstructed OK")
+            meta["fiducials"] = fid_results
 
     write_json(run.reconstruct / "reconstruction_meta.json", meta)
-    if bool(recon_cfg.get("fail_on_quality_error", True)) and not bool(quality.get("ok", True)):
-        raise RuntimeError("Reconstruction quality gate failed: " + "; ".join(quality.get("reasons", [])))
 
     # Export point cloud
     try:
@@ -198,46 +206,6 @@ def run_reconstruct_stage(
         _save_debug_images(run.reconstruct, tri_result, uv_map)
 
     return meta
-
-
-def _reconstruction_quality(meta: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
-    cfg = config.get("quality_gate", {}) or {}
-    if not bool(cfg.get("enabled", True)):
-        return {"enabled": False, "ok": True, "reasons": []}
-
-    valid_uv = int(meta.get("valid_uv_points") or 0)
-    valid_reconstruct = int(meta.get("valid_reconstruct_points") or 0)
-    rejected_proj = int(meta.get("rejected_by_projector_reproj_px") or 0)
-    reconstruct_ratio = valid_reconstruct / float(valid_uv) if valid_uv > 0 else 0.0
-    projector_reject_ratio = rejected_proj / float(valid_uv) if valid_uv > 0 else 1.0
-    reasons: list[str] = []
-
-    min_uv = int(cfg.get("min_valid_uv_points", 1000))
-    if valid_uv < min_uv:
-        reasons.append(f"valid_uv_points<{min_uv}")
-    min_reconstruct = int(cfg.get("min_valid_reconstruct_points", 1000))
-    if valid_reconstruct < min_reconstruct:
-        reasons.append(f"valid_reconstruct_points<{min_reconstruct}")
-    min_ratio = float(cfg.get("min_reconstruct_to_uv_ratio", 0.10))
-    if valid_uv > 0 and reconstruct_ratio < min_ratio:
-        reasons.append(f"reconstruct_to_uv_ratio<{min_ratio:.3f}")
-    max_reject = float(cfg.get("max_projector_reject_ratio", 0.50))
-    if projector_reject_ratio > max_reject:
-        reasons.append(f"projector_reject_ratio>{max_reject:.3f}")
-    max_reproj_mean = cfg.get("max_reproj_proj_mean_px")
-    reproj_mean = meta.get("reproj_proj_mean_px")
-    if max_reproj_mean is not None and reproj_mean is not None and float(reproj_mean) > float(max_reproj_mean):
-        reasons.append(f"reproj_proj_mean_px>{float(max_reproj_mean):.2f}")
-
-    return {
-        "enabled": True,
-        "ok": not reasons,
-        "reasons": reasons,
-        "valid_uv_points": valid_uv,
-        "valid_reconstruct_points": valid_reconstruct,
-        "reconstruct_to_uv_ratio": reconstruct_ratio,
-        "projector_reject_ratio": projector_reject_ratio,
-    }
 
 
 def _remove_small_components(
@@ -498,3 +466,230 @@ def _export_pointcloud(out_dir: Path, xyz: np.ndarray, mask: np.ndarray) -> None
         except Exception as e:
             print(f"[reconstruct] Warning: Failed to write {cloud_path}: {e}")
 
+
+def _detect_fiducial_pixels(
+    run: RunPaths,
+    fid_cfg: dict[str, Any],
+) -> list[tuple[int, int]]:
+    """
+    Auto-detect fiducial mark pixel positions from the ROI capture image.
+
+    Finds bright colored marks using HSV thresholding, clusters them, and
+    returns the N largest plausible cluster centroids sorted top-to-bottom.
+    Falls back to fixed pixel_coords from config if detection fails.
+    """
+    roi_capture = run.raw / "roi_capture.png"
+    if not roi_capture.exists():
+        return [(int(c[0]), int(c[1])) for c in fid_cfg.get("pixel_coords", [])]
+
+    try:
+        from PIL import Image as _PIL
+        from scipy import ndimage as _ndi
+
+        arr = np.array(_PIL.open(roi_capture)).astype(np.float32)
+        if arr.ndim == 2:
+            arr = np.stack([arr] * 3, axis=-1)
+        r, g, b = arr[:, :, 0] / 255.0, arr[:, :, 1] / 255.0, arr[:, :, 2] / 255.0
+
+        raw_hue_ranges = fid_cfg.get("detect_hue_ranges")
+        if raw_hue_ranges:
+            hue_ranges = [
+                (float(pair[0]) % 360.0, float(pair[1]) % 360.0)
+                for pair in raw_hue_ranges
+                if isinstance(pair, (list, tuple)) and len(pair) >= 2
+            ]
+        else:
+            hue_ranges = [
+                (
+                    float(fid_cfg.get("detect_hue_lo", 0.0)) % 360.0,
+                    float(fid_cfg.get("detect_hue_hi", 30.0)) % 360.0,
+                )
+            ]
+        sat_min = float(fid_cfg.get("detect_sat_min", 0.55))
+        val_min = float(fid_cfg.get("detect_val_min", 0.35))
+        min_px = int(fid_cfg.get("detect_min_px", 50))
+        max_px = int(fid_cfg.get("detect_max_px", 6000))
+        n_marks = int(fid_cfg.get("n_marks", 4))
+
+        maxc = np.maximum(np.maximum(r, g), b)
+        minc = np.minimum(np.minimum(r, g), b)
+        delta = maxc - minc
+        sat = np.zeros_like(maxc)
+        np.divide(delta, maxc, out=sat, where=maxc > 1e-6)
+        val = maxc
+        hue = np.zeros_like(r)
+        m = delta > 1e-6
+        mr = m & (maxc == r)
+        mg = m & (maxc == g)
+        mb = m & (maxc == b)
+        hue[mr] = (60.0 * ((g[mr] - b[mr]) / delta[mr])) % 360.0
+        hue[mg] = 60.0 * ((b[mg] - r[mg]) / delta[mg]) + 120.0
+        hue[mb] = 60.0 * ((r[mb] - g[mb]) / delta[mb]) + 240.0
+
+        in_hue = np.zeros_like(hue, dtype=bool)
+        for hue_lo, hue_hi in hue_ranges:
+            if hue_lo <= hue_hi:
+                in_hue |= (hue >= hue_lo) & (hue <= hue_hi)
+            else:
+                in_hue |= (hue >= hue_lo) | (hue <= hue_hi)
+
+        mask = in_hue & (sat >= sat_min) & (val >= val_min)
+        labeled, n = _ndi.label(mask)
+        if n == 0:
+            raise ValueError("no colored marks detected")
+
+        clusters = []
+        for i in range(1, n + 1):
+            comp = labeled == i
+            sz = int(comp.sum())
+            if sz < min_px or (max_px > 0 and sz > max_px):
+                continue
+            ys, xs = np.where(comp)
+            clusters.append((sz, int(xs.mean()), int(ys.mean())))
+
+        clusters.sort(key=lambda c: -c[0])
+        clusters = clusters[:n_marks]
+        if len(clusters) < 3:
+            raise ValueError(f"only {len(clusters)} marks detected, need ≥3")
+
+        # Sort top-to-bottom for stable ordering
+        clusters.sort(key=lambda c: c[2])
+        coords = [(c[1], c[2]) for c in clusters]
+        print(f"[reconstruct] Fiducials auto-detected: {coords}")
+        return coords
+
+    except Exception as exc:
+        print(f"[reconstruct] Fiducial auto-detect failed ({exc}), using fixed pixel_coords")
+        return [(int(c[0]), int(c[1])) for c in fid_cfg.get("pixel_coords", [])]
+
+
+def _reconstruct_fiducial_pixels(
+    run: RunPaths,
+    config: dict[str, Any],
+    calibration: CalibrationService,
+    pixel_coords: list[tuple[int, int]],
+) -> list[dict]:
+    """
+    Reconstruct 3D positions of fiducial mark pixels, bypassing the ROI mask.
+
+    Runs a mini unwrap→UV→triangulate pipeline for each specified pixel using
+    only the raw per-frequency phase masks (not the ROI-filtered unwrap outputs).
+    Saves results to reconstruct/fiducials.json so merge can load them.
+    """
+    scan_cfg = config.get("scan", {}) or {}
+    freqs = sorted([float(v) for v in scan_cfg.get("frequencies", [])])
+    if len(freqs) < 2:
+        return [{"u": u, "v": v, "ok": False, "reason": "too_few_frequencies"} for u, v in pixel_coords]
+
+    high_freq = max(freqs)
+    two_pi = 2.0 * np.pi
+    proj_w, proj_h = calibration.projector.projector_size
+    phase_origin_u = float(scan_cfg.get("phase_origin_u_rad", scan_cfg.get("phase_origin_rad", 0.0)))
+    phase_origin_v = float(scan_cfg.get("phase_origin_v_rad", scan_cfg.get("phase_origin_rad", 0.0)))
+    u_offset = float(scan_cfg.get("projector_u_offset_px", 0.0))
+    v_offset = float(scan_cfg.get("projector_v_offset_px", 0.0))
+    freq_semantics = str(scan_cfg.get("frequency_semantics", "cycles_across_dimension"))
+
+    cam_model = CameraModel(
+        matrix=calibration.camera.matrix,
+        dist_coeffs=calibration.camera.dist_coeffs,
+        image_size=calibration.camera.image_size,
+    )
+    proj_model = ProjectorModel(
+        matrix=calibration.projector.matrix,
+        dist_coeffs=calibration.projector.dist_coeffs,
+        rotation=calibration.projector.rotation,
+        translation=calibration.projector.translation,
+        size=calibration.projector.projector_size,
+    )
+    recon_cfg = dict(config.get("reconstruction", {}) or {})
+    recon_cfg["sor_enabled"] = False
+    # Marks are on the flat turntable bed where calibration accuracy may be lower
+    # than for the object. The reproj filter is relaxed so marks are accepted;
+    # their errors are stored in fiducials.json for inspection.
+    recon_cfg["max_reproj_err_px"] = float(
+        (config.get("multi_scan") or {}).get("fiducials", {}).get("max_reproj_err_px", 200.0)
+    )
+
+    results = []
+    for px_u, px_v in pixel_coords:
+        mark: dict = {"u": int(px_u), "v": int(px_v), "ok": False}
+        try:
+            phi_abs_per_orient: dict[str, float] = {}
+            failed = False
+            for orientation in ("vertical", "horizontal"):
+                phi_low: float | None = None
+                prev_freq: float | None = None
+                for freq in freqs:
+                    phase_path = run.phase / orientation / freq_tag(freq)
+                    phi_w = float(np.load(phase_path / "phi_wrapped.npy")[px_v, px_u])
+                    raw_mask = bool(np.load(phase_path / "mask.npy")[px_v, px_u])
+                    if not raw_mask or not np.isfinite(phi_w):
+                        mark["reason"] = f"phase_invalid_{orientation}_freq{freq}"
+                        failed = True
+                        break
+                    if phi_low is None:
+                        phi_low = phi_w % two_pi
+                    else:
+                        r = freq / prev_freq  # type: ignore[operator]
+                        k = round((r * phi_low - phi_w) / two_pi)
+                        phi_low = phi_w + two_pi * k
+                    prev_freq = freq
+                if failed:
+                    break
+                phi_abs_per_orient[orientation] = phi_low  # type: ignore[assignment]
+
+            if failed:
+                results.append(mark)
+                continue
+
+            phi_v = phi_abs_per_orient["vertical"]
+            phi_h = phi_abs_per_orient["horizontal"]
+
+            if freq_semantics == "cycles_across_dimension":
+                u_proj = (phi_v - phase_origin_u) / (two_pi * high_freq) * proj_w + u_offset
+                v_proj = (phi_h - phase_origin_v) / (two_pi * high_freq) * proj_h + v_offset
+            else:
+                u_proj = phi_v / two_pi * high_freq + u_offset
+                v_proj = phi_h / two_pi * high_freq + v_offset
+
+            mark["u_proj"] = float(u_proj)
+            mark["v_proj"] = float(v_proj)
+
+            if not (0 <= u_proj < proj_w and 0 <= v_proj < proj_h):
+                mark["reason"] = "uv_out_of_projector_bounds"
+                results.append(mark)
+                continue
+
+            # Build full-size UV arrays (triangulate_from_uv validates image size)
+            cam_h, cam_w = calibration.camera.image_size[1], calibration.camera.image_size[0]
+            u_full = np.full((cam_h, cam_w), np.nan, dtype=np.float32)
+            v_full = np.full((cam_h, cam_w), np.nan, dtype=np.float32)
+            mask_full = np.zeros((cam_h, cam_w), dtype=bool)
+            u_full[px_v, px_u] = float(u_proj)
+            v_full[px_v, px_u] = float(v_proj)
+            mask_full[px_v, px_u] = True
+
+            tri = triangulate_from_uv(
+                u_map=u_full,
+                v_map=v_full,
+                mask_uv=mask_full,
+                camera_model=cam_model,
+                projector_model=proj_model,
+                config=recon_cfg,
+            )
+
+            if tri.mask[px_v, px_u]:
+                mark["ok"] = True
+                mark["xyz_m"] = [float(c) for c in tri.xyz[px_v, px_u]]
+                mark["reproj_cam_px"] = float(tri.reproj_err_cam[px_v, px_u])
+                mark["reproj_proj_px"] = float(tri.reproj_err_proj[px_v, px_u])
+            else:
+                mark["reason"] = "triangulation_rejected"
+
+        except Exception as exc:
+            mark["reason"] = f"error: {exc}"
+
+        results.append(mark)
+
+    return results

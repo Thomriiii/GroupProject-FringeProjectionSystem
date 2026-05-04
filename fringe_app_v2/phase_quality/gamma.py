@@ -21,7 +21,7 @@ def apply_gamma(pattern: np.ndarray, gamma: float) -> np.ndarray:
         normalised = arr.astype(np.float32) / 255.0
     else:
         normalised = arr.astype(np.float32)
-    corrected = np.clip(normalised, 0.0, 1.0) ** (1.0 / float(gamma))
+    corrected = np.clip(normalised, 0.0, 1.0) ** float(gamma)
     if is_integer:
         return np.clip(np.rint(corrected * 255.0), 0, 255).astype(arr.dtype)
     return corrected.astype(arr.dtype, copy=False)

@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from fringe_app_v2.core.turntable import TurntableClient
 from fringe_app_v2.pipeline.capture import capture_raw, create_pipeline_run, lock_exposure_mid_gray
 from fringe_app_v2.pipeline.merge_clouds import merge_run_dirs
@@ -17,6 +19,77 @@ from fringe_app_v2.pipeline.roi_stage import run_roi_stage
 from fringe_app_v2.pipeline.structured_capture import run_structured_capture
 from fringe_app_v2.pipeline.unwrap import run_unwrap_stage
 from fringe_app_v2.utils.io import write_json
+
+
+def _frame_luma_stats(frame) -> dict[str, float]:
+    arr = np.asarray(frame)
+    if arr.ndim == 3:
+        gray = arr[:, :, :3].astype(np.float32).mean(axis=2)
+    else:
+        gray = arr.astype(np.float32)
+    return {
+        "mean_dn": float(np.mean(gray)),
+        "p95_dn": float(np.percentile(gray, 95.0)),
+        "p99_dn": float(np.percentile(gray, 99.0)),
+        "max_dn": float(np.max(gray)),
+    }
+
+
+def _capture_roi_with_idle_light(
+    run,
+    camera,
+    projector,
+    config: dict[str, Any],
+    angle_deg: float,
+):
+    ms_cfg = config.get("multi_scan") or {}
+    light_cfg = ms_cfg.get("roi_light_check") or {}
+    settle_s = float(light_cfg.get("settle_ms", 350)) / 1000.0
+    flush_frames = int(light_cfg.get("flush_frames", 3))
+    retries = int(light_cfg.get("retries", 2))
+    min_mean_dn = float(light_cfg.get("min_mean_dn", 8.0))
+    min_p99_dn = float(light_cfg.get("min_p99_dn", 25.0))
+    fail_on_dark = bool(light_cfg.get("fail_on_dark", True))
+
+    attempts: list[dict[str, Any]] = []
+    last_frame = None
+    for attempt in range(1, max(1, retries + 1) + 1):
+        projector.show_idle(config)
+        time.sleep(settle_s)
+        frame = capture_raw(run, camera, name="roi_capture.png", flush_frames=flush_frames)
+        stats = _frame_luma_stats(frame)
+        ok = stats["mean_dn"] >= min_mean_dn and stats["p99_dn"] >= min_p99_dn
+        attempts.append({
+            "attempt": attempt,
+            "angle_deg": float(angle_deg),
+            "flush_frames": flush_frames,
+            "settle_ms": int(round(settle_s * 1000.0)),
+            "ok": bool(ok),
+            **stats,
+        })
+        last_frame = frame
+        if ok:
+            break
+        print(
+            "[multi_scan] ROI illumination dark "
+            f"angle={angle_deg:.1f}° attempt={attempt}: "
+            f"mean={stats['mean_dn']:.2f} p99={stats['p99_dn']:.2f}; retrying"
+        )
+
+    payload = {
+        "enabled": True,
+        "min_mean_dn": min_mean_dn,
+        "min_p99_dn": min_p99_dn,
+        "attempts": attempts,
+        "ok": bool(attempts and attempts[-1]["ok"]),
+    }
+    write_json(run.raw / "roi_light_check.json", payload)
+    if not payload["ok"] and fail_on_dark:
+        raise RuntimeError(
+            f"ROI illumination check failed at {angle_deg:.1f}° after {len(attempts)} attempt(s): "
+            f"mean={attempts[-1]['mean_dn']:.2f}, p99={attempts[-1]['p99_dn']:.2f}"
+        )
+    return last_frame
 
 
 def run_multi_scan(
@@ -62,9 +135,9 @@ def run_multi_scan(
         write_json(sub_run.root / "angle.json", {"angle_deg": angle})
 
         _stage(f"roi_{angle:.0f}deg")
-        projector.show_idle(config)   # structured_capture leaves projector at 0; re-illuminate for ROI
-        time.sleep(0.15)
-        frame = capture_raw(sub_run, camera, name="roi_capture.png", flush_frames=1)
+        # structured_capture leaves the projector at black; re-illuminate and
+        # verify before ROI capture so stale dark frames cannot poison a scan.
+        frame = _capture_roi_with_idle_light(sub_run, camera, projector, config, angle)
         roi_mask = run_roi_stage(sub_run, camera, projector, config, source=frame)
 
         _stage(f"capture_{angle:.0f}deg")
